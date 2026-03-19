@@ -9,6 +9,7 @@ mod rc {
 }
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{ColorImage, TextureHandle, Vec2};
 use tokio::sync::mpsc;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub connected: bool,
     pub config: Config,
     pub telemetry: Arc<Mutex<Telemetry>>,
+    pub running: Arc<AtomicBool>,
 }
 
 pub struct RpvApp {
@@ -38,6 +40,7 @@ impl RpvApp {
         config: Config,
         video_rx: Arc<Mutex<Option<DecodedYUV>>>,
         telemetry: Arc<Mutex<Telemetry>>,
+        running: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state: AppState {
@@ -48,6 +51,7 @@ impl RpvApp {
                 connected: false,
                 config,
                 telemetry,
+                running,
             },
             video_rx,
         }
@@ -119,7 +123,13 @@ fn yuv420p_to_rgba(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize) -> Vec<u8> 
 }
 
 impl eframe::App for RpvApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Check for ctrl+c signal
+        if !self.state.running.load(Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         self.update_texture(ctx);
 
         ctx.request_repaint();
@@ -300,6 +310,14 @@ fn main() -> Result<(), eframe::Error> {
     let config = Config::load();
     tracing::info!("Config: {:?}", config);
 
+    // Shared running flag for ctrl+c
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        tracing::info!("Ctrl+C received, shutting down...");
+        r.store(false, Ordering::SeqCst);
+    }).expect("Failed to set ctrl+c handler");
+
     let (video_frame_tx, video_frame_rx) = mpsc::unbounded_channel();
 
     // Create video decoder
@@ -316,6 +334,7 @@ fn main() -> Result<(), eframe::Error> {
     let bg_config = config.clone();
     let bg_video_frame_tx = video_frame_tx;
     let bg_telemetry = telemetry;
+    let bg_running = running.clone();
 
     // Spawn tokio runtime in background thread
     std::thread::spawn(move || {
@@ -341,9 +360,11 @@ fn main() -> Result<(), eframe::Error> {
                 rc.run().await;
             });
 
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            // Stay alive until ctrl+c
+            while bg_running.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
+            tracing::info!("Background tasks shutting down");
         });
     });
 
@@ -372,11 +393,12 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
+    let app_running = running.clone();
     eframe::run_native(
         "rpv ground station",
         native_options,
         Box::new(|_cc| {
-            Ok(Box::new(RpvApp::new(config, decoded_frame, telemetry_state)))
+            Ok(Box::new(RpvApp::new(config, decoded_frame, telemetry_state, app_running)))
         }),
     )
 }
