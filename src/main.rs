@@ -350,7 +350,7 @@ fn main() -> Result<(), eframe::Error> {
     // Run egui on main thread with custom wgpu limits for Pi 5 V3D GPU
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 720.0])
+            .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             device_descriptor: std::sync::Arc::new(|_adapter| {
