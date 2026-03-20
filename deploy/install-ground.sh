@@ -3,7 +3,6 @@ set -e
 cp rpv-net-setup.sh /usr/local/bin/rpv-net-setup.sh
 chmod +x /usr/local/bin/rpv-net-setup.sh
 cp rpv-wpa.conf /etc/wpa_supplicant/rpv-wpa.conf
-cp rpv-ground.service /etc/systemd/system/rpv-ground.service
-systemctl daemon-reload
-systemctl enable rpv-ground.service
-echo "Done. Reboot to activate."
+mkdir -p ~/.config/autostart
+cp ground/rpv-ground.desktop ~/.config/autostart/
+echo "Done. On next login, rpv-ground will auto-start in the desktop session."
