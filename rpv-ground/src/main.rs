@@ -131,13 +131,15 @@ impl RpvApp {
 }
 
 fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) {
+    let uv_width = w / 2;
+    for row in 0..h {
+        let y_row = row * w;
+        let uv_row = (row / 2) * uv_width;
+        for col in 0..w {
+            let y_idx = y_row + col;
+            let uv_idx = uv_row + (col / 2);
+            let rgba_idx = y_idx * 4;
 
-    let mut y_idx = 0usize;
-    let mut uv_idx = 0usize;
-    let mut rgba_idx = 0usize;
-
-    for _ in 0..h {
-        for _ in 0..w {
             let y_val = y[y_idx] as i32;
             let u_val = u[uv_idx] as i32 - 128;
             let v_val = v[uv_idx] as i32 - 128;
@@ -146,14 +148,54 @@ fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgb
             rgba[rgba_idx + 1] = (y_val - ((88 * u_val + 183 * v_val) >> 8)).clamp(0, 255) as u8;
             rgba[rgba_idx + 2] = (y_val + ((454 * u_val) >> 8)).clamp(0, 255) as u8;
             rgba[rgba_idx + 3] = 255;
+        }
+    }
+}
 
-            y_idx += 1;
-            rgba_idx += 4;
+#[cfg(test)]
+mod tests {
+    use super::yuv420p_to_rgba_inplace;
 
-            if (y_idx % w) == 0 {
-                uv_idx += 1;
+    fn yuv420p_to_rgba_reference(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut out = vec![0u8; w * h * 4];
+        let uv_width = w / 2;
+        for row in 0..h {
+            for col in 0..w {
+                let y_idx = row * w + col;
+                let uv_idx = (row / 2) * uv_width + (col / 2);
+                let rgba_idx = y_idx * 4;
+
+                let y_val = y[y_idx] as i32;
+                let u_val = u[uv_idx] as i32 - 128;
+                let v_val = v[uv_idx] as i32 - 128;
+
+                out[rgba_idx] = (y_val + ((359 * v_val) >> 8)).clamp(0, 255) as u8;
+                out[rgba_idx + 1] = (y_val - ((88 * u_val + 183 * v_val) >> 8)).clamp(0, 255) as u8;
+                out[rgba_idx + 2] = (y_val + ((454 * u_val) >> 8)).clamp(0, 255) as u8;
+                out[rgba_idx + 3] = 255;
             }
         }
+        out
+    }
+
+    #[test]
+    fn yuv420p_to_rgba_matches_reference_layout() {
+        let w = 4;
+        let h = 4;
+        let y = vec![
+            16, 32, 64, 96,
+            20, 40, 80, 100,
+            24, 48, 72, 104,
+            28, 52, 76, 108,
+        ];
+        let u = vec![0, 255, 128, 64];
+        let v = vec![255, 0, 128, 192];
+
+        let mut rgba = vec![0u8; w * h * 4];
+        yuv420p_to_rgba_inplace(&y, &u, &v, w, h, &mut rgba);
+
+        let expected = yuv420p_to_rgba_reference(&y, &u, &v, w, h);
+        assert_eq!(rgba, expected);
     }
 }
 
