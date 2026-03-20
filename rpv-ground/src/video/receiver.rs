@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -6,7 +7,7 @@ use tracing::{info, warn};
 use reed_solomon_erasure::ReedSolomon;
 
 const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 2;
+const PARITY_SHARDS: usize = 4;
 
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -26,7 +27,7 @@ pub struct VideoReceiver {
 
 impl VideoReceiver {
     pub async fn new(port: u16, tx: mpsc::UnboundedSender<VideoFrame>) -> std::io::Result<Self> {
-        info!("Video receiver (FEC 4+2) ready on port {}", port);
+        info!("Video receiver (FEC {}+{}) ready on port {}", DATA_SHARDS, PARITY_SHARDS, port);
         Ok(Self { tx, port })
     }
 
@@ -47,12 +48,12 @@ impl VideoReceiver {
         let mut buf = vec![0u8; 65536];
         let mut fec_groups: HashMap<u32, FecGroup> = HashMap::new();
         let mut next_seq: Option<u32> = None;
+        let mut last_decode_time = Instant::now();
 
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, _addr)) => {
                     if len < 8 {
-                        // Too short for header, send raw
                         let frame = VideoFrame { data: buf[..len].to_vec() };
                         let _ = self.tx.send(frame);
                         continue;
@@ -68,7 +69,6 @@ impl VideoReceiver {
                     let payload_available = len - header_size;
 
                     if shard_index >= total_shards || shard_len == 0 || shard_len > payload_available {
-                        // Malformed header, treat as raw data
                         let frame = VideoFrame { data: buf[..len].to_vec() };
                         let _ = self.tx.send(frame);
                         continue;
@@ -86,11 +86,11 @@ impl VideoReceiver {
                         k.wrapping_sub(next_seq.unwrap_or(k)) < 8
                     });
 
-            let group = fec_groups.entry(seq).or_insert_with(|| FecGroup {
-                shards: vec![None; total_shards],
-                shard_size: shard_len,
-                received: 0,
-            });
+                    let group = fec_groups.entry(seq).or_insert_with(|| FecGroup {
+                        shards: vec![None; total_shards],
+                        shard_size: shard_len,
+                        received: 0,
+                    });
 
                     if group.shards[shard_index].is_none() {
                         group.received += 1;
@@ -108,6 +108,18 @@ impl VideoReceiver {
                             }
                             fec_groups.remove(&current_seq);
                             next_seq = Some(current_seq.wrapping_add(1));
+                            last_decode_time = Instant::now();
+                        }
+                    }
+
+                    // FEC stall recovery: skip stalled group after 500ms
+                    if let Some(current_seq) = next_seq {
+                        if last_decode_time.elapsed().as_millis() > 500 && fec_groups.contains_key(&current_seq) {
+                            warn!("FEC: seq {} stalled for >500ms, skipping (had {}/{} shards)",
+                                current_seq, fec_groups[&current_seq].received, DATA_SHARDS);
+                            fec_groups.remove(&current_seq);
+                            next_seq = Some(current_seq.wrapping_add(1));
+                            last_decode_time = Instant::now();
                         }
                     }
                 }
@@ -124,8 +136,6 @@ fn decode_fec_group(
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
     group: &FecGroup,
 ) -> Vec<Vec<u8>> {
-    let _shard_size = group.shard_size;
-
     // Build Option<Vec<u8>> shards for reconstruction
     let mut shards: Vec<Option<Vec<u8>>> = group.shards.iter()
         .map(|s| s.as_ref().map(|v| v.clone()))
@@ -135,11 +145,14 @@ fn decode_fec_group(
     let missing_count = shards.iter().filter(|s| s.is_none()).count();
 
     if missing_count > 0 {
-        warn!("FEC: missing {} shards, attempting reconstruction", missing_count);
-
-        if rs.reconstruct(&mut shards).is_ok() {
-            info!("FEC: successfully reconstructed {} missing shards", missing_count);
+        if missing_count <= PARITY_SHARDS {
+            info!("FEC: reconstructing {} missing shards", missing_count);
         } else {
+            warn!("FEC: {} missing shards exceeds parity ({}), dropping group", missing_count, PARITY_SHARDS);
+            return Vec::new();
+        }
+
+        if rs.reconstruct(&mut shards).is_err() {
             warn!("FEC: reconstruction failed, dropping group");
             return Vec::new();
         }

@@ -6,16 +6,17 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reed_solomon_erasure::ReedSolomon;
 
 const VIDEO_PORT: u16 = 5600;
 const TELEMETRY_PORT: u16 = 5601;
 const RC_PORT: u16 = 5602;
+const HEARTBEAT_PORT: u16 = 5603;
 
 const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 2;
+const PARITY_SHARDS: usize = 4;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
@@ -46,7 +47,23 @@ fn main() {
     tracing::info!("Ground station at {}", ground_ip);
     write_link_status("connected");
 
-    let ground_addr = Arc::new(Mutex::new(Some(ground_ip)));
+    let ground_addr: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(Some(ground_ip)));
+    let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+
+    // Start heartbeat receiver
+    let hb_running = running.clone();
+    let hb_last = Arc::clone(&last_heartbeat);
+    let hb_handle = thread::spawn(move || {
+        heartbeat_receiver(hb_running, hb_last);
+    });
+
+    // Start heartbeat monitor (triggers re-discovery when heartbeat lost)
+    let hm_running = running.clone();
+    let hm_ground = Arc::clone(&ground_addr);
+    let hm_last = Arc::clone(&last_heartbeat);
+    let hm_handle = thread::spawn(move || {
+        heartbeat_monitor(hm_running, hm_ground, hm_last);
+    });
 
     // Start video capture and streaming
     let video_running = running.clone();
@@ -68,11 +85,86 @@ fn main() {
         telemetry_sender(telem_running, telem_ground);
     });
 
+    hb_handle.join().ok();
+    hm_handle.join().ok();
     video_handle.join().ok();
     rc_handle.join().ok();
     telem_handle.join().ok();
 
     tracing::info!("rpv-cam stopped");
+}
+
+fn heartbeat_receiver(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant>>) {
+    let socket = match UdpSocket::bind(format!("0.0.0.0:{}", HEARTBEAT_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                "Failed to bind heartbeat socket on port {}: {}",
+                HEARTBEAT_PORT,
+                e
+            );
+            return;
+        }
+    };
+
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+    tracing::info!("Heartbeat receiver listening on port {}", HEARTBEAT_PORT);
+
+    let mut buf = [0u8; 64];
+
+    while running.load(Ordering::SeqCst) {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _addr)) => {
+                if len >= 7 && &buf[..7] == b"rpv-bea" {
+                    *last_heartbeat.lock().unwrap() = Instant::now();
+                }
+            }
+            Err(_) => {
+                // timeout or error, keep waiting
+            }
+        }
+    }
+}
+
+fn heartbeat_monitor(
+    running: Arc<AtomicBool>,
+    ground_addr: Arc<Mutex<Option<IpAddr>>>,
+    last_heartbeat: Arc<Mutex<Instant>>,
+) {
+    tracing::info!("Heartbeat monitor started (timeout: 3s)");
+    thread::sleep(Duration::from_secs(3)); // initial grace period
+
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_secs(1));
+
+        let elapsed = last_heartbeat.lock().unwrap().elapsed();
+        if elapsed > Duration::from_secs(3) {
+            tracing::warn!(
+                "Heartbeat lost ({}s), triggering re-discovery...",
+                elapsed.as_secs()
+            );
+            write_link_status("searching");
+
+            // Non-blocking: spawn discovery in a background thread
+            let rediscover_ground = Arc::clone(&ground_addr);
+            thread::spawn(move || {
+                match std::panic::catch_unwind(|| discover::discover_ground(5)) {
+                    Ok(new_ip) => {
+                        tracing::info!("Re-discovered ground station at {}", new_ip);
+                        *rediscover_ground.lock().unwrap() = Some(new_ip);
+                        write_link_status("connected");
+                        // Reset heartbeat timer so we don't immediately re-trigger
+                    }
+                    Err(_) => {
+                        tracing::error!("Discovery panicked, will retry on next heartbeat check");
+                    }
+                }
+            });
+
+            // Wait before checking again
+            thread::sleep(Duration::from_secs(6));
+        }
+    }
 }
 
 fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
@@ -137,7 +229,11 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
             }
         });
 
-        tracing::info!("rpicam-vid started, streaming H.264 with FEC...");
+        tracing::info!(
+            "rpicam-vid started, streaming H.264 with FEC {}+{}...",
+            DATA_SHARDS,
+            PARITY_SHARDS
+        );
 
         let mut buf = vec![0u8; 65536];
         let mut total_bytes = 0u64;
@@ -169,7 +265,6 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
                                     seq,
                                     &target,
                                     &mut fail_count,
-                                    &ground_addr,
                                 );
                                 seq = seq.wrapping_add(1);
                             }
@@ -189,15 +284,7 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
         if !fec_buffer.is_empty() {
             if let Some(ip) = *ground_addr.lock().unwrap() {
                 let target = format!("{}:{}", ip, VIDEO_PORT);
-                send_fec_group(
-                    &socket,
-                    &rs,
-                    &fec_buffer,
-                    seq,
-                    &target,
-                    &mut fail_count,
-                    &ground_addr,
-                );
+                send_fec_group(&socket, &rs, &fec_buffer, seq, &target, &mut fail_count);
             }
             fec_buffer.clear();
         }
@@ -224,7 +311,6 @@ fn send_fec_group(
     seq: u32,
     target: &str,
     fail_count: &mut u8,
-    ground_addr: &Arc<Mutex<Option<IpAddr>>>,
 ) {
     // Determine shard size (max chunk length, padded)
     let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -268,12 +354,9 @@ fn send_fec_group(
                 *fail_count = fail_count.saturating_add(1);
                 tracing::warn!("Video send error: {} (fail_count={})", e, fail_count);
                 if *fail_count > 30 {
-                    tracing::warn!("Too many send failures, rediscovering ground station...");
-                    write_link_status("searching");
-                    let new_ip = discover::discover_ground(5);
-                    *ground_addr.lock().unwrap() = Some(new_ip);
-                    tracing::info!("Ground station refreshed to {}", new_ip);
-                    write_link_status("connected");
+                    tracing::warn!(
+                        "Too many send failures, will rely on heartbeat monitor for re-discovery"
+                    );
                     *fail_count = 0;
                     return;
                 }
@@ -361,14 +444,14 @@ fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAd
 
     let interval = Duration::from_millis(200); // 5Hz
     let camera_check_interval = Duration::from_secs(5);
-    let mut last_camera_check = std::time::Instant::now();
+    let mut last_camera_check = Instant::now();
     let mut camera_ok = check_camera_available();
     tracing::info!("Camera available: {}", camera_ok);
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
             camera_ok = check_camera_available();
-            last_camera_check = std::time::Instant::now();
+            last_camera_check = Instant::now();
         }
 
         if let Some(ip) = *ground_addr.lock().unwrap() {

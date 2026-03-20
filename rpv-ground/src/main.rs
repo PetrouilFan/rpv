@@ -428,10 +428,14 @@ fn main() -> Result<(), eframe::Error> {
     // Shared link status between video receiver and UI
     let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
 
+    // Shared camera IP for RC transmitter and heartbeat sender
+    let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
+
     let discovery_running = running.clone();
     let bg_link_status = Arc::clone(&link_status_shared);
+    let bg_cam_ip = Arc::clone(&cam_ip);
     std::thread::spawn(move || {
-        discovery::run(discovery_running, bg_link_status);
+        discovery::run(discovery_running, bg_link_status, bg_cam_ip);
     });
 
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
@@ -447,6 +451,7 @@ fn main() -> Result<(), eframe::Error> {
     let bg_telemetry = telemetry;
     let bg_config = config.clone();
     let bg_running = running.clone();
+    let bg_cam_ip2 = Arc::clone(&cam_ip);
 
     // Spawn tokio runtime in background thread
     std::thread::spawn(move || {
@@ -466,11 +471,48 @@ fn main() -> Result<(), eframe::Error> {
                 bg_telemetry.run(telem_port).await;
             });
 
-            // RC transmitter with dynamic cam IP (discovery responder provides it)
-            let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
-            let mut rc = crate::rc::joystick::RCTx::new(cam_ip, rc_port);
+            // RC transmitter with dynamic cam IP (discovery provides it)
+            let rc_cam_ip = Arc::clone(&bg_cam_ip2);
+            let mut rc = crate::rc::joystick::RCTx::new(rc_cam_ip, rc_port);
             tokio::spawn(async move {
                 rc.run().await;
+            });
+
+            // Heartbeat sender (ground → camera)
+            let hb_cam_ip = Arc::clone(&bg_cam_ip2);
+            tokio::spawn(async move {
+                let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to bind heartbeat sender socket: {}", e);
+                        return;
+                    }
+                };
+                let hb_port = 5603u16;
+                let mut seq: u32 = 0;
+                tracing::info!("Heartbeat sender ready on port {}", hb_port);
+
+                loop {
+                    let target = {
+                        let locked = hb_cam_ip.lock().unwrap();
+                        locked.map(|ip| format!("{}:{}", ip, hb_port))
+                    };
+                    if let Some(addr) = target {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+
+                        let mut pkt = [0u8; 19];
+                        pkt[..7].copy_from_slice(b"rpv-bea");
+                        pkt[7..11].copy_from_slice(&seq.to_le_bytes());
+                        pkt[11..19].copy_from_slice(&ts.to_le_bytes());
+
+                        let _ = socket.send_to(&pkt, &addr).await;
+                        seq = seq.wrapping_add(1);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
             });
 
             // Stay alive until ctrl+c
