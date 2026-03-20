@@ -308,7 +308,7 @@ fn rc_receiver(running: Arc<AtomicBool>) {
                 let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
                 let expected = 4 + count * 2;
 
-                if len < expected {
+                if len < expected || count > 126 {
                     continue;
                 }
 
@@ -331,6 +331,23 @@ fn rc_receiver(running: Arc<AtomicBool>) {
     }
 }
 
+fn check_camera_available() -> bool {
+    if let Ok(output) = std::process::Command::new("vcgencmd")
+        .arg("get_camera")
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // "supported=0 detected=0, libcamera interfaces=0"
+        // or "supported=1 detected=1, libcamera interfaces=1"
+        if let Some(val) = stdout.split("detected=").nth(1) {
+            if let Some(count) = val.split(',').next() {
+                return count.trim().parse::<i32>().unwrap_or(0) > 0;
+            }
+        }
+    }
+    false
+}
+
 fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -343,8 +360,17 @@ fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAd
     tracing::info!("Telemetry sender ready");
 
     let interval = Duration::from_millis(200); // 5Hz
+    let camera_check_interval = Duration::from_secs(5);
+    let mut last_camera_check = std::time::Instant::now();
+    let mut camera_ok = check_camera_available();
+    tracing::info!("Camera available: {}", camera_ok);
 
     while running.load(Ordering::SeqCst) {
+        if last_camera_check.elapsed() > camera_check_interval {
+            camera_ok = check_camera_available();
+            last_camera_check = std::time::Instant::now();
+        }
+
         if let Some(ip) = *ground_addr.lock().unwrap() {
             let target_addr = format!("{}:{}", ip, TELEMETRY_PORT);
 
@@ -359,6 +385,7 @@ fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAd
                 "battery_pct": 0,
                 "mode": "UNKNOWN",
                 "armed": false,
+                "camera_ok": camera_ok,
             });
 
             if let Ok(data) = serde_json::to_string(&telem) {

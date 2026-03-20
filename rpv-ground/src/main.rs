@@ -27,12 +27,14 @@ pub enum LinkStatus {
     Searching,
     Connected,
     SignalLost,
+    NoCamera,
 }
 
 pub struct AppState {
     pub texture: Option<TextureHandle>,
     pub last_frame_time: Instant,
     pub frame_count: u64,
+    pub fps_timer: Instant,
     pub fps: f64,
     pub link_status: LinkStatus,
     pub link_status_shared: Arc<Mutex<LinkStatus>>,
@@ -44,6 +46,9 @@ pub struct AppState {
 pub struct RpvApp {
     state: AppState,
     video_rx: Arc<Mutex<Option<DecodedYUV>>>,
+    rgba_buf: Vec<u8>,
+    needs_repaint: bool,
+    has_ever_had_frame: bool,
 }
 
 impl RpvApp {
@@ -54,10 +59,13 @@ impl RpvApp {
         running: Arc<AtomicBool>,
         link_status_shared: Arc<Mutex<LinkStatus>>,
     ) -> Self {
+        let w = config.video_width as usize;
+        let h = config.video_height as usize;
         Self {
             state: AppState {
                 texture: None,
                 last_frame_time: Instant::now(),
+                fps_timer: Instant::now(),
                 frame_count: 0,
                 fps: 0.0,
                 link_status: LinkStatus::Searching,
@@ -67,15 +75,19 @@ impl RpvApp {
                 running,
             },
             video_rx,
+            rgba_buf: vec![0u8; w * h * 4],
+            needs_repaint: false,
+            has_ever_had_frame: false,
         }
     }
 
-    fn update_texture(&mut self, ctx: &egui::Context) {
+    fn update_texture(&mut self, ctx: &egui::Context) -> bool {
         let frame_data = {
-            let lock = self.video_rx.lock().unwrap();
-            lock.clone()
+            let mut lock = self.video_rx.lock().unwrap();
+            lock.take()
         };
 
+        let mut had_frame = false;
         if let Some(yuv) = frame_data {
             let w = self.state.config.video_width as usize;
             let h = self.state.config.video_height as usize;
@@ -84,8 +96,8 @@ impl RpvApp {
                 && yuv.u_data.len() == (w / 2) * (h / 2)
                 && yuv.v_data.len() == (w / 2) * (h / 2)
             {
-                let rgba = yuv420p_to_rgba(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h);
-                let image = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                yuv420p_to_rgba_inplace(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf);
+                let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
 
                 if let Some(ref mut tex) = self.state.texture {
                     tex.set(image, egui::TextureOptions::default());
@@ -98,69 +110,92 @@ impl RpvApp {
                 }
 
                 self.state.frame_count += 1;
-                self.state.link_status = LinkStatus::Connected;
                 self.state.last_frame_time = Instant::now();
 
-                let elapsed = self.state.last_frame_time.elapsed().as_secs_f64();
-                if elapsed >= 1.0 {
-                    self.state.fps = self.state.frame_count as f64 / elapsed;
+                if self.state.frame_count == 30 {
+                    self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
                     self.state.frame_count = 0;
-                    self.state.last_frame_time = std::time::Instant::now();
+                    self.state.fps_timer = Instant::now();
                 }
+
+                if self.state.link_status != LinkStatus::Connected {
+                    self.state.link_status = LinkStatus::Connected;
+                    tracing::info!("Video: decoded frame received, link status = Connected");
+                }
+                self.has_ever_had_frame = true;
+                had_frame = true;
+            }
+        }
+        had_frame
+    }
+}
+
+fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) {
+
+    let mut y_idx = 0usize;
+    let mut uv_idx = 0usize;
+    let mut rgba_idx = 0usize;
+
+    for _ in 0..h {
+        for _ in 0..w {
+            let y_val = y[y_idx] as i32;
+            let u_val = u[uv_idx] as i32 - 128;
+            let v_val = v[uv_idx] as i32 - 128;
+
+            rgba[rgba_idx] = (y_val + ((359 * v_val) >> 8)).clamp(0, 255) as u8;
+            rgba[rgba_idx + 1] = (y_val - ((88 * u_val + 183 * v_val) >> 8)).clamp(0, 255) as u8;
+            rgba[rgba_idx + 2] = (y_val + ((454 * u_val) >> 8)).clamp(0, 255) as u8;
+            rgba[rgba_idx + 3] = 255;
+
+            y_idx += 1;
+            rgba_idx += 4;
+
+            if (y_idx % w) == 0 {
+                uv_idx += 1;
             }
         }
     }
 }
 
-fn yuv420p_to_rgba(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut rgba = vec![0u8; w * h * 4];
-    for row in 0..h {
-        for col in 0..w {
-            let y_val = y[row * w + col] as i32;
-            let uv_row = row / 2;
-            let uv_col = col / 2;
-            let u_val = u[uv_row * (w / 2) + uv_col] as i32 - 128;
-            let v_val = v[uv_row * (w / 2) + uv_col] as i32 - 128;
-
-            let r = (y_val + ((359 * v_val) >> 8)).clamp(0, 255) as u8;
-            let g = (y_val - ((88 * u_val + 183 * v_val) >> 8)).clamp(0, 255) as u8;
-            let b = (y_val + ((454 * u_val) >> 8)).clamp(0, 255) as u8;
-
-            let idx = (row * w + col) * 4;
-            rgba[idx] = r;
-            rgba[idx + 1] = g;
-            rgba[idx + 2] = b;
-            rgba[idx + 3] = 255;
-        }
-    }
-    rgba
-}
-
 impl eframe::App for RpvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for ctrl+c signal
         if !self.state.running.load(Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        self.update_texture(ctx);
+        let had_frame = self.update_texture(ctx);
+        self.needs_repaint = had_frame;
 
-        // Detect signal loss (no frames for 2+ seconds)
+        // Detect "no camera module" state
+        if !self.has_ever_had_frame {
+            let telem = self.state.telemetry.lock().unwrap();
+            if !telem.camera_ok && self.state.link_status != LinkStatus::NoCamera {
+                self.state.link_status = LinkStatus::NoCamera;
+                self.needs_repaint = true;
+            } else if telem.camera_ok && self.state.link_status == LinkStatus::NoCamera {
+                self.state.link_status = LinkStatus::Searching;
+                self.needs_repaint = true;
+            }
+        }
+
         if self.state.link_status == LinkStatus::Connected
             && self.state.last_frame_time.elapsed().as_secs() >= 2
         {
             self.state.link_status = LinkStatus::SignalLost;
+            self.needs_repaint = true;
         }
 
         if let Ok(shared) = self.state.link_status_shared.lock() {
-            if *shared == LinkStatus::Connected && self.state.link_status != LinkStatus::Connected {
-                tracing::info!("UI: syncing link_status from {:?} to Connected", self.state.link_status);
+            if *shared == LinkStatus::Connected && self.state.link_status == LinkStatus::Searching {
                 self.state.link_status = LinkStatus::Connected;
+                self.needs_repaint = true;
             }
         }
 
-        ctx.request_repaint();
+        if self.needs_repaint || self.state.link_status != LinkStatus::Connected {
+            ctx.request_repaint();
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK).inner_margin(0.0))
@@ -200,6 +235,7 @@ impl eframe::App for RpvApp {
                         LinkStatus::Searching => ("Searching for camera...", egui::Color32::YELLOW),
                         LinkStatus::SignalLost => ("Signal lost — reconnecting...", egui::Color32::RED),
                         LinkStatus::Connected => ("Waiting for video...", egui::Color32::GRAY),
+                        LinkStatus::NoCamera => ("No camera detected", egui::Color32::from_rgb(255, 160, 0)),
                     };
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -226,6 +262,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                     LinkStatus::Connected => ("LINK OK", egui::Color32::GREEN, true),
                     LinkStatus::Searching => ("SEARCHING", egui::Color32::YELLOW, false),
                     LinkStatus::SignalLost => ("SIGNAL LOST", egui::Color32::RED, false),
+                    LinkStatus::NoCamera => ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false),
                 };
 
                 // Status dot + text row
@@ -366,9 +403,11 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_target(false)
-        .with_level(true)
         .init();
 
     tracing::info!("rpv ground station starting");
@@ -388,36 +427,32 @@ fn main() -> Result<(), eframe::Error> {
 
     // Shared link status between video receiver and UI
     let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
-    let bg_link_status = Arc::clone(&link_status_shared);
 
-    // Start discovery responder with shared link status
     let discovery_running = running.clone();
-    let bg_link_status2 = Arc::clone(&link_status_shared);
+    let bg_link_status = Arc::clone(&link_status_shared);
     std::thread::spawn(move || {
-        discovery::run(discovery_running, bg_link_status2);
+        discovery::run(discovery_running, bg_link_status);
     });
 
-    // Create video decoder
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
     let decoded_frame = decoder.get_frame();
     decoder.spawn(video_frame_rx);
 
-    // Create telemetry receiver
-    let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared));
+    let telemetry = TelemetryReceiver::new();
     let telemetry_state = telemetry.get_state();
 
     config.save();
 
-    let bg_config = config.clone();
     let bg_video_frame_tx = video_frame_tx;
     let bg_telemetry = telemetry;
+    let bg_config = config.clone();
     let bg_running = running.clone();
 
     // Spawn tokio runtime in background thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_link_status).await
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;

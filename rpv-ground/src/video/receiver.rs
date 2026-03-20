@@ -1,12 +1,9 @@
 use std::collections::HashMap;
-use std::net::UdpSocket;
-use std::sync::{Arc, Mutex};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use reed_solomon_erasure::ReedSolomon;
-
-use crate::LinkStatus;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -24,39 +21,36 @@ struct FecGroup {
 
 pub struct VideoReceiver {
     tx: mpsc::UnboundedSender<VideoFrame>,
-    link_status: Arc<Mutex<LinkStatus>>,
     port: u16,
 }
 
 impl VideoReceiver {
-    pub async fn new(port: u16, tx: mpsc::UnboundedSender<VideoFrame>, link_status: Arc<Mutex<LinkStatus>>) -> std::io::Result<Self> {
+    pub async fn new(port: u16, tx: mpsc::UnboundedSender<VideoFrame>) -> std::io::Result<Self> {
         info!("Video receiver (FEC 4+2) ready on port {}", port);
-        Ok(Self { tx, link_status, port })
+        Ok(Self { tx, port })
     }
 
     pub async fn run(&self) {
         let bind_addr = format!("0.0.0.0:{}", self.port);
-        let socket = UdpSocket::bind(&bind_addr)
-            .expect("Failed to bind video socket");
+        let socket = match UdpSocket::bind(&bind_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to bind video socket on {}: {}", bind_addr, e);
+                return;
+            }
+        };
         info!("Video receiver listening on {}", bind_addr);
 
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 
-        let mut buf = [0u8; 65536];
+        let mut buf = vec![0u8; 65536];
         let mut fec_groups: HashMap<u32, FecGroup> = HashMap::new();
         let mut next_seq: Option<u32> = None;
 
         loop {
-            match socket.recv_from(&mut buf) {
-                Ok((len, addr)) => {
-                    if let Ok(mut status) = self.link_status.lock() {
-                        if *status != LinkStatus::Connected {
-                            *status = LinkStatus::Connected;
-                            tracing::info!("Link status updated to Connected (video from {})", addr);
-                        }
-                    }
-
+            match socket.recv_from(&mut buf).await {
+                Ok((len, _addr)) => {
                     if len < 8 {
                         // Too short for header, send raw
                         let frame = VideoFrame { data: buf[..len].to_vec() };
@@ -119,7 +113,7 @@ impl VideoReceiver {
                 }
                 Err(e) => {
                     warn!("Video receive error: {}", e);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }

@@ -21,21 +21,16 @@ pub fn run(responder_running: Arc<AtomicBool>, link_status: Arc<Mutex<LinkStatus
         match socket.recv_from(&mut buf) {
             Ok((len, sender)) => {
                 if &buf[..len] == b"rpv-cam" {
-                    tracing::info!("Discovery request from {}", sender.ip());
                     let _ = socket.send_to(b"rpv-ground", sender);
-                    match link_status.lock() {
-                        Ok(mut status) => {
-                            tracing::info!("Discovery: current status = {:?}", *status);
-                            if *status != LinkStatus::Connected {
-                                *status = LinkStatus::Connected;
-                                tracing::info!("Discovery: updated to Connected");
-                            } else {
-                                tracing::info!("Discovery: already Connected");
-                            }
+                    let mut needs_log = false;
+                    if let Ok(mut status) = link_status.lock() {
+                        if *status == LinkStatus::Searching {
+                            *status = LinkStatus::Connected;
+                            needs_log = true;
                         }
-                        Err(e) => {
-                            tracing::error!("Discovery: failed to lock link_status: {}", e);
-                        }
+                    }
+                    if needs_log {
+                        tracing::info!("Discovery: camera {} connected", sender.ip());
                     }
                 }
             }
