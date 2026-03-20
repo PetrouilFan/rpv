@@ -1,20 +1,21 @@
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
 pub struct RCTx {
     socket: Option<UdpSocket>,
-    camera_addr: String,
-    _port: u16,
+    cam_ip: Arc<Mutex<Option<IpAddr>>>,
+    port: u16,
     channels: Arc<Mutex<Vec<u16>>>,
 }
 
 impl RCTx {
-    pub fn new(camera_ip: &str, port: u16) -> Self {
+    pub fn new(cam_ip: Arc<Mutex<Option<IpAddr>>>, port: u16) -> Self {
         Self {
             socket: None,
-            camera_addr: format!("{}:{}", camera_ip, port),
-            _port: port,
+            cam_ip,
+            port,
             channels: Arc::new(Mutex::new(vec![1500; 16])),
         }
     }
@@ -28,12 +29,22 @@ impl RCTx {
             }
         }
 
-        info!("RC transmitter ready, target: {}", self.camera_addr);
+        info!("RC transmitter ready on port {}", self.port);
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(20));
 
         loop {
             interval.tick().await;
+
+            let cam_addr = {
+                let locked = self.cam_ip.lock().unwrap();
+                locked.map(|ip| format!("{}:{}", ip, self.port))
+            };
+
+            let cam_addr = match cam_addr {
+                Some(addr) => addr,
+                None => continue,
+            };
 
             // Clone channels data to avoid holding MutexGuard across await
             let channels = {
@@ -49,7 +60,7 @@ impl RCTx {
             }
 
             if let Some(ref socket) = self.socket {
-                let _ = socket.send_to(&packet, &self.camera_addr).await;
+                let _ = socket.send_to(&packet, &cam_addr).await;
             }
         }
     }

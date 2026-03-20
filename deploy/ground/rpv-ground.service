@@ -1,0 +1,15 @@
+[Unit]
+Description=RPV Ground Station
+After=network.target
+Wants=network.target
+
+[Service]
+ExecStartPre=/usr/local/bin/rpv-net-setup.sh
+ExecStart=/usr/local/bin/rpv-ground
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

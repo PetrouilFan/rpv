@@ -1,4 +1,5 @@
 mod config;
+mod discovery;
 mod telemetry;
 mod video {
     pub mod receiver;
@@ -8,8 +9,10 @@ mod rc {
     pub mod joystick;
 }
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use egui::{ColorImage, TextureHandle, Vec2};
 use tokio::sync::mpsc;
@@ -19,12 +22,20 @@ use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::receiver::VideoReceiver;
 use crate::video::decoder::{VideoDecoder, DecodedYUV};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkStatus {
+    Searching,
+    Connected,
+    SignalLost,
+}
+
 pub struct AppState {
     pub texture: Option<TextureHandle>,
-    pub last_frame_time: std::time::Instant,
+    pub last_frame_time: Instant,
     pub frame_count: u64,
     pub fps: f64,
-    pub connected: bool,
+    pub link_status: LinkStatus,
+    pub link_status_shared: Arc<Mutex<LinkStatus>>,
     pub config: Config,
     pub telemetry: Arc<Mutex<Telemetry>>,
     pub running: Arc<AtomicBool>,
@@ -41,14 +52,16 @@ impl RpvApp {
         video_rx: Arc<Mutex<Option<DecodedYUV>>>,
         telemetry: Arc<Mutex<Telemetry>>,
         running: Arc<AtomicBool>,
+        link_status_shared: Arc<Mutex<LinkStatus>>,
     ) -> Self {
         Self {
             state: AppState {
                 texture: None,
-                last_frame_time: std::time::Instant::now(),
+                last_frame_time: Instant::now(),
                 frame_count: 0,
                 fps: 0.0,
-                connected: false,
+                link_status: LinkStatus::Searching,
+                link_status_shared,
                 config,
                 telemetry,
                 running,
@@ -85,7 +98,8 @@ impl RpvApp {
                 }
 
                 self.state.frame_count += 1;
-                self.state.connected = true;
+                self.state.link_status = LinkStatus::Connected;
+                self.state.last_frame_time = Instant::now();
 
                 let elapsed = self.state.last_frame_time.elapsed().as_secs_f64();
                 if elapsed >= 1.0 {
@@ -123,7 +137,7 @@ fn yuv420p_to_rgba(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize) -> Vec<u8> 
 }
 
 impl eframe::App for RpvApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Check for ctrl+c signal
         if !self.state.running.load(Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -131,6 +145,20 @@ impl eframe::App for RpvApp {
         }
 
         self.update_texture(ctx);
+
+        // Detect signal loss (no frames for 2+ seconds)
+        if self.state.link_status == LinkStatus::Connected
+            && self.state.last_frame_time.elapsed().as_secs() >= 2
+        {
+            self.state.link_status = LinkStatus::SignalLost;
+        }
+
+        if let Ok(shared) = self.state.link_status_shared.lock() {
+            if *shared == LinkStatus::Connected && self.state.link_status != LinkStatus::Connected {
+                tracing::info!("UI: syncing link_status from {:?} to Connected", self.state.link_status);
+                self.state.link_status = LinkStatus::Connected;
+            }
+        }
 
         ctx.request_repaint();
 
@@ -168,11 +196,16 @@ impl eframe::App for RpvApp {
                         0.0,
                         egui::Color32::from_gray(20),
                     );
+                    let (wait_text, wait_color) = match self.state.link_status {
+                        LinkStatus::Searching => ("Searching for camera...", egui::Color32::YELLOW),
+                        LinkStatus::SignalLost => ("Signal lost — reconnecting...", egui::Color32::RED),
+                        LinkStatus::Connected => ("Waiting for video...", egui::Color32::GRAY),
+                    };
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            egui::RichText::new("Waiting for video...")
+                            egui::RichText::new(wait_text)
                                 .size(32.0)
-                                .color(egui::Color32::GRAY),
+                                .color(wait_color),
                         );
                     });
                 }
@@ -189,23 +222,56 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         .fixed_pos(egui::pos2(10.0, 10.0))
         .show(ui.ctx(), |ui| {
             ui.vertical(|ui| {
-                let status_color = if state.connected {
-                    egui::Color32::GREEN
-                } else {
-                    egui::Color32::RED
+                let (label, color, show_dot) = match state.link_status {
+                    LinkStatus::Connected => ("LINK OK", egui::Color32::GREEN, true),
+                    LinkStatus::Searching => ("SEARCHING", egui::Color32::YELLOW, false),
+                    LinkStatus::SignalLost => ("SIGNAL LOST", egui::Color32::RED, false),
+                };
+
+                // Status dot + text row
+                ui.horizontal(|ui| {
+                    if show_dot {
+                        let dot_size = 10.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(dot_size, dot_size),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
+                    } else {
+                        // Blinking dot for searching/lost
+                        let ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let blink = (ms / 500) % 2 == 0;
+                        if blink {
+                            let dot_size = 10.0;
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(dot_size, dot_size),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
+                        } else {
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(14.0)
+                            .color(color),
+                    );
+                });
+
+                // FPS line
+                let fps_color = match state.link_status {
+                    LinkStatus::Connected => egui::Color32::from_gray(200),
+                    _ => egui::Color32::from_gray(100),
                 };
                 ui.label(
                     egui::RichText::new(format!("FPS: {:.1}", state.fps))
-                        .size(14.0)
-                        .color(status_color),
+                        .size(12.0)
+                        .color(fps_color),
                 );
-                if state.connected {
-                    ui.label(
-                        egui::RichText::new("CONNECTED")
-                            .size(14.0)
-                            .color(egui::Color32::GREEN),
-                    );
-                }
             });
         });
 
@@ -320,13 +386,24 @@ fn main() -> Result<(), eframe::Error> {
 
     let (video_frame_tx, video_frame_rx) = mpsc::unbounded_channel();
 
+    // Shared link status between video receiver and UI
+    let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
+    let bg_link_status = Arc::clone(&link_status_shared);
+
+    // Start discovery responder with shared link status
+    let discovery_running = running.clone();
+    let bg_link_status2 = Arc::clone(&link_status_shared);
+    std::thread::spawn(move || {
+        discovery::run(discovery_running, bg_link_status2);
+    });
+
     // Create video decoder
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
     let decoded_frame = decoder.get_frame();
     decoder.spawn(video_frame_rx);
 
     // Create telemetry receiver
-    let telemetry = TelemetryReceiver::new();
+    let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared));
     let telemetry_state = telemetry.get_state();
 
     config.save();
@@ -340,11 +417,10 @@ fn main() -> Result<(), eframe::Error> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx).await
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_link_status).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;
-            let camera_ip = bg_config.camera_ip.clone();
             let rc_port = bg_config.rc_port;
 
             tokio::spawn(async move {
@@ -355,7 +431,9 @@ fn main() -> Result<(), eframe::Error> {
                 bg_telemetry.run(telem_port).await;
             });
 
-            let mut rc = crate::rc::joystick::RCTx::new(&camera_ip, rc_port);
+            // RC transmitter with dynamic cam IP (discovery responder provides it)
+            let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
+            let mut rc = crate::rc::joystick::RCTx::new(cam_ip, rc_port);
             tokio::spawn(async move {
                 rc.run().await;
             });
@@ -398,7 +476,7 @@ fn main() -> Result<(), eframe::Error> {
         "rpv ground station",
         native_options,
         Box::new(|_cc| {
-            Ok(Box::new(RpvApp::new(config, decoded_frame, telemetry_state, app_running)))
+            Ok(Box::new(RpvApp::new(config, decoded_frame, telemetry_state, app_running, link_status_shared)))
         }),
     )
 }

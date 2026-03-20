@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
+use crate::LinkStatus;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
     pub lat: f64,
@@ -36,12 +38,14 @@ impl Default for Telemetry {
 
 pub struct TelemetryReceiver {
     state: Arc<Mutex<Telemetry>>,
+    link_status: Arc<Mutex<LinkStatus>>,
 }
 
 impl TelemetryReceiver {
-    pub fn new() -> Self {
+    pub fn new(link_status: Arc<Mutex<LinkStatus>>) -> Self {
         Self {
             state: Arc::new(Mutex::new(Telemetry::default())),
+            link_status,
         }
     }
 
@@ -68,8 +72,19 @@ impl TelemetryReceiver {
                     if let Ok(json_str) = std::str::from_utf8(&buf[..len]) {
                         if let Ok(telem) = serde_json::from_str::<Telemetry>(json_str) {
                             let mut state = self.state.lock().unwrap();
-                            *state = telem;
+                            *state = telem.clone();
+
+                            if let Ok(mut status) = self.link_status.lock() {
+                                if *status != LinkStatus::Connected {
+                                    *status = LinkStatus::Connected;
+                                    tracing::info!("Link status updated to Connected (telemetry)");
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Telemetry: failed to parse JSON: {:?}", &json_str[..json_str.len().min(50)]);
                         }
+                    } else {
+                        tracing::warn!("Telemetry: invalid UTF-8: {:?}", &buf[..len.min(20)]);
                     }
                 }
                 Err(e) => {

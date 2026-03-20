@@ -1,15 +1,27 @@
-use std::io::{Read, Write, BufReader};
-use std::net::UdpSocket;
+mod discover;
+
+use std::io::{BufReader, Read};
+use std::net::{IpAddr, UdpSocket};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const GROUND_IP: &str = "192.168.100.116";
+use reed_solomon_erasure::ReedSolomon;
+
 const VIDEO_PORT: u16 = 5600;
 const TELEMETRY_PORT: u16 = 5601;
 const RC_PORT: u16 = 5602;
+
+const DATA_SHARDS: usize = 4;
+const PARITY_SHARDS: usize = 2;
+const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+const STATUS_FILE: &str = "/tmp/rpv_link_status";
+
+fn write_link_status(status: &str) {
+    let _ = std::fs::write(STATUS_FILE, status);
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -25,12 +37,22 @@ fn main() {
     ctrlc::set_handler(move || {
         tracing::info!("Shutting down...");
         r.store(false, Ordering::SeqCst);
-    }).ok();
+    })
+    .ok();
+
+    tracing::info!("Discovering ground station...");
+    write_link_status("searching");
+    let ground_ip = discover::discover_ground(5);
+    tracing::info!("Ground station at {}", ground_ip);
+    write_link_status("connected");
+
+    let ground_addr = Arc::new(Mutex::new(Some(ground_ip)));
 
     // Start video capture and streaming
     let video_running = running.clone();
+    let video_ground = Arc::clone(&ground_addr);
     let video_handle = thread::spawn(move || {
-        video_loop(video_running);
+        video_loop(video_running, video_ground);
     });
 
     // Start RC receiver
@@ -39,10 +61,11 @@ fn main() {
         rc_receiver(rc_running);
     });
 
-    // Start telemetry sender (dummy for now)
+    // Start telemetry sender
     let telem_running = running.clone();
+    let telem_ground = Arc::clone(&ground_addr);
     let telem_handle = thread::spawn(move || {
-        telemetry_sender(telem_running);
+        telemetry_sender(telem_running, telem_ground);
     });
 
     video_handle.join().ok();
@@ -52,25 +75,43 @@ fn main() {
     tracing::info!("rpv-cam stopped");
 }
 
-fn video_loop(running: Arc<AtomicBool>) {
-    let target_addr = format!("{}:{}", GROUND_IP, VIDEO_PORT);
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind video socket");
-    tracing::info!("Video sender -> {}", target_addr);
+fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => {
+            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+            s
+        }
+        Err(e) => {
+            tracing::error!("Failed to bind video socket: {}", e);
+            return;
+        }
+    };
+    tracing::info!("Video sender ready (FEC {}+{})", DATA_SHARDS, PARITY_SHARDS);
+
+    let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
+        .expect("Failed to create Reed-Solomon encoder");
 
     while running.load(Ordering::SeqCst) {
         tracing::info!("Starting rpicam-vid...");
 
         let child = Command::new("rpicam-vid")
             .args(&[
-                "--width", "1280",
-                "--height", "720",
-                "--framerate", "30",
-                "--codec", "h264",
-                "--bitrate", "4000000",
+                "--width",
+                "1280",
+                "--height",
+                "720",
+                "--framerate",
+                "30",
+                "--codec",
+                "h264",
+                "--bitrate",
+                "4000000",
                 "--inline",
                 "--nopreview",
-                "-t", "0",
-                "-o", "-",
+                "-t",
+                "0",
+                "-o",
+                "-",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -88,7 +129,6 @@ fn video_loop(running: Arc<AtomicBool>) {
         let stdout = child.stdout.take().expect("No stdout");
         let mut reader = BufReader::new(stdout);
 
-        // Read stderr in background
         let stderr = child.stderr.take();
         thread::spawn(move || {
             if let Some(mut stderr) = stderr {
@@ -97,10 +137,13 @@ fn video_loop(running: Arc<AtomicBool>) {
             }
         });
 
-        tracing::info!("rpicam-vid started, streaming H.264...");
+        tracing::info!("rpicam-vid started, streaming H.264 with FEC...");
 
         let mut buf = vec![0u8; 65536];
         let mut total_bytes = 0u64;
+        let mut seq: u32 = 0;
+        let mut fail_count: u8 = 0;
+        let mut fec_buffer: Vec<Vec<u8>> = Vec::with_capacity(DATA_SHARDS);
 
         while running.load(Ordering::SeqCst) {
             match reader.read(&mut buf) {
@@ -109,13 +152,29 @@ fn video_loop(running: Arc<AtomicBool>) {
                     break;
                 }
                 Ok(n) => {
-                    // Send H.264 data over UDP
-                    // Split into chunks if larger than MTU
+                    // Split into chunks and add to FEC buffer
                     let mut offset = 0;
                     while offset < n {
                         let chunk_size = (n - offset).min(1300);
-                        let _ = socket.send_to(&buf[offset..offset + chunk_size], &target_addr);
+                        fec_buffer.push(buf[offset..offset + chunk_size].to_vec());
                         offset += chunk_size;
+
+                        if fec_buffer.len() == DATA_SHARDS {
+                            if let Some(ip) = *ground_addr.lock().unwrap() {
+                                let target = format!("{}:{}", ip, VIDEO_PORT);
+                                send_fec_group(
+                                    &socket,
+                                    &rs,
+                                    &fec_buffer,
+                                    seq,
+                                    &target,
+                                    &mut fail_count,
+                                    &ground_addr,
+                                );
+                                seq = seq.wrapping_add(1);
+                            }
+                            fec_buffer.clear();
+                        }
                     }
                     total_bytes += n as u64;
                 }
@@ -124,6 +183,23 @@ fn video_loop(running: Arc<AtomicBool>) {
                     break;
                 }
             }
+        }
+
+        // Send any remaining partial group
+        if !fec_buffer.is_empty() {
+            if let Some(ip) = *ground_addr.lock().unwrap() {
+                let target = format!("{}:{}", ip, VIDEO_PORT);
+                send_fec_group(
+                    &socket,
+                    &rs,
+                    &fec_buffer,
+                    seq,
+                    &target,
+                    &mut fail_count,
+                    &ground_addr,
+                );
+            }
+            fec_buffer.clear();
         }
 
         let _ = child.kill();
@@ -141,6 +217,71 @@ fn video_loop(running: Arc<AtomicBool>) {
     }
 }
 
+fn send_fec_group(
+    socket: &UdpSocket,
+    rs: &reed_solomon_erasure::galois_8::ReedSolomon,
+    chunks: &[Vec<u8>],
+    seq: u32,
+    target: &str,
+    fail_count: &mut u8,
+    ground_addr: &Arc<Mutex<Option<IpAddr>>>,
+) {
+    // Determine shard size (max chunk length, padded)
+    let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
+    if shard_size == 0 {
+        return;
+    }
+
+    // Build data shards with padding
+    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
+    for chunk in chunks {
+        let mut shard = vec![0u8; shard_size];
+        shard[..chunk.len()].copy_from_slice(chunk);
+        shards.push(shard);
+    }
+    // Add empty parity placeholders
+    for _ in 0..PARITY_SHARDS {
+        shards.push(vec![0u8; shard_size]);
+    }
+
+    // Encode parity
+    if let Err(e) = rs.encode(&mut shards) {
+        tracing::warn!("Reed-Solomon encode error: {:?}", e);
+        return;
+    }
+
+    // Send all shards
+    for (i, shard) in shards.iter().enumerate() {
+        // Header: [4B seq][1B shard_index][1B total_shards][2B shard_len]
+        let mut packet = Vec::with_capacity(8 + shard.len());
+        packet.extend_from_slice(&seq.to_le_bytes());
+        packet.push(i as u8);
+        packet.push(TOTAL_SHARDS as u8);
+        packet.extend_from_slice(&(shard.len() as u16).to_le_bytes());
+        packet.extend_from_slice(shard);
+
+        match socket.send_to(&packet, target) {
+            Ok(_) => {
+                *fail_count = 0;
+            }
+            Err(e) => {
+                *fail_count = fail_count.saturating_add(1);
+                tracing::warn!("Video send error: {} (fail_count={})", e, fail_count);
+                if *fail_count > 30 {
+                    tracing::warn!("Too many send failures, rediscovering ground station...");
+                    write_link_status("searching");
+                    let new_ip = discover::discover_ground(5);
+                    *ground_addr.lock().unwrap() = Some(new_ip);
+                    tracing::info!("Ground station refreshed to {}", new_ip);
+                    write_link_status("connected");
+                    *fail_count = 0;
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn rc_receiver(running: Arc<AtomicBool>) {
     let bind_addr = format!("0.0.0.0:{}", RC_PORT);
     let socket = match UdpSocket::bind(&bind_addr) {
@@ -154,7 +295,7 @@ fn rc_receiver(running: Arc<AtomicBool>) {
     tracing::info!("RC receiver listening on {}", bind_addr);
 
     let mut buf = [0u8; 256];
-    let mut rc_file_path = "/tmp/rpv_rc_channels";
+    let rc_file_path = "/tmp/rpv_rc_channels";
 
     while running.load(Ordering::SeqCst) {
         match socket.recv_from(&mut buf) {
@@ -190,8 +331,7 @@ fn rc_receiver(running: Arc<AtomicBool>) {
     }
 }
 
-fn telemetry_sender(running: Arc<AtomicBool>) {
-    let target_addr = format!("{}:{}", GROUND_IP, TELEMETRY_PORT);
+fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => {
@@ -200,26 +340,30 @@ fn telemetry_sender(running: Arc<AtomicBool>) {
         }
     };
 
-    tracing::info!("Telemetry sender -> {}", target_addr);
+    tracing::info!("Telemetry sender ready");
 
-    let mut interval = Duration::from_millis(200); // 5Hz
+    let interval = Duration::from_millis(200); // 5Hz
 
     while running.load(Ordering::SeqCst) {
-        let telem = serde_json::json!({
-            "lat": 0.0,
-            "lon": 0.0,
-            "alt": 0.0,
-            "heading": 0.0,
-            "speed": 0.0,
-            "satellites": 0,
-            "battery_v": 0.0,
-            "battery_pct": 0,
-            "mode": "UNKNOWN",
-            "armed": false,
-        });
+        if let Some(ip) = *ground_addr.lock().unwrap() {
+            let target_addr = format!("{}:{}", ip, TELEMETRY_PORT);
 
-        if let Ok(data) = serde_json::to_string(&telem) {
-            let _ = socket.send_to(data.as_bytes(), &target_addr);
+            let telem = serde_json::json!({
+                "lat": 0.0,
+                "lon": 0.0,
+                "alt": 0.0,
+                "heading": 0.0,
+                "speed": 0.0,
+                "satellites": 0,
+                "battery_v": 0.0,
+                "battery_pct": 0,
+                "mode": "UNKNOWN",
+                "armed": false,
+            });
+
+            if let Ok(data) = serde_json::to_string(&telem) {
+                let _ = socket.send_to(data.as_bytes(), &target_addr);
+            }
         }
 
         thread::sleep(interval);
