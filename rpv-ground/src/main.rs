@@ -45,7 +45,7 @@ pub struct AppState {
 
 pub struct RpvApp {
     state: AppState,
-    video_rx: Arc<Mutex<Option<DecodedYUV>>>,
+    frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
     rgba_buf: Vec<u8>,
     needs_repaint: bool,
     has_ever_had_frame: bool,
@@ -54,7 +54,7 @@ pub struct RpvApp {
 impl RpvApp {
     pub fn new(
         config: Config,
-        video_rx: Arc<Mutex<Option<DecodedYUV>>>,
+        frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
         telemetry: Arc<Mutex<Telemetry>>,
         running: Arc<AtomicBool>,
         link_status_shared: Arc<Mutex<LinkStatus>>,
@@ -74,7 +74,7 @@ impl RpvApp {
                 telemetry,
                 running,
             },
-            video_rx,
+            frame_rx,
             rgba_buf: vec![0u8; w * h * 4],
             needs_repaint: false,
             has_ever_had_frame: false,
@@ -82,10 +82,12 @@ impl RpvApp {
     }
 
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
-        let frame_data = {
-            let mut lock = self.video_rx.lock().unwrap();
-            lock.take()
-        };
+        // Drain all queued frames, keep only the latest
+        let mut latest = None;
+        while let Ok(frame) = self.frame_rx.try_recv() {
+            latest = Some(frame);
+        }
+        let frame_data = latest;
 
         let mut had_frame = false;
         if let Some(yuv) = frame_data {
@@ -96,16 +98,18 @@ impl RpvApp {
                 && yuv.u_data.len() == (w / 2) * (h / 2)
                 && yuv.v_data.len() == (w / 2) * (h / 2)
             {
-                yuv420p_to_rgba_inplace(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf);
+                if let Err(e) = yuv420p_to_rgba_inplace(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf) {
+                    tracing::warn!("YUV conversion error: {}", e);
+                }
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
 
                 if let Some(ref mut tex) = self.state.texture {
-                    tex.set(image, egui::TextureOptions::default());
+                    tex.set(image, egui::TextureOptions::LINEAR);
                 } else {
                     self.state.texture = Some(ctx.load_texture(
                         "video",
                         image,
-                        egui::TextureOptions::default(),
+                        egui::TextureOptions::LINEAR,
                     ));
                 }
 
@@ -130,31 +134,30 @@ impl RpvApp {
     }
 }
 
-fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) {
+fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) -> Result<(), String> {
+    // Manual YUV420p to RGBA conversion - avoids crate compatibility issues
+    for row in 0..h {
+        for col in 0..w {
+            let y_idx = row * w + col;
+            let uv_idx = (row / 2) * (w / 2) + (col / 2);
 
-    let mut y_idx = 0usize;
-    let mut uv_idx = 0usize;
-    let mut rgba_idx = 0usize;
-
-    for _ in 0..h {
-        for _ in 0..w {
             let y_val = y[y_idx] as i32;
             let u_val = u[uv_idx] as i32 - 128;
             let v_val = v[uv_idx] as i32 - 128;
 
-            rgba[rgba_idx] = (y_val + ((359 * v_val) >> 8)).clamp(0, 255) as u8;
-            rgba[rgba_idx + 1] = (y_val - ((88 * u_val + 183 * v_val) >> 8)).clamp(0, 255) as u8;
-            rgba[rgba_idx + 2] = (y_val + ((454 * u_val) >> 8)).clamp(0, 255) as u8;
+            // BT.601 limited range
+            let r = ((y_val * 256 + v_val * 359 + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((y_val * 256 - u_val * 88 - v_val * 183 + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((y_val * 256 + u_val * 454 + 128) >> 8).clamp(0, 255) as u8;
+
+            let rgba_idx = y_idx * 4;
+            rgba[rgba_idx] = r;
+            rgba[rgba_idx + 1] = g;
+            rgba[rgba_idx + 2] = b;
             rgba[rgba_idx + 3] = 255;
-
-            y_idx += 1;
-            rgba_idx += 4;
-
-            if (y_idx % w) == 0 {
-                uv_idx += 1;
-            }
         }
     }
+    Ok(())
 }
 
 impl eframe::App for RpvApp {
@@ -179,22 +182,20 @@ impl eframe::App for RpvApp {
             }
         }
 
-        if self.state.link_status == LinkStatus::Connected
-            && self.state.last_frame_time.elapsed().as_secs() >= 2
-        {
-            self.state.link_status = LinkStatus::SignalLost;
-            self.needs_repaint = true;
-        }
+        // Signal loss detection is handled by the telemetry receiver thread.
+        // The GUI just reads the shared link_status.
 
         if let Ok(shared) = self.state.link_status_shared.lock() {
-            if *shared == LinkStatus::Connected && self.state.link_status == LinkStatus::Searching {
-                self.state.link_status = LinkStatus::Connected;
+            if *shared != self.state.link_status {
+                self.state.link_status = *shared;
                 self.needs_repaint = true;
             }
         }
 
-        if self.needs_repaint || self.state.link_status != LinkStatus::Connected {
-            ctx.request_repaint();
+        if self.needs_repaint {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        } else if self.state.link_status != LinkStatus::Connected {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         egui::CentralPanel::default()
@@ -423,13 +424,18 @@ fn main() -> Result<(), eframe::Error> {
         r.store(false, Ordering::SeqCst);
     }).expect("Failed to set ctrl+c handler");
 
-    let (video_frame_tx, video_frame_rx) = mpsc::unbounded_channel();
+    let (video_frame_tx, video_frame_rx) = mpsc::channel(64);
 
     // Shared link status between video receiver and UI
     let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
 
     // Shared camera IP for RC transmitter and heartbeat sender
-    let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
+    // Pre-populate from config so we connect directly without waiting for broadcast discovery
+    let initial_cam_ip: Option<IpAddr> = config.camera_ip.parse().ok();
+    if let Some(ip) = initial_cam_ip {
+        tracing::info!("Using static camera IP from config: {}", ip);
+    }
+    let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(initial_cam_ip));
 
     let discovery_running = running.clone();
     let bg_link_status = Arc::clone(&link_status_shared);
@@ -439,10 +445,10 @@ fn main() -> Result<(), eframe::Error> {
     });
 
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
-    let decoded_frame = decoder.get_frame();
+    let frame_rx = decoder.get_rx();
     decoder.spawn(video_frame_rx);
 
-    let telemetry = TelemetryReceiver::new();
+    let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared));
     let telemetry_state = telemetry.get_state();
 
     config.save();
@@ -553,7 +559,7 @@ fn main() -> Result<(), eframe::Error> {
         "rpv ground station",
         native_options,
         Box::new(|_cc| {
-            Ok(Box::new(RpvApp::new(config, decoded_frame, telemetry_state, app_running, link_status_shared)))
+            Ok(Box::new(RpvApp::new(config, frame_rx, telemetry_state, app_running, link_status_shared)))
         }),
     )
 }

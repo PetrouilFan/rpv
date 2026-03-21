@@ -1,9 +1,10 @@
 use std::net::{IpAddr, UdpSocket};
 use std::time::Duration;
 
-pub fn discover_ground(timeout_secs: u64) -> IpAddr {
-    let socket =
-        UdpSocket::bind("0.0.0.0:5599").expect("Failed to bind discovery socket on port 5599");
+pub fn discover_ground(timeout_secs: u64, fallback_ip: Option<IpAddr>) -> IpAddr {
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap_or_else(|e| {
+        panic!("Failed to bind ephemeral socket: {}", e);
+    });
     socket
         .set_broadcast(true)
         .expect("Failed to enable broadcast on discovery socket");
@@ -12,6 +13,7 @@ pub fn discover_ground(timeout_secs: u64) -> IpAddr {
         .expect("Failed to set read timeout on discovery socket");
 
     let mut attempt = 0u64;
+    let max_broadcast_attempts = 3;
 
     loop {
         attempt += 1;
@@ -21,6 +23,11 @@ pub fn discover_ground(timeout_secs: u64) -> IpAddr {
         );
 
         let _ = socket.send_to(b"rpv-cam", "255.255.255.255:5599");
+
+        // Also send unicast to fallback IP if available (radio link may not support broadcast)
+        if let Some(ip) = fallback_ip {
+            let _ = socket.send_to(b"rpv-cam", format!("{}:5599", ip));
+        }
 
         // Read responses, skipping our own broadcast echo
         loop {
@@ -38,6 +45,18 @@ pub fn discover_ground(timeout_secs: u64) -> IpAddr {
                     // Timeout or error — break inner loop, retry broadcast
                     break;
                 }
+            }
+        }
+
+        // After several failed broadcast attempts, use fallback IP if available
+        if attempt >= max_broadcast_attempts {
+            if let Some(ip) = fallback_ip {
+                tracing::info!(
+                    "Broadcast discovery failed after {} attempts, using static ground IP: {}",
+                    attempt,
+                    ip
+                );
+                return ip;
             }
         }
     }

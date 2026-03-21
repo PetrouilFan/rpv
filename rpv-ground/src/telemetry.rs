@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
+use crate::LinkStatus;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
     pub lat: f64,
@@ -43,12 +45,14 @@ impl Default for Telemetry {
 
 pub struct TelemetryReceiver {
     state: Arc<Mutex<Telemetry>>,
+    link_status: Arc<Mutex<LinkStatus>>,
 }
 
 impl TelemetryReceiver {
-    pub fn new() -> Self {
+    pub fn new(link_status: Arc<Mutex<LinkStatus>>) -> Self {
         Self {
             state: Arc::new(Mutex::new(Telemetry::default())),
+            link_status,
         }
     }
 
@@ -70,18 +74,36 @@ impl TelemetryReceiver {
         let mut buf = vec![0u8; 4096];
 
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, _)) => {
+            let timeout = tokio::time::Duration::from_secs(3);
+            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, _))) => {
                     if let Ok(json_str) = std::str::from_utf8(&buf[..len]) {
                         if let Ok(telem) = serde_json::from_str::<Telemetry>(json_str) {
                             let mut state = self.state.lock().unwrap();
                             *state = telem;
+
+                            // Set link to Connected when telemetry arrives
+                            if let Ok(mut status) = self.link_status.lock() {
+                                if *status == LinkStatus::Searching || *status == LinkStatus::SignalLost {
+                                    *status = LinkStatus::Connected;
+                                    info!("Telemetry: camera connected");
+                                }
+                            }
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("Telemetry recv error: {}", e);
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    // Timeout - no telemetry for 3 seconds
+                    if let Ok(mut status) = self.link_status.lock() {
+                        if *status == LinkStatus::Connected {
+                            *status = LinkStatus::SignalLost;
+                            warn!("Telemetry: no data for 3s, signal lost");
+                        }
+                    }
                 }
             }
         }

@@ -768,6 +768,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2712,6 +2721,7 @@ dependencies = [
  "reed-solomon-erasure",
  "serde",
  "serde_json",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2720,10 +2730,12 @@ dependencies = [
 name = "rpv-ground"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "ctrlc",
  "eframe",
  "egui",
  "egui-wgpu",
+ "libc",
  "reed-solomon-erasure",
  "serde",
  "serde_json",

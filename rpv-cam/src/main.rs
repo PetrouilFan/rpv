@@ -1,3 +1,4 @@
+mod config;
 mod discover;
 
 use std::io::{BufReader, Read};
@@ -16,7 +17,7 @@ const RC_PORT: u16 = 5602;
 const HEARTBEAT_PORT: u16 = 5603;
 
 const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 4;
+const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
@@ -32,6 +33,9 @@ fn main() {
 
     tracing::info!("rpv-cam starting on Raspberry Pi Zero 2W");
 
+    let config = config::Config::load();
+    tracing::info!("Config: {:?}", config);
+
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
@@ -43,7 +47,8 @@ fn main() {
 
     tracing::info!("Discovering ground station...");
     write_link_status("searching");
-    let ground_ip = discover::discover_ground(5);
+    let fallback_ip: Option<IpAddr> = config.ground_ip.parse().ok();
+    let ground_ip = discover::discover_ground(5, fallback_ip);
     tracing::info!("Ground station at {}", ground_ip);
     write_link_status("connected");
 
@@ -61,8 +66,9 @@ fn main() {
     let hm_running = running.clone();
     let hm_ground = Arc::clone(&ground_addr);
     let hm_last = Arc::clone(&last_heartbeat);
+    let hm_fallback = fallback_ip;
     let hm_handle = thread::spawn(move || {
-        heartbeat_monitor(hm_running, hm_ground, hm_last);
+        heartbeat_monitor(hm_running, hm_ground, hm_last, hm_fallback);
     });
 
     // Start video capture and streaming
@@ -130,6 +136,7 @@ fn heartbeat_monitor(
     running: Arc<AtomicBool>,
     ground_addr: Arc<Mutex<Option<IpAddr>>>,
     last_heartbeat: Arc<Mutex<Instant>>,
+    fallback_ip: Option<IpAddr>,
 ) {
     tracing::info!("Heartbeat monitor started (timeout: 3s)");
     thread::sleep(Duration::from_secs(3)); // initial grace period
@@ -147,8 +154,10 @@ fn heartbeat_monitor(
 
             // Non-blocking: spawn discovery in a background thread
             let rediscover_ground = Arc::clone(&ground_addr);
+            let rediscover_fallback = fallback_ip;
             thread::spawn(move || {
-                match std::panic::catch_unwind(|| discover::discover_ground(5)) {
+                match std::panic::catch_unwind(|| discover::discover_ground(5, rediscover_fallback))
+                {
                     Ok(new_ip) => {
                         tracing::info!("Re-discovered ground station at {}", new_ip);
                         *rediscover_ground.lock().unwrap() = Some(new_ip);
@@ -196,9 +205,17 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
                 "30",
                 "--codec",
                 "h264",
+                "--profile",
+                "baseline",
+                "--level",
+                "4.1",
                 "--bitrate",
                 "4000000",
+                "--low-latency",
+                "--flush",
                 "--inline",
+                "--intra",
+                "15",
                 "--nopreview",
                 "-t",
                 "0",
