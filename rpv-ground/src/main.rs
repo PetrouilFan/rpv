@@ -192,9 +192,9 @@ impl eframe::App for RpvApp {
             }
         }
 
-        if self.needs_repaint {
+        if self.state.link_status == LinkStatus::Connected {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        } else if self.state.link_status != LinkStatus::Connected {
+        } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
