@@ -16,7 +16,7 @@ const TELEMETRY_PORT: u16 = 5601;
 const RC_PORT: u16 = 5602;
 const HEARTBEAT_PORT: u16 = 5603;
 
-const DATA_SHARDS: usize = 8;
+const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const STATUS_FILE: &str = "/tmp/rpv_link_status";

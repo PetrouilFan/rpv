@@ -7,7 +7,7 @@ use tracing::{info, warn, error};
 
 use reed_solomon_erasure::ReedSolomon;
 
-const DATA_SHARDS: usize = 8;
+const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 
 #[derive(Clone)]
