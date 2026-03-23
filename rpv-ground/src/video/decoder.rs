@@ -21,7 +21,7 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(width: u32, height: u32) -> Self {
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(32);
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(128);
         Self {
             frame_tx,
             frame_rx,
@@ -71,9 +71,9 @@ fn decode_loop(
             .arg("-c")
             .arg(format!(
                 "cat '{}' | /usr/bin/ffmpeg -loglevel error \
-                 -c:v h264_v4l2m2m -num_output_buffers 16 -num_capture_buffers 16 \
+                 -fflags nobuffer -flags low_delay -thread_queue_size 4096 \
                  -f h264 -i pipe:0 \
-                 -fflags nobuffer -f rawvideo -pix_fmt yuv420p -",
+                 -threads 4 -f rawvideo -pix_fmt yuv420p -",
                 fifo_path.display()
             ))
             .stdout(Stdio::piped())

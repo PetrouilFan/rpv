@@ -271,44 +271,8 @@ fn video_loop(
     let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
         .expect("Failed to create Reed-Solomon encoder");
 
-    const MIN_BITRATE: u32 = 1_000_000;
-    const MAX_BITRATE: u32 = 10_000_000;
-    const DEFAULT_BITRATE: u32 = 5_000_000;
-    let mut current_bitrate = DEFAULT_BITRATE;
-    let mut last_bitrate_check = Instant::now();
-
     while running.load(Ordering::SeqCst) {
-        // Check if we need to adjust bitrate
-        if last_bitrate_check.elapsed() >= Duration::from_secs(2) {
-            let (loss_rate, _) = *bitrate_state.lock().unwrap();
-
-            if loss_rate > 15 {
-                // High packet loss - reduce bitrate
-                let new_bitrate = (current_bitrate * 8 / 10).max(MIN_BITRATE);
-                if new_bitrate != current_bitrate {
-                    tracing::info!(
-                        "HIGH LOSS: reducing bitrate {} -> {}",
-                        current_bitrate,
-                        new_bitrate
-                    );
-                    current_bitrate = new_bitrate;
-                }
-            } else if loss_rate < 5 && current_bitrate < MAX_BITRATE {
-                // Low packet loss - increase bitrate gradually
-                let new_bitrate = (current_bitrate * 11 / 10).min(MAX_BITRATE);
-                if new_bitrate != current_bitrate {
-                    tracing::info!(
-                        "LOW LOSS: increasing bitrate {} -> {}",
-                        current_bitrate,
-                        new_bitrate
-                    );
-                    current_bitrate = new_bitrate;
-                }
-            }
-            last_bitrate_check = Instant::now();
-        }
-
-        tracing::info!("Starting rpicam-vid with bitrate {}...", current_bitrate);
+        tracing::info!("Starting rpicam-vid...");
 
         let child = Command::new("rpicam-vid")
             .args(&[
@@ -317,24 +281,20 @@ fn video_loop(
                 "--height",
                 "720",
                 "--framerate",
-                "60",
+                "30",
                 "--codec",
                 "h264",
                 "--profile",
                 "baseline",
                 "--level",
-                "4.2",
+                "4.1",
                 "--bitrate",
-                &current_bitrate.to_string(),
+                "3000000",
                 "--low-latency",
                 "--flush",
                 "--inline",
                 "--intra",
                 "30",
-                "--denoise",
-                "cdn_fast",
-                "--sharpness",
-                "1.5",
                 "--nopreview",
                 "-t",
                 "0",
@@ -355,13 +315,19 @@ fn video_loop(
         };
 
         let stdout = child.stdout.take().expect("No stdout");
-        let mut reader = BufReader::with_capacity(256 * 1024, stdout);
+        let mut reader = BufReader::new(stdout);
 
         let stderr = child.stderr.take();
         thread::spawn(move || {
             if let Some(mut stderr) = stderr {
                 let mut buf = Vec::new();
                 let _ = stderr.read_to_end(&mut buf);
+                if !buf.is_empty() {
+                    let stderr_str = String::from_utf8_lossy(&buf);
+                    if stderr_str.contains("ERROR") || stderr_str.contains("failed") {
+                        tracing::error!("rpicam-vid stderr: {}", stderr_str);
+                    }
+                }
             }
         });
 
@@ -388,19 +354,19 @@ fn video_loop(
                     let mut offset = 0;
                     while offset < n {
                         let remaining = n - offset;
-                        let mut chunk_size = remaining.min(1400);
+                        let mut chunk_size = remaining.min(1300);
 
                         // Try to split at NAL start code boundary (0x000001 or 0x00000001)
-                        if remaining > 1400 {
-                            let scan_start = (offset + 1000).min(n.saturating_sub(4));
-                            let scan_end = (offset + 1400).min(n);
+                        if remaining > 1300 {
+                            let scan_start = (offset + 900).min(n.saturating_sub(4));
+                            let scan_end = (offset + 1300).min(n);
                             if let Some(nal_pos) = find_nal_start(&buf[scan_start..scan_end]) {
                                 chunk_size = scan_start - offset + nal_pos;
                             }
                         }
 
                         if chunk_size == 0 {
-                            chunk_size = remaining.min(1400);
+                            chunk_size = remaining.min(1300);
                         }
 
                         fec_buffer.push(buf[offset..offset + chunk_size].to_vec());
@@ -449,8 +415,8 @@ fn video_loop(
         );
 
         if running.load(Ordering::SeqCst) {
-            tracing::info!("Restarting in 2 seconds...");
-            thread::sleep(Duration::from_secs(2));
+            tracing::info!("Restarting in 15 seconds...");
+            thread::sleep(Duration::from_secs(15));
         }
     }
 }

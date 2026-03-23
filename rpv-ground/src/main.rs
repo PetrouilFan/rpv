@@ -104,7 +104,7 @@ impl RpvApp {
                 && yuv.u_data.len() == expected_uv
                 && yuv.v_data.len() == expected_uv
             {
-                let _ = yuv420p_to_rgba_parallel(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf);
+                yuv420p_to_rgba(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf);
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
 
                 if let Some(ref mut tex) = self.state.texture {
@@ -138,62 +138,26 @@ impl RpvApp {
     }
 }
 
-fn yuv420p_to_rgba_parallel(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) -> Result<(), String> {
-    let num_threads = num_cpus::get().min(8).max(1);
-    let rows_per_thread = (h + num_threads - 1) / num_threads;
-    let row_width = w * 4;
-    
-    std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        
-        let mut remaining = rgba;
-        
-        for thread_id in 0..num_threads {
-            let start_row = thread_id * rows_per_thread;
-            let end_row = (start_row + rows_per_thread).min(h);
+#[inline(always)]
+fn yuv420p_to_rgba(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) {
+    let w2 = w / 2;
+    let mut i = 0;
+    for row in 0..h {
+        let row2 = row / 2;
+        for col in 0..w {
+            let y_val = y[row * w + col] as i32;
+            let uv_idx = row2 * w2 + (col / 2);
+            let u_val = u[uv_idx] as i32 - 128;
+            let v_val = v[uv_idx] as i32 - 128;
             
-            if start_row >= h {
-                break;
-            }
-            
-            let chunk_size = (end_row - start_row) * row_width;
-            let (chunk, rest) = remaining.split_at_mut(chunk_size);
-            remaining = rest;
-            
-            let y = y.to_vec();
-            let u = u.to_vec();
-            let v = v.to_vec();
-            let w = w;
-            let start_row = start_row;
-            
-            handles.push(s.spawn(move || {
-                for row in 0..(end_row - start_row) {
-                    let actual_row = start_row + row;
-                    for col in 0..w {
-                        let y_idx = actual_row * w + col;
-                        let uv_idx = (actual_row / 2) * (w / 2) + (col / 2);
-                        
-                        let y_val = y[y_idx] as i32;
-                        let u_val = u[uv_idx] as i32 - 128;
-                        let v_val = v[uv_idx] as i32 - 128;
-                        
-                        let c = y_val - 16;
-                        let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
-                        let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
-                        let b = ((298 * c + 517 * u_val + 128) >> 8).clamp(0, 255) as u8;
-                        
-                        let rgba_idx = row * row_width + col * 4;
-                        chunk[rgba_idx] = r;
-                        chunk[rgba_idx + 1] = g;
-                        chunk[rgba_idx + 2] = b;
-                        chunk[rgba_idx + 3] = 255;
-                    }
-                }
-            }));
+            let c = y_val - 16;
+            rgba[i] = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
+            rgba[i + 1] = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
+            rgba[i + 2] = ((298 * c + 517 * u_val + 128) >> 8).clamp(0, 255) as u8;
+            rgba[i + 3] = 255;
+            i += 4;
         }
-    });
-    
-    Ok(())
+    }
 }
 
 impl eframe::App for RpvApp {
