@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn, error};
 
 use reed_solomon_erasure::ReedSolomon;
 
 const DATA_SHARDS: usize = 2;
 const PARITY_SHARDS: usize = 1;
+const FEEDBACK_PORT: u16 = 5604;
+const FEEDBACK_WINDOW_FRAMES: usize = 60;
 
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -27,12 +30,13 @@ struct FecGroup {
 pub struct VideoReceiver {
     tx: mpsc::Sender<VideoFrame>,
     port: u16,
+    cam_ip: Arc<Mutex<Option<std::net::IpAddr>>>,
 }
 
 impl VideoReceiver {
-    pub async fn new(port: u16, tx: mpsc::Sender<VideoFrame>) -> std::io::Result<Self> {
+    pub async fn new(port: u16, tx: mpsc::Sender<VideoFrame>, cam_ip: Arc<Mutex<Option<std::net::IpAddr>>>) -> std::io::Result<Self> {
         info!("Video receiver (FEC {}+{}) ready on port {}", DATA_SHARDS, PARITY_SHARDS, port);
-        Ok(Self { tx, port })
+        Ok(Self { tx, port, cam_ip })
     }
 
     pub async fn run(&self) {
@@ -60,6 +64,15 @@ impl VideoReceiver {
         };
         info!("Video receiver listening on {}", bind_addr);
 
+        let feedback_socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to bind feedback socket: {}", e);
+                return;
+            }
+        };
+        info!("Feedback sender ready on port {}", FEEDBACK_PORT);
+
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 
@@ -69,6 +82,11 @@ impl VideoReceiver {
         let mut last_decode_time = Instant::now();
         let mut latencies: Vec<u64> = Vec::new();
         let mut frame_count: u64 = 0;
+
+        // Loss tracking for adaptive bitrate
+        let mut seq_history: Vec<u32> = Vec::with_capacity(FEEDBACK_WINDOW_FRAMES);
+        let mut last_feedback_time = Instant::now();
+        let mut last_loss_rate: u8 = 0;
 
         loop {
             match socket.recv_from(&mut buf).await {
@@ -135,6 +153,60 @@ impl VideoReceiver {
                     }
                     group.shards[shard_index] = Some(shard_data);
                     group.shard_size = shard_len;
+
+                    // Track sequence history for loss calculation
+                    if let Some(current) = next_seq {
+                        let gap = seq.wrapping_sub(current);
+                        if gap > 0 && gap < 1000 {
+                            for lost_seq in current..seq {
+                                seq_history.push(lost_seq);
+                            }
+                        }
+                    }
+                    seq_history.push(seq);
+                    if seq_history.len() > FEEDBACK_WINDOW_FRAMES * 3 {
+                        seq_history.drain(..seq_history.len() - FEEDBACK_WINDOW_FRAMES * 3);
+                    }
+
+                    // Calculate and send loss feedback periodically
+                    if last_feedback_time.elapsed().as_secs() >= 1 && !seq_history.is_empty() {
+                        let mut expected: usize = 0;
+                        let mut received: usize = 0;
+                        
+                        if seq_history.len() >= 2 {
+                            let min_seq = seq_history.iter().min().copied().unwrap_or(0);
+                            let max_seq = seq_history.iter().max().copied().unwrap_or(0);
+                            expected = max_seq.wrapping_sub(min_seq) as usize + 1;
+                            received = seq_history.len();
+                        } else {
+                            expected = 1;
+                            received = 1;
+                        }
+                        
+                        let loss_rate = if expected > 0 {
+                            ((expected - received) * 100 / expected) as u8
+                        } else {
+                            0
+                        };
+                        
+                        // Only send if loss rate changed significantly
+                        if (loss_rate as i16 - last_loss_rate as i16).abs() > 2 {
+                            last_loss_rate = loss_rate;
+                            
+                            let ip = self.cam_ip.lock().await;
+                            if let Some(cam_ip) = *ip {
+                                let target = format!("{}:{}", cam_ip, FEEDBACK_PORT);
+                                // Format: [1B 'L'][1B loss_rate_percent][2B reserved]
+                                let pkt = [b'L', loss_rate, 0, 0];
+                                let _ = feedback_socket.send_to(&pkt, &target).await;
+                                info!("FEEDBACK: loss_rate={}% ({}/{} frames in window)", 
+                                    loss_rate, received, expected);
+                            }
+                        }
+                        
+                        seq_history.clear();
+                        last_feedback_time = Instant::now();
+                    }
 
                     // Check if we can decode this group
                     if let Some(current_seq) = next_seq {

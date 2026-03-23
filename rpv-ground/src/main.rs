@@ -10,12 +10,12 @@ mod rc {
 }
 
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use egui::{ColorImage, TextureHandle, Vec2};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::config::Config;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
@@ -263,6 +263,8 @@ impl eframe::App for RpvApp {
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
 
+    let telem = state.telemetry.lock().unwrap().clone();
+
     egui::Area::new(egui::Id::new("osd_top_left"))
         .fixed_pos(egui::pos2(10.0, 10.0))
         .show(ui.ctx(), |ui| {
@@ -324,7 +326,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_top_right"))
         .fixed_pos(egui::pos2(screen.max.x - 170.0, 10.0))
         .show(ui.ctx(), |ui| {
-            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 let pct = telem.battery_pct as f32;
                 let bar_color = if pct > 30.0 {
@@ -372,7 +373,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_bottom_left"))
         .fixed_pos(egui::pos2(10.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
-            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(format!("SPD: {:.1} m/s", telem.speed))
@@ -390,7 +390,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_bottom_right"))
         .fixed_pos(egui::pos2(screen.max.x - 210.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
-            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(format!("HDG: {:.0}deg", telem.heading))
@@ -443,7 +442,8 @@ fn main() -> Result<(), eframe::Error> {
     if let Some(ip) = initial_cam_ip {
         tracing::info!("Using static camera IP from config: {}", ip);
     }
-    let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(initial_cam_ip));
+    let cam_ip: Arc<StdMutex<Option<IpAddr>>> = Arc::new(StdMutex::new(initial_cam_ip));
+    let cam_ip_tokio: Arc<TokioMutex<Option<IpAddr>>> = Arc::new(TokioMutex::new(initial_cam_ip));
 
     let discovery_running = running.clone();
     let bg_link_status = Arc::clone(&link_status_shared);
@@ -466,12 +466,13 @@ fn main() -> Result<(), eframe::Error> {
     let bg_config = config.clone();
     let bg_running = running.clone();
     let bg_cam_ip2 = Arc::clone(&cam_ip);
+    let bg_cam_ip_tokio = Arc::clone(&cam_ip_tokio);
 
     // Spawn tokio runtime in background thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx).await
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_cam_ip_tokio).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;
