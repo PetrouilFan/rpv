@@ -69,9 +69,9 @@ fn decode_loop(
         let child = Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "cat '{}' | /usr/bin/ffmpeg -loglevel error -flags low_delay \
+                "cat '{}' | /usr/bin/ffmpeg -loglevel error -fflags nobuffer -flags low_delay \
                  -thread_queue_size 4096 -f h264 -i pipe:0 \
-                 -f rawvideo -pix_fmt yuv420p -",
+                 -threads 4 -f rawvideo -pix_fmt yuv420p -",
                 fifo_path.display()
             ))
             .stdout(Stdio::piped())

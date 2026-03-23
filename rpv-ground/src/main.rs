@@ -122,7 +122,7 @@ impl RpvApp {
                 self.state.frame_count += 1;
                 self.state.last_frame_time = Instant::now();
 
-                if self.state.frame_count == 30 {
+                if self.state.frame_count == 60 {
                     self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
                     self.state.frame_count = 0;
                     self.state.fps_timer = Instant::now();
@@ -197,7 +197,10 @@ impl eframe::App for RpvApp {
             }
         }
 
-        if self.state.link_status == LinkStatus::Connected {
+        // Force immediate UI repaint if a new video frame arrived
+        if self.needs_repaint {
+            ctx.request_repaint();
+        } else if self.state.link_status == LinkStatus::Connected {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
