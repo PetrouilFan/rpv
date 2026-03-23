@@ -66,12 +66,14 @@ fn decode_loop(
             .status();
 
         let fifo_path_clone = fifo_path.clone();
+
         let child = Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "cat '{}' | /usr/bin/ffmpeg -loglevel error -fflags nobuffer -flags low_delay \
-                 -thread_queue_size 4096 -f h264 -i pipe:0 \
-                 -threads 4 -f rawvideo -pix_fmt yuv420p -",
+                "cat '{}' | /usr/bin/ffmpeg -loglevel error \
+                 -c:v h264_v4l2m2m -num_output_buffers 16 -num_capture_buffers 16 \
+                 -f h264 -i pipe:0 \
+                 -fflags nobuffer -f rawvideo -pix_fmt yuv420p -",
                 fifo_path.display()
             ))
             .stdout(Stdio::piped())
