@@ -10,6 +10,8 @@ Environment="WAYLAND_DISPLAY=wayland-0"
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
 ExecStart=/usr/local/bin/rpv-ground
 Restart=always
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
 RestartSec=3
 StandardOutput=journal
 StandardError=journal

@@ -2718,6 +2718,7 @@ name = "rpv-cam"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "libc",
  "reed-solomon-erasure",
  "serde",
  "serde_json",

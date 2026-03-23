@@ -7,8 +7,8 @@ use tracing::{info, warn, error};
 
 use reed_solomon_erasure::ReedSolomon;
 
-const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 2;
+const DATA_SHARDS: usize = 2;
+const PARITY_SHARDS: usize = 1;
 
 #[derive(Clone)]
 pub struct VideoFrame {

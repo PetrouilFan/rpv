@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::receiver::VideoReceiver;
-use crate::video::decoder::{VideoDecoder, DecodedYUV};
+use crate::video::decoder::{VideoDecoder, DecodedFrame as DecodedYUV};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LinkStatus {
@@ -82,10 +82,14 @@ impl RpvApp {
     }
 
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
-        // Drain all queued frames, keep only the latest
         let mut latest = None;
+        let mut recv_count = 0;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
+            recv_count += 1;
+        }
+        if recv_count > 0 {
+            tracing::info!("UI received {} frames from decoder", recv_count);
         }
         let frame_data = latest;
 
@@ -93,10 +97,12 @@ impl RpvApp {
         if let Some(yuv) = frame_data {
             let w = self.state.config.video_width as usize;
             let h = self.state.config.video_height as usize;
+            let expected_y = w * h;
+            let expected_uv = (w / 2) * (h / 2);
 
-            if yuv.y_data.len() == w * h
-                && yuv.u_data.len() == (w / 2) * (h / 2)
-                && yuv.v_data.len() == (w / 2) * (h / 2)
+            if yuv.y_data.len() == expected_y
+                && yuv.u_data.len() == expected_uv
+                && yuv.v_data.len() == expected_uv
             {
                 if let Err(e) = yuv420p_to_rgba_inplace(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf) {
                     tracing::warn!("YUV conversion error: {}", e);
@@ -135,7 +141,6 @@ impl RpvApp {
 }
 
 fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) -> Result<(), String> {
-    // Manual YUV420p to RGBA conversion - avoids crate compatibility issues
     for row in 0..h {
         for col in 0..w {
             let y_idx = row * w + col;
@@ -145,7 +150,6 @@ fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgb
             let u_val = u[uv_idx] as i32 - 128;
             let v_val = v[uv_idx] as i32 - 128;
 
-            // BT.601 limited range: Y offset 16, correct coefficients
             let c = y_val - 16;
             let r = ((c * 298 + v_val * 409 + 128) >> 8).clamp(0, 255) as u8;
             let g = ((c * 298 - u_val * 100 - v_val * 208 + 128) >> 8).clamp(0, 255) as u8;
@@ -194,7 +198,7 @@ impl eframe::App for RpvApp {
         }
 
         if self.state.link_status == LinkStatus::Connected {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -425,7 +429,7 @@ fn main() -> Result<(), eframe::Error> {
         r.store(false, Ordering::SeqCst);
     }).expect("Failed to set ctrl+c handler");
 
-    let (video_frame_tx, video_frame_rx) = mpsc::channel(64);
+    let (video_frame_tx, video_frame_rx) = mpsc::channel(32);
 
     // Shared link status between video receiver and UI
     let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
@@ -536,6 +540,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
+            present_mode: wgpu::PresentMode::Mailbox,
             device_descriptor: std::sync::Arc::new(|_adapter| {
                 let limits = wgpu::Limits {
                     max_texture_dimension_1d: 4096,

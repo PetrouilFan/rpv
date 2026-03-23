@@ -16,8 +16,8 @@ const TELEMETRY_PORT: u16 = 5601;
 const RC_PORT: u16 = 5602;
 const HEARTBEAT_PORT: u16 = 5603;
 
-const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 2;
+const DATA_SHARDS: usize = 2;
+const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
@@ -179,7 +179,18 @@ fn heartbeat_monitor(
 fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => {
-            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+            use std::os::unix::io::AsRawFd;
+            let sndbuf: libc::c_int = 4 * 1024 * 1024;
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &sndbuf as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
             s
         }
         Err(e) => {
@@ -202,11 +213,11 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
                 "--height",
                 "720",
                 "--framerate",
-                "30",
+                "20",
                 "--codec",
                 "h264",
                 "--profile",
-                "high",
+                "baseline",
                 "--level",
                 "4.1",
                 "--bitrate",
