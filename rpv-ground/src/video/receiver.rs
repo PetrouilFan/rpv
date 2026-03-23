@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
@@ -191,11 +191,10 @@ fn decode_and_send(
     next_seq: &mut Option<u32>,
     last_decode_time: &mut Instant,
     tx: &mpsc::Sender<VideoFrame>,
-    latencies: &mut Vec<u64>,
-    frame_count: &mut u64,
+    _latencies: &mut Vec<u64>,
+    _frame_count: &mut u64,
 ) {
     let current_seq = next_seq.unwrap();
-    let fec_start = Instant::now();
 
     let decoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_fec_group(rs, group))) {
         Ok(d) => d,
@@ -208,8 +207,8 @@ fn decode_and_send(
         }
     };
 
-    let fec_us = fec_start.elapsed().as_micros() as u64;
-    let group_delay_us = group.first_recv.elapsed().as_micros() as u64;
+    let _fec_us = Instant::now().elapsed().as_micros() as u64;
+    let _group_delay_us = group.first_recv.elapsed().as_micros() as u64;
 
     if decoded.is_empty() {
         warn!("FEC: decode_fec_group returned empty for seq {}", current_seq);
@@ -219,53 +218,12 @@ fn decode_and_send(
         return;
     }
 
-    for (i, chunk) in decoded.iter().enumerate() {
-        let send_ts_us = if i == 0 && chunk.len() >= 8 {
-            Some(u64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3],
-                chunk[4], chunk[5], chunk[6], chunk[7],
-            ]))
-        } else {
-            None
-        };
-
+    for chunk in decoded.iter() {
         let frame = VideoFrame {
-            data: if send_ts_us.is_some() { chunk[8..].to_vec() } else { chunk.clone() },
-            send_ts_us,
+            data: chunk.clone(),
+            send_ts_us: None,
             recv_time: group.first_recv,
         };
-
-        if let Some(send_ts) = send_ts_us {
-            let now_us = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64;
-            let e2e_us = now_us.saturating_sub(send_ts);
-            latencies.push(e2e_us);
-            *frame_count += 1;
-
-            if *frame_count % 30 == 1 {
-                let avg = latencies.iter().sum::<u64>() / latencies.len() as u64;
-                let min = *latencies.iter().min().unwrap_or(&0);
-                let max = *latencies.iter().max().unwrap_or(&0);
-                let p50 = {
-                    let mut sorted = latencies.clone();
-                    sorted.sort();
-                    sorted[sorted.len() / 2]
-                };
-                info!(
-                    "LATENCY stats (n={}): avg={:.1}ms min={:.1}ms p50={:.1}ms max={:.1}ms | fec={}us group={}us",
-                    latencies.len(),
-                    avg as f64 / 1000.0,
-                    min as f64 / 1000.0,
-                    p50 as f64 / 1000.0,
-                    max as f64 / 1000.0,
-                    fec_us,
-                    group_delay_us,
-                );
-                latencies.clear();
-            }
-        }
 
         if let Err(e) = tx.try_send(frame) {
             warn!("FEC: video frame channel full, dropping frame: {}", e);
