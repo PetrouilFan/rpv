@@ -1,10 +1,13 @@
 [Unit]
 Description=RPV Ground Station
-After=network.target
-Wants=network.target
+After=graphical.target
+Wants=graphical.target
 
 [Service]
-ExecStartPre=/usr/local/bin/rpv-net-setup.sh
+Type=simple
+User=petrouil
+Environment="WAYLAND_DISPLAY=wayland-0"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
 ExecStart=/usr/local/bin/rpv-ground
 Restart=always
 RestartSec=3
@@ -12,4 +15,4 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target

@@ -90,6 +90,13 @@ impl VideoReceiver {
                     let header_size = 8;
                     let payload_available = len - header_size;
 
+                    // Validate total_shards matches expected FEC configuration
+                    if total_shards != DATA_SHARDS + PARITY_SHARDS {
+                        warn!("FEC: unexpected total_shards={} (expected {}), dropping packet",
+                            total_shards, DATA_SHARDS + PARITY_SHARDS);
+                        continue;
+                    }
+
                     if shard_index >= total_shards || shard_len == 0 || shard_len > payload_available {
                         warn!("FEC: invalid shard idx={} total={} len={} avail={} pkt_len={}",
                             shard_index, total_shards, shard_len, payload_available, len);

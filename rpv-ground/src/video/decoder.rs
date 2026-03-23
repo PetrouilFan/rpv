@@ -21,7 +21,7 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(width: u32, height: u32) -> Self {
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedYUV>(1);
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedYUV>(4);
         Self {
             frame_tx,
             frame_rx,
@@ -55,12 +55,8 @@ fn decode_loop(
     let uv_size = (width / 2 * height / 2) as usize;
     let total_size = y_size + uv_size * 2;
 
-    let pending_ts: std::sync::Arc<std::sync::Mutex<Option<u64>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let pending_ts_clone = std::sync::Arc::clone(&pending_ts);
-    let pending_recv: std::sync::Arc<std::sync::Mutex<Option<Instant>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let pending_recv_clone = std::sync::Arc::clone(&pending_recv);
+    // Use a channel to properly pair timestamps with decoded frames (FIFO order)
+    let (ts_tx, ts_rx) = crossbeam_channel::bounded::<(Option<u64>, Option<Instant>)>(8);
 
     loop {
         // Create a FIFO for passing H.264 data to ffmpeg via shell pipe.
@@ -95,18 +91,16 @@ fn decode_loop(
             }
         };
 
-        let stdin = match std::fs::OpenOptions::new()
-            .write(true)
-            .open(&fifo_path_clone)
-        {
-            Ok(f) => BufWriter::new(f),
-            Err(e) => {
-                error!("Failed to open FIFO: {}", e);
-                let _ = child.kill();
-                let _ = std::fs::remove_file(&fifo_path_clone);
-                break;
-            }
-        };
+        let stdin =
+            match open_fifo_with_timeout(&fifo_path_clone, std::time::Duration::from_secs(5)) {
+                Ok(f) => BufWriter::new(f),
+                Err(e) => {
+                    error!("Failed to open FIFO: {}", e);
+                    let _ = child.kill();
+                    let _ = std::fs::remove_file(&fifo_path_clone);
+                    break;
+                }
+            };
         let mut stdin = stdin;
         let stdout = child.stdout.take().expect("No stdout");
         let stderr = child.stderr.take().expect("No stderr");
@@ -126,8 +120,7 @@ fn decode_loop(
         });
 
         let frame_tx_clone = frame_tx.clone();
-        let ts_reader = std::sync::Arc::clone(&pending_ts_clone);
-        let recv_reader = std::sync::Arc::clone(&pending_recv_clone);
+        let ts_rx_clone = ts_rx.clone();
         let read_handle = std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut frame_buf = vec![0u8; total_size];
@@ -141,8 +134,8 @@ fn decode_loop(
                         let u_data = frame_buf[y_size..y_size + uv_size].to_vec();
                         let v_data = frame_buf[y_size + uv_size..].to_vec();
 
-                        let send_ts = *ts_reader.lock().unwrap();
-                        let recv_t = *recv_reader.lock().unwrap();
+                        // Pop timestamp in FIFO order (matches ffmpeg decode order)
+                        let (send_ts, recv_t) = ts_rx_clone.try_recv().unwrap_or((None, None));
 
                         let decode_ms = recv_t.map(|rt| rt.elapsed().as_micros() as f64 / 1000.0);
 
@@ -194,8 +187,6 @@ fn decode_loop(
         });
 
         let mut closed = false;
-        let ts_writer = std::sync::Arc::clone(&pending_ts_clone);
-        let recv_writer = std::sync::Arc::clone(&pending_recv_clone);
         let mut buf = Vec::with_capacity(1024 * 1024);
         let mut initial_flushed = false;
 
@@ -215,8 +206,19 @@ fn decode_loop(
                 buf.extend_from_slice(&extra.data);
             }
 
-            *ts_writer.lock().unwrap() = frame.send_ts_us;
-            *recv_writer.lock().unwrap() = Some(frame.recv_time);
+            // Cap buffer to prevent unbounded memory growth during ffmpeg stalls
+            const MAX_BUF: usize = 4 * 1024 * 1024;
+            if buf.len() > MAX_BUF {
+                warn!(
+                    "H.264 buffer exceeded {}MB, dropping old data",
+                    MAX_BUF / 1024 / 1024
+                );
+                let drain_len = buf.len() - MAX_BUF;
+                buf.drain(..drain_len);
+            }
+
+            // Send timestamp to reader thread in FIFO order
+            let _ = ts_tx.try_send((frame.send_ts_us, Some(frame.recv_time)));
 
             // Initial buffer: accumulate enough data for ffmpeg codec detection
             let should_flush = if !initial_flushed {
@@ -253,4 +255,25 @@ fn decode_loop(
     }
 
     info!("Decoder thread exiting");
+}
+
+fn open_fifo_with_timeout(
+    path: &std::path::Path,
+    _timeout: std::time::Duration,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let c_path =
+        std::ffi::CString::new(path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")
+        })?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    // O_RDWR on a FIFO never blocks on Linux, avoiding deadlock if reader dies
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }

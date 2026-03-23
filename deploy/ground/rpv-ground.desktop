@@ -1,5 +1,5 @@
 [Desktop Entry]
 Type=Application
 Name=RPV Ground Station
-Exec=env WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 /home/petrouil/rpv/target/release/rpv-ground
+Exec=/usr/local/bin/rpv-ground
 NoDisplay=true

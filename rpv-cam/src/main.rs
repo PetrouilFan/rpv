@@ -265,10 +265,25 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
                     break;
                 }
                 Ok(n) => {
-                    // Split into chunks and add to FEC buffer
+                    // Split into chunks, preferring NAL unit boundaries
                     let mut offset = 0;
                     while offset < n {
-                        let chunk_size = (n - offset).min(1300);
+                        let remaining = n - offset;
+                        let mut chunk_size = remaining.min(1300);
+
+                        // Try to split at NAL start code boundary (0x000001 or 0x00000001)
+                        if remaining > 1300 {
+                            let scan_start = (offset + 900).min(n.saturating_sub(4));
+                            let scan_end = (offset + 1300).min(n);
+                            if let Some(nal_pos) = find_nal_start(&buf[scan_start..scan_end]) {
+                                chunk_size = scan_start - offset + nal_pos;
+                            }
+                        }
+
+                        if chunk_size == 0 {
+                            chunk_size = remaining.min(1300);
+                        }
+
                         fec_buffer.push(buf[offset..offset + chunk_size].to_vec());
                         offset += chunk_size;
 
@@ -329,18 +344,23 @@ fn send_fec_group(
     target: &str,
     fail_count: &mut u8,
 ) {
-    // Determine shard size (max chunk length, padded)
-    let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
-    if shard_size == 0 {
+    if chunks.is_empty() {
         return;
     }
 
-    // Build data shards with padding
+    // Determine shard size (max chunk length, padded)
+    let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(1);
+
+    // Build data shards with padding (pad to DATA_SHARDS if partial group)
     let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
     for chunk in chunks {
         let mut shard = vec![0u8; shard_size];
         shard[..chunk.len()].copy_from_slice(chunk);
         shards.push(shard);
+    }
+    // Pad remaining data slots with zeros for partial groups
+    while shards.len() < DATA_SHARDS {
+        shards.push(vec![0u8; shard_size]);
     }
     // Add empty parity placeholders
     for _ in 0..PARITY_SHARDS {
@@ -380,6 +400,28 @@ fn send_fec_group(
             }
         }
     }
+}
+
+fn find_nal_start(data: &[u8]) -> Option<usize> {
+    // Scan for H.264 NAL start codes: 0x00000001 or 0x000001
+    if data.len() < 3 {
+        return None;
+    }
+    for i in 0..data.len() - 2 {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                // Check for 4-byte start code
+                if i > 0 && data[i - 1] == 0 {
+                    return Some(i - 1);
+                }
+                return Some(i);
+            }
+            if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 fn rc_receiver(running: Arc<AtomicBool>) {

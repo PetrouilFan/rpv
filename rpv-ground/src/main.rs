@@ -145,10 +145,11 @@ fn yuv420p_to_rgba_inplace(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgb
             let u_val = u[uv_idx] as i32 - 128;
             let v_val = v[uv_idx] as i32 - 128;
 
-            // BT.601 limited range
-            let r = ((y_val * 256 + v_val * 359 + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((y_val * 256 - u_val * 88 - v_val * 183 + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((y_val * 256 + u_val * 454 + 128) >> 8).clamp(0, 255) as u8;
+            // BT.601 limited range: Y offset 16, correct coefficients
+            let c = y_val - 16;
+            let r = ((c * 298 + v_val * 409 + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((c * 298 - u_val * 100 - v_val * 208 + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((c * 298 + u_val * 517 + 128) >> 8).clamp(0, 255) as u8;
 
             let rgba_idx = y_idx * 4;
             rgba[rgba_idx] = r;
