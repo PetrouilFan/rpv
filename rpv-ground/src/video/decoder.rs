@@ -1,13 +1,14 @@
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct DecodedFrame {
-    pub y_data: Vec<u8>,
-    pub u_data: Vec<u8>,
-    pub v_data: Vec<u8>,
+    pub nv12_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
     pub send_ts_us: Option<u64>,
     pub recv_time: Option<Instant>,
 }
@@ -21,7 +22,8 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(width: u32, height: u32) -> Self {
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(128);
+        // Small queue for low latency
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(4);
         Self {
             frame_tx,
             frame_rx,
@@ -44,137 +46,161 @@ impl VideoDecoder {
     }
 }
 
+pub fn nv12_to_rgba(y_plane: &[u8], uv_plane: &[u8], stride: usize, width: usize, height: usize, rgba: &mut [u8]) {
+    let mut i = 0;
+    for row in 0..height {
+        let uv_row = row / 2;
+        for col in 0..width {
+            let y_val = y_plane[row * stride + col] as i32;
+            
+            // NV12: UV is interleaved, stride applies to UV plane too
+            let uv_idx = uv_row * stride + (col & !1);
+            let u_val = uv_plane[uv_idx] as i32 - 128;
+            let v_val = uv_plane[uv_idx + 1] as i32 - 128;
+
+            // BT.601 YUV to RGB conversion
+            let c = y_val - 16;
+            let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 517 * u_val + 128) >> 8).clamp(0, 255) as u8;
+            
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 255;
+            i += 4;
+        }
+    }
+}
+
 fn decode_loop(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
     mut rx: tokio::sync::mpsc::Receiver<crate::video::receiver::VideoFrame>,
     width: u32,
     height: u32,
 ) {
-    let y_size = (width * height) as usize;
-    let uv_size = (width / 2 * height / 2) as usize;
-    let total_size = y_size + uv_size * 2;
+    // NV12 format: Y plane (width * height) + UV plane (width * height / 2)
+    // Stride is typically aligned to 32 or 64 bytes on Pi hardware
+    let stride = ((width + 31) / 32) * 32;  // Align to 32 bytes
+    let y_size = (stride * height) as usize;
+    let uv_size = (stride * height / 2) as usize;
+    let total_size = y_size + uv_size;
 
-    let (ts_tx, ts_rx) = crossbeam_channel::bounded::<(Option<u64>, Option<Instant>)>(8);
+    info!("H.264 decoder initialized: {}x{} stride={} NV12", width, height, stride);
 
     loop {
-        let fifo_dir = std::env::temp_dir().join("rpv");
-        let _ = std::fs::create_dir_all(&fifo_dir);
-        let fifo_path = fifo_dir.join(format!("video_{}.fifo", std::process::id()));
-        let _ = std::fs::remove_file(&fifo_path);
-        let _ = std::process::Command::new("mkfifo")
-            .arg(&fifo_path)
-            .status();
+        // Try hardware decode first with NV12 output
+        let hw_args = vec![
+            "-loglevel", "error",
+            "-hwaccel", "v4l2m2m",
+            "-hwaccel_output_format", "nv12",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-thread_queue_size", "4096",
+            "-f", "h264",
+            "-i", "pipe:0",
+            "-threads", "2",
+            "-f", "rawvideo",
+            "-pix_fmt", "nv12",
+            "pipe:1",
+        ];
 
-        let fifo_path_clone = fifo_path.clone();
+        // Software fallback with NV12
+        let sw_args = vec![
+            "-loglevel", "error",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-thread_queue_size", "4096",
+            "-f", "h264",
+            "-i", "pipe:0",
+            "-threads", "2",
+            "-f", "rawvideo",
+            "-pix_fmt", "nv12",
+            "pipe:1",
+        ];
 
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "cat '{}' | /usr/bin/ffmpeg -loglevel error \
-                 -fflags nobuffer -flags low_delay -thread_queue_size 4096 \
-                 -f h264 -i pipe:0 \
-                 -threads 4 -f rawvideo -pix_fmt yuv420p -",
-                fifo_path.display()
-            ))
+        // Try hardware decode first
+        let child = Command::new("ffmpeg")
+            .args(&hw_args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn();
+            .spawn()
+            .or_else(|_| {
+                warn!("Hardware decode failed, falling back to software");
+                Command::new("ffmpeg")
+                    .args(&sw_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            });
 
         let mut child = match child {
-            Ok(c) => c,
+            Ok(c) => {
+                info!("FFmpeg decoder started: {}x{} NV12 (stride={})", width, height, stride);
+                c
+            }
             Err(e) => {
                 error!("Failed to spawn ffmpeg: {}", e);
-                let _ = std::fs::remove_file(&fifo_path);
-                break;
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
             }
         };
 
-        let stdin =
-            match open_fifo_with_timeout(&fifo_path_clone, std::time::Duration::from_secs(5)) {
-                Ok(f) => BufWriter::new(f),
-                Err(e) => {
-                    error!("Failed to open FIFO: {}", e);
-                    let _ = child.kill();
-                    let _ = std::fs::remove_file(&fifo_path_clone);
-                    break;
-                }
-            };
-        let mut stdin = stdin;
+        let mut stdin = child.stdin.take().expect("No stdin");
         let stdout = child.stdout.take().expect("No stdout");
         let stderr = child.stderr.take().expect("No stderr");
 
-        info!("ffmpeg decoder started: {}x{} YUV420p", width, height);
-
+        // Drain stderr in background
         let stderr_handle = std::thread::spawn(move || {
             let mut err_buf = Vec::new();
             let mut stderr_reader = BufReader::new(stderr);
             let _ = stderr_reader.read_to_end(&mut err_buf);
             if !err_buf.is_empty() {
                 for line in String::from_utf8_lossy(&err_buf).lines() {
-                    warn!("ffmpeg: {}", line);
+                    if !line.is_empty() {
+                        warn!("ffmpeg: {}", line);
+                    }
                 }
             }
         });
 
+        // Read decoded frames in background
         let frame_tx_clone = frame_tx.clone();
-        let ts_rx_clone = ts_rx.clone();
         let read_handle = std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut frame_buf = vec![0u8; total_size];
             let mut frame_count = 0u64;
-            let mut decode_latencies: Vec<f64> = Vec::new();
 
             loop {
                 match reader.read_exact(&mut frame_buf) {
                     Ok(()) => {
+                        // Extract NV12 planes
                         let y_data = frame_buf[0..y_size].to_vec();
-                        let u_data = frame_buf[y_size..y_size + uv_size].to_vec();
-                        let v_data = frame_buf[y_size + uv_size..].to_vec();
+                        let uv_data = frame_buf[y_size..y_size + uv_size].to_vec();
 
-                        let (send_ts, recv_t) = ts_rx_clone.try_recv().unwrap_or((None, None));
-
-                        let decode_ms = recv_t.map(|rt| rt.elapsed().as_micros() as f64 / 1000.0);
-
-                        let yuv = DecodedFrame {
-                            y_data,
-                            u_data,
-                            v_data,
-                            send_ts_us: send_ts,
-                            recv_time: recv_t,
+                        let frame = DecodedFrame {
+                            nv12_data: frame_buf.clone(),
+                            width,
+                            height,
+                            stride,
+                            send_ts_us: None,
+                            recv_time: None,
                         };
 
-                        let _ = frame_tx_clone.try_send(yuv);
-
-                        if let Some(dl) = decode_ms {
-                            decode_latencies.push(dl);
+                        // Non-blocking send - drop frame if queue full
+                        if let Err(_) = frame_tx_clone.try_send(frame) {
+                            // Queue full, drop frame for low latency
                         }
 
                         frame_count += 1;
                         if frame_count % 30 == 0 {
-                            if !decode_latencies.is_empty() {
-                                let avg = decode_latencies.iter().sum::<f64>()
-                                    / decode_latencies.len() as f64;
-                                decode_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                                let p50 = decode_latencies[decode_latencies.len() / 2];
-                                let p95 = decode_latencies
-                                    [(decode_latencies.len() as f64 * 0.95) as usize];
-                                info!(
-                                    "DECODE PIPELINE (n={}): avg={:.1}ms p50={:.1}ms p95={:.1}ms",
-                                    decode_latencies.len(),
-                                    avg,
-                                    p50,
-                                    p95
-                                );
-                                decode_latencies.clear();
-                            }
-                            info!("Decoded {} frames (YUV420p)", frame_count);
+                            info!("Decoded {} frames (NV12)", frame_count);
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "ffmpeg stdout read error after {} frames: {}",
-                            frame_count, e
-                        );
+                        error!("ffmpeg stdout read error after {} frames: {}", frame_count, e);
                         break;
                     }
                 }
@@ -182,9 +208,7 @@ fn decode_loop(
             info!("Read thread exiting after {} frames", frame_count);
         });
 
-        let mut buf = Vec::with_capacity(1024 * 1024);
-        let mut initial_flushed = false;
-
+        // Feed H.264 data to ffmpeg stdin
         loop {
             let frame = match rx.blocking_recv() {
                 Some(f) => f,
@@ -194,71 +218,23 @@ fn decode_loop(
                 }
             };
 
-            buf.extend_from_slice(&frame.data);
-
-            for extra in std::iter::from_fn(|| rx.try_recv().ok()) {
-                buf.extend_from_slice(&extra.data);
-            }
-
-            const MAX_BUF: usize = 4 * 1024 * 1024;
-            if buf.len() > MAX_BUF {
-                warn!(
-                    "H.264 buffer exceeded {}MB, dropping old data",
-                    MAX_BUF / 1024 / 1024
-                );
-                let drain_len = buf.len() - MAX_BUF;
-                buf.drain(..drain_len);
-            }
-
-            let _ = ts_tx.try_send((frame.send_ts_us, Some(frame.recv_time)));
-
-            let should_flush = if !initial_flushed {
-                buf.len() >= 65536
-            } else {
-                true
-            };
-
-            if should_flush && !buf.is_empty() {
-                if stdin.write_all(&buf).is_err() {
-                    warn!("ffmpeg stdin write error");
-                    break;
-                }
-                buf.clear();
-                initial_flushed = true;
+            // Write immediately - no buffering delay
+            if stdin.write_all(&frame.data).is_err() {
+                warn!("ffmpeg stdin write error");
+                break;
             }
         }
 
+        // Cleanup
         drop(stdin);
         let _ = read_handle.join();
         let _ = stderr_handle.join();
-
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_file(&fifo_path_clone);
 
         info!("Restarting ffmpeg decoder...");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     info!("Decoder thread exiting");
-}
-
-fn open_fifo_with_timeout(
-    path: &std::path::Path,
-    _timeout: std::time::Duration,
-) -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::FromRawFd;
-
-    let c_path =
-        std::ffi::CString::new(path.to_str().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")
-        })?)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }

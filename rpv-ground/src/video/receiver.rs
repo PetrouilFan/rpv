@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
-use reed_solomon_erasure::ReedSolomon;
+use reed_solomon_erasure::galois_8::ReedSolomon;
+
+const FEEDBACK_PORT: u16 = 5604;
 
 const DATA_SHARDS: usize = 2;
 const PARITY_SHARDS: usize = 1;
-const FEEDBACK_PORT: u16 = 5604;
-const FEEDBACK_WINDOW_FRAMES: usize = 60;
+const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -20,9 +20,9 @@ pub struct VideoFrame {
     pub recv_time: Instant,
 }
 
-struct FecGroup {
+struct RsBlock {
     shards: Vec<Option<Vec<u8>>>,
-    shard_size: usize,
+    shard_sizes: Vec<usize>,
     received: usize,
     first_recv: Instant,
 }
@@ -30,12 +30,21 @@ struct FecGroup {
 pub struct VideoReceiver {
     tx: mpsc::Sender<VideoFrame>,
     port: u16,
-    cam_ip: Arc<Mutex<Option<std::net::IpAddr>>>,
+    cam_ip: std::sync::Arc<Mutex<Option<std::net::IpAddr>>>,
 }
 
 impl VideoReceiver {
-    pub async fn new(port: u16, tx: mpsc::Sender<VideoFrame>, cam_ip: Arc<Mutex<Option<std::net::IpAddr>>>) -> std::io::Result<Self> {
-        info!("Video receiver (FEC {}+{}) ready on port {}", DATA_SHARDS, PARITY_SHARDS, port);
+    pub async fn new(
+        port: u16,
+        tx: mpsc::Sender<VideoFrame>,
+        cam_ip: std::sync::Arc<Mutex<Option<std::net::IpAddr>>>,
+    ) -> std::io::Result<Self> {
+        info!(
+            "Video receiver (RS {}+{}) ready on port {}",
+            DATA_SHARDS,
+            PARITY_SHARDS,
+            port
+        );
         Ok(Self { tx, port, cam_ip })
     }
 
@@ -43,7 +52,6 @@ impl VideoReceiver {
         let bind_addr = format!("0.0.0.0:{}", self.port);
         let socket = match UdpSocket::bind(&bind_addr).await {
             Ok(s) => {
-                // Set 4MB receive buffer to prevent kernel-side drops
                 let fd = s.as_raw_fd();
                 let rcvbuf: libc::c_int = 4 * 1024 * 1024;
                 unsafe {
@@ -77,265 +85,243 @@ impl VideoReceiver {
             .expect("Failed to create Reed-Solomon decoder");
 
         let mut buf = vec![0u8; 65536];
-        let mut fec_groups: HashMap<u32, FecGroup> = HashMap::new();
-        let mut next_seq: Option<u32> = None;
+        let mut blocks: HashMap<u32, RsBlock> = HashMap::new();
+        let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
-        let mut latencies: Vec<u64> = Vec::new();
-        let mut frame_count: u64 = 0;
-
-        // Loss tracking for adaptive bitrate
-        let mut seq_history: Vec<u32> = Vec::with_capacity(FEEDBACK_WINDOW_FRAMES);
         let mut last_feedback_time = Instant::now();
         let mut last_loss_rate: u8 = 0;
+        let mut block_count: u64 = 0;
+        let mut loss_samples: Vec<bool> = Vec::new();
+
+        // FU-A reassembly state
+        let mut nal_buf: Vec<u8> = Vec::new();
+        let mut nal_started = false;
 
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, _addr)) => {
                     let recv_time = Instant::now();
 
+                    // Header: [4B seq][1B shard_index][1B total_shards][2B shard_len] = 8 bytes
                     if len < 8 {
-                        let frame = VideoFrame { data: buf[..len].to_vec(), send_ts_us: None, recv_time };
-                        let _ = self.tx.try_send(frame);
                         continue;
                     }
 
-                    // Parse header: [4B seq][1B shard_index][1B total_shards][2B shard_len]
-                    let seq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let block_seq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let shard_index = buf[4] as usize;
                     let total_shards = buf[5] as usize;
                     let shard_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
 
-                    let header_size = 8;
-                    let payload_available = len - header_size;
-
-                    // Validate total_shards matches expected FEC configuration
-                    if total_shards != DATA_SHARDS + PARITY_SHARDS {
-                        warn!("FEC: unexpected total_shards={} (expected {}), dropping packet",
-                            total_shards, DATA_SHARDS + PARITY_SHARDS);
+                    if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
+                        warn!(
+                            "RS: invalid shard idx={} total={}",
+                            shard_index, total_shards
+                        );
                         continue;
                     }
 
-                    if shard_index >= total_shards || shard_len == 0 || shard_len > payload_available {
-                        warn!("FEC: invalid shard idx={} total={} len={} avail={} pkt_len={}",
-                            shard_index, total_shards, shard_len, payload_available, len);
+                    let payload_start = 8;
+                    let payload_end = payload_start + shard_len;
+                    if payload_end > len {
                         continue;
                     }
+                    let payload = buf[payload_start..payload_end].to_vec();
 
-                    let shard_data = buf[header_size..header_size + shard_len].to_vec();
-
-                    // Track sequence group
-                    if next_seq.is_none() {
-                        next_seq = Some(seq);
-                    } else if let Some(current) = next_seq {
-                        // Detect camera restart: if seq is much lower than expected, reset
-                        let gap = current.wrapping_sub(seq);
-                        if gap > 1000 {
-                            info!("FEC: camera restarted, seq reset {} -> {}", current, seq);
-                            next_seq = Some(seq);
-                            fec_groups.clear();
-                        }
-                    }
-
-                    // Clean up old groups (keep current and a few future)
-                    fec_groups.retain(|&k, _| {
-                        k.wrapping_sub(next_seq.unwrap_or(k)) < 8
-                    });
-
-                    let group = fec_groups.entry(seq).or_insert_with(|| FecGroup {
-                        shards: vec![None; total_shards],
-                        shard_size: shard_len,
-                        received: 0,
-                        first_recv: Instant::now(),
-                    });
-
-                    if group.shards[shard_index].is_none() {
-                        group.received += 1;
-                    }
-                    group.shards[shard_index] = Some(shard_data);
-                    group.shard_size = shard_len;
-
-                    // Track sequence history for loss calculation
-                    if let Some(current) = next_seq {
-                        let gap = seq.wrapping_sub(current);
-                        if gap > 0 && gap < 1000 {
-                            for lost_seq in current..seq {
-                                seq_history.push(lost_seq);
+                    // Track sequence for loss calculation
+                    if let Some(current) = next_block {
+                        let gap = block_seq.wrapping_sub(current);
+                        if gap > 0 && gap < 100 {
+                            for _ in 0..gap {
+                                loss_samples.push(false);
                             }
                         }
                     }
-                    seq_history.push(seq);
-                    if seq_history.len() > FEEDBACK_WINDOW_FRAMES * 3 {
-                        seq_history.drain(..seq_history.len() - FEEDBACK_WINDOW_FRAMES * 3);
+                    loss_samples.push(true);
+                    if loss_samples.len() > 120 {
+                        loss_samples.drain(..loss_samples.len() - 120);
                     }
 
-                    // Calculate and send loss feedback periodically
-                    if last_feedback_time.elapsed().as_secs() >= 1 && !seq_history.is_empty() {
-                        let mut expected: usize = 0;
-                        let mut received: usize = 0;
-                        
-                        if seq_history.len() >= 2 {
-                            let min_seq = seq_history.iter().min().copied().unwrap_or(0);
-                            let max_seq = seq_history.iter().max().copied().unwrap_or(0);
-                            expected = max_seq.wrapping_sub(min_seq) as usize + 1;
-                            received = seq_history.len();
-                        } else {
-                            expected = 1;
-                            received = 1;
+                    // Initialize next_block if needed
+                    if next_block.is_none() {
+                        next_block = Some(block_seq);
+                    } else if let Some(current) = next_block {
+                        let gap = current.wrapping_sub(block_seq);
+                        if gap > 1000 {
+                            info!(
+                                "RS: camera restarted, seq reset {} -> {}",
+                                current, block_seq
+                            );
+                            next_block = Some(block_seq);
+                            blocks.clear();
+                            nal_buf.clear();
+                            nal_started = false;
                         }
-                        
-                        let loss_rate = if expected > 0 {
-                            ((expected - received) * 100 / expected) as u8
+                    }
+
+                    // Clean up old blocks
+                    if let Some(current) = next_block {
+                        blocks.retain(|&k, _| {
+                            let age = current.wrapping_sub(k);
+                            age == 0 || (k.wrapping_sub(current) < 4 && age < 8)
+                        });
+                    }
+
+                    let block = blocks.entry(block_seq).or_insert_with(|| RsBlock {
+                        shards: vec![None; TOTAL_SHARDS],
+                        shard_sizes: vec![0; TOTAL_SHARDS],
+                        received: 0,
+                        first_recv: recv_time,
+                    });
+
+                    if block.shards[shard_index].is_none() {
+                        block.received += 1;
+                        block.shard_sizes[shard_index] = shard_len;
+                    }
+                    block.shards[shard_index] = Some(payload);
+
+                    // Try to reconstruct and send immediately
+                    if let Some(current_seq) = next_block {
+                        if block_seq == current_seq {
+                            let block = blocks.get(&block_seq).unwrap();
+                            if block.received >= DATA_SHARDS {
+                                // Enough shards received, attempt RS reconstruction
+                                let reconstructed = reconstruct_rs_block(&rs, block);
+                                if let Some(data_shards) = reconstructed {
+                                    // Process shards: FU-A reassembly
+                                    for shard_data in &data_shards {
+                                        if shard_data.is_empty() {
+                                            continue;
+                                        }
+                                        let frag_index = shard_data[0];
+                                        let frag_payload = &shard_data[1..];
+
+                                        if frag_index == 0 {
+                                            // Start of a new NALU
+                                            if nal_started && !nal_buf.is_empty() {
+                                                // Flush previous NALU
+                                                let frame = VideoFrame {
+                                                    data: std::mem::take(&mut nal_buf),
+                                                    send_ts_us: None,
+                                                    recv_time: block.first_recv,
+                                                };
+                                                if let Err(e) = self.tx.try_send(frame) {
+                                                    if block_count % 60 == 0 {
+                                                        warn!(
+                                                            "Video frame channel full, dropping: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                                block_count += 1;
+                                            }
+                                            nal_buf.clear();
+                                            nal_buf.extend_from_slice(frag_payload);
+                                            nal_started = true;
+                                        } else if nal_started {
+                                            // Continuation fragment
+                                            nal_buf.extend_from_slice(frag_payload);
+                                        }
+                                        // If !nal_started and frag_index != 0, discard orphan fragment
+                                    }
+                                } else {
+                                    // FEC reconstruction failed - drop entire NALU
+                                    if nal_started {
+                                        nal_buf.clear();
+                                        nal_started = false;
+                                    }
+                                }
+
+                                blocks.remove(&block_seq);
+                                next_block = Some(current_seq.wrapping_add(1));
+                                last_decode_time = Instant::now();
+                            } else if last_decode_time.elapsed().as_millis() > 50 {
+                                // Stall timeout - drop block
+                                warn!(
+                                    "RS: block {} stalled (had {}/{} shards), dropping",
+                                    current_seq, block.received, DATA_SHARDS
+                                );
+                                // Drop entire NALU if we were accumulating
+                                if nal_started {
+                                    nal_buf.clear();
+                                    nal_started = false;
+                                }
+                                blocks.remove(&block_seq);
+                                next_block = Some(current_seq.wrapping_add(1));
+                                last_decode_time = Instant::now();
+                            }
+                        }
+                    }
+
+                    // Send loss feedback periodically
+                    if last_feedback_time.elapsed().as_secs() >= 1 && loss_samples.len() >= 10 {
+                        let received_count = loss_samples.iter().filter(|&&r| r).count();
+                        let total_count = loss_samples.len();
+                        let loss_rate = if total_count > 0 {
+                            ((total_count - received_count) * 100 / total_count) as u8
                         } else {
                             0
                         };
-                        
-                        // Only send if loss rate changed significantly
-                        if (loss_rate as i16 - last_loss_rate as i16).abs() > 2 {
+
+                        if (loss_rate as i16 - last_loss_rate as i16).abs() > 5 {
                             last_loss_rate = loss_rate;
-                            
-                            let ip = self.cam_ip.lock().await;
-                            if let Some(cam_ip) = *ip {
+
+                            let cam_ip = {
+                                let ip = self.cam_ip.lock().await;
+                                *ip
+                            };
+                            if let Some(cam_ip) = cam_ip {
                                 let target = format!("{}:{}", cam_ip, FEEDBACK_PORT);
-                                // Format: [1B 'L'][1B loss_rate_percent][2B reserved]
                                 let pkt = [b'L', loss_rate, 0, 0];
                                 let _ = feedback_socket.send_to(&pkt, &target).await;
-                                info!("FEEDBACK: loss_rate={}% ({}/{} frames in window)", 
-                                    loss_rate, received, expected);
+                                info!(
+                                    "FEEDBACK: loss_rate={}% ({}/{})",
+                                    loss_rate, received_count, total_count
+                                );
                             }
                         }
-                        
-                        seq_history.clear();
+
+                        loss_samples.clear();
                         last_feedback_time = Instant::now();
-                    }
-
-                    // Check if we can decode this group
-                    if let Some(current_seq) = next_seq {
-                        if seq == current_seq {
-                            let group = fec_groups.get(&seq).unwrap();
-                            if group.received >= DATA_SHARDS {
-                                let group_clone = FecGroup {
-                                    shards: group.shards.clone(),
-                                    shard_size: group.shard_size,
-                                    received: group.received,
-                                    first_recv: group.first_recv,
-                                };
-                                decode_and_send(&rs, &group_clone, &mut fec_groups, &mut next_seq, &mut last_decode_time, &self.tx, &mut latencies, &mut frame_count);
-                            }
-                        }
-                    }
-
-                    // FEC stall recovery: skip stalled group after 200ms
-                    if let Some(current_seq) = next_seq {
-                        if last_decode_time.elapsed().as_millis() > 200 && fec_groups.contains_key(&current_seq) {
-                            let group = &fec_groups[&current_seq];
-                            if group.received < DATA_SHARDS {
-                                warn!("FEC: seq {} stalled for >200ms, skipping (had {}/{} shards)",
-                                    current_seq, group.received, DATA_SHARDS);
-                                fec_groups.remove(&current_seq);
-                                next_seq = Some(current_seq.wrapping_add(1));
-                                last_decode_time = Instant::now();
-                            } else {
-                                // Force decode: have enough shards but missed normal trigger
-                                let group_clone = FecGroup {
-                                    shards: group.shards.clone(),
-                                    shard_size: group.shard_size,
-                                    received: group.received,
-                                    first_recv: group.first_recv,
-                                };
-                                decode_and_send(&rs, &group_clone, &mut fec_groups, &mut next_seq, &mut last_decode_time, &self.tx, &mut latencies, &mut frame_count);
-                            }
-                        }
                     }
                 }
                 Err(e) => {
                     warn!("Video receive error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
             }
         }
     }
 }
 
-fn decode_and_send(
-    rs: &reed_solomon_erasure::galois_8::ReedSolomon,
-    group: &FecGroup,
-    fec_groups: &mut HashMap<u32, FecGroup>,
-    next_seq: &mut Option<u32>,
-    last_decode_time: &mut Instant,
-    tx: &mpsc::Sender<VideoFrame>,
-    _latencies: &mut Vec<u64>,
-    _frame_count: &mut u64,
-) {
-    let current_seq = next_seq.unwrap();
-
-    let decoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_fec_group(rs, group))) {
-        Ok(d) => d,
-        Err(_) => {
-            error!("FEC: decode_fec_group panicked for seq {}", current_seq);
-            fec_groups.remove(&current_seq);
-            *next_seq = Some(current_seq.wrapping_add(1));
-            *last_decode_time = Instant::now();
-            return;
-        }
-    };
-
-    let _fec_us = Instant::now().elapsed().as_micros() as u64;
-    let _group_delay_us = group.first_recv.elapsed().as_micros() as u64;
-
-    if decoded.is_empty() {
-        warn!("FEC: decode_fec_group returned empty for seq {}", current_seq);
-        fec_groups.remove(&current_seq);
-        *next_seq = Some(current_seq.wrapping_add(1));
-        *last_decode_time = Instant::now();
-        return;
+fn reconstruct_rs_block(
+    rs: &ReedSolomon,
+    block: &RsBlock,
+) -> Option<Vec<Vec<u8>>> {
+    let max_size = block.shard_sizes.iter().max().copied().unwrap_or(0);
+    if max_size == 0 {
+        return None;
     }
 
-    for chunk in decoded.iter() {
-        let frame = VideoFrame {
-            data: chunk.clone(),
-            send_ts_us: None,
-            recv_time: group.first_recv,
-        };
-
-        if let Err(e) = tx.try_send(frame) {
-            warn!("FEC: video frame channel full, dropping frame: {}", e);
-        }
-    }
-
-    fec_groups.remove(&current_seq);
-    *next_seq = Some(current_seq.wrapping_add(1));
-    *last_decode_time = Instant::now();
-}
-
-fn decode_fec_group(
-    rs: &reed_solomon_erasure::galois_8::ReedSolomon,
-    group: &FecGroup,
-) -> Vec<Vec<u8>> {
-    let mut shards: Vec<Option<Vec<u8>>> = group.shards.iter()
-        .map(|s| s.as_ref().map(|v| v.clone()))
-        .collect();
-
-    let missing_count = shards.iter().filter(|s| s.is_none()).count();
-
-    if missing_count > 0 {
-        if missing_count <= PARITY_SHARDS {
-            info!("FEC: reconstructing {} missing shards", missing_count);
+    let mut shard_refs: Vec<Option<Vec<u8>>> = Vec::with_capacity(TOTAL_SHARDS);
+    for i in 0..TOTAL_SHARDS {
+        if let Some(ref data) = block.shards[i] {
+            let mut padded = vec![0u8; max_size];
+            padded[..data.len()].copy_from_slice(data);
+            shard_refs.push(Some(padded));
         } else {
-            warn!("FEC: {} missing shards exceeds parity ({}), dropping group", missing_count, PARITY_SHARDS);
-            return Vec::new();
-        }
-
-        if rs.reconstruct(&mut shards).is_err() {
-            warn!("FEC: reconstruction failed, dropping group");
-            return Vec::new();
+            shard_refs.push(None);
         }
     }
 
+    if let Err(e) = rs.reconstruct(&mut shard_refs) {
+        warn!("RS reconstruct failed: {:?}", e);
+        return None;
+    }
+
+    // Return only the data shards (first DATA_SHARDS)
     let mut result = Vec::with_capacity(DATA_SHARDS);
-    for shard in shards.iter().take(DATA_SHARDS) {
-        if let Some(data) = shard {
-            result.push(data.clone());
-        }
+    for i in 0..DATA_SHARDS {
+        result.push(shard_refs[i].clone().unwrap_or_default());
     }
-    result
+    Some(result)
 }
