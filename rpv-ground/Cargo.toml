@@ -3,6 +3,14 @@ name = "rpv-ground"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rpv-ground"
+path = "src/main.rs"
+
+[[bin]]
+name = "rpv-ground-rpi5"
+path = "src/main_rpi5.rs"
+
 [dependencies]
 tokio         = { version = "1", features = ["net", "sync", "rt-multi-thread", "time", "signal"] }
 egui          = "0.29"
