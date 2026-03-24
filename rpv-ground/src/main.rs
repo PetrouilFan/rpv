@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use egui::{ColorImage, TextureHandle, Vec2};
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
@@ -88,8 +88,8 @@ impl RpvApp {
             latest = Some(frame);
             recv_count += 1;
         }
-        if recv_count > 0 {
-            tracing::info!("UI received {} frames from decoder", recv_count);
+        if recv_count > 1 {
+            tracing::debug!("UI frame queue drain: {} frames dropped", recv_count - 1);
         }
         let frame_data = latest;
 
@@ -343,12 +343,9 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                         );
                         ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
                     } else {
-                        // Blinking dot for searching/lost
-                        let ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let blink = (ms / 500) % 2 == 0;
+                        // Blinking dot for searching/lost — use egui time, no syscall
+                        let t = ui.ctx().input(|i| i.time);
+                        let blink = (t * 2.0) as u64 % 2 == 0;
                         if blink {
                             let dot_size = 10.0;
                             let (rect, _) = ui.allocate_exact_size(
@@ -477,7 +474,7 @@ fn main() -> Result<(), eframe::Error> {
 
     tracing::info!("rpv ground station starting");
 
-    let config = Config::load();
+    let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
 
     // Shared running flag for ctrl+c
@@ -500,7 +497,6 @@ fn main() -> Result<(), eframe::Error> {
         tracing::info!("Using static camera IP from config: {}", ip);
     }
     let cam_ip: Arc<StdMutex<Option<IpAddr>>> = Arc::new(StdMutex::new(initial_cam_ip));
-    let cam_ip_tokio: Arc<TokioMutex<Option<IpAddr>>> = Arc::new(TokioMutex::new(initial_cam_ip));
 
     let discovery_running = running.clone();
     let bg_link_status = Arc::clone(&link_status_shared);
@@ -516,20 +512,21 @@ fn main() -> Result<(), eframe::Error> {
     let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared));
     let telemetry_state = telemetry.get_state();
 
-    config.save();
+    if was_default {
+        config.save();
+    }
 
     let bg_video_frame_tx = video_frame_tx;
     let bg_telemetry = telemetry;
     let bg_config = config.clone();
     let bg_running = running.clone();
     let bg_cam_ip2 = Arc::clone(&cam_ip);
-    let bg_cam_ip_tokio = Arc::clone(&cam_ip_tokio);
 
     // Spawn tokio runtime in background thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_cam_ip_tokio).await
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_cam_ip2).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;

@@ -34,7 +34,7 @@ fn main() {
 
     tracing::info!("rpv-cam starting on Raspberry Pi Zero 2W");
 
-    let config = config::Config::load();
+    let (config, _was_default) = config::Config::load();
     tracing::info!("Config: {:?}", config);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -151,22 +151,27 @@ fn heartbeat_monitor(
     last_heartbeat: Arc<Mutex<Instant>>,
     fallback_ip: Option<IpAddr>,
 ) {
+    use std::sync::atomic::AtomicBool as AtomicBoolFlag;
     tracing::info!("Heartbeat monitor started (timeout: 3s)");
     thread::sleep(Duration::from_secs(3)); // initial grace period
+
+    let rediscovering = Arc::new(AtomicBoolFlag::new(false));
 
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_secs(1));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > Duration::from_secs(3) {
+        if elapsed > Duration::from_secs(3) && !rediscovering.load(Ordering::SeqCst) {
             tracing::warn!(
                 "Heartbeat lost ({}s), triggering re-discovery...",
                 elapsed.as_secs()
             );
             write_link_status("searching");
 
-            // Non-blocking: spawn discovery in a background thread
+            rediscovering.store(true, Ordering::SeqCst);
+            let rd = Arc::clone(&rediscovering);
             let rediscover_ground = Arc::clone(&ground_addr);
+            let rediscover_last_hb = Arc::clone(&last_heartbeat);
             let rediscover_fallback = fallback_ip;
             thread::spawn(move || {
                 match std::panic::catch_unwind(|| discover::discover_ground(5, rediscover_fallback))
@@ -174,17 +179,16 @@ fn heartbeat_monitor(
                     Ok(new_ip) => {
                         tracing::info!("Re-discovered ground station at {}", new_ip);
                         *rediscover_ground.lock().unwrap() = Some(new_ip);
-                        write_link_status("connected");
                         // Reset heartbeat timer so we don't immediately re-trigger
+                        *rediscover_last_hb.lock().unwrap() = Instant::now();
+                        write_link_status("connected");
                     }
                     Err(_) => {
                         tracing::error!("Discovery panicked, will retry on next heartbeat check");
                     }
                 }
+                rd.store(false, Ordering::SeqCst);
             });
-
-            // Wait before checking again
-            thread::sleep(Duration::from_secs(6));
         }
     }
 }
@@ -394,13 +398,21 @@ fn video_loop(
         );
 
         if running.load(Ordering::SeqCst) {
-            tracing::info!("Restarting in 15 seconds...");
-            thread::sleep(Duration::from_secs(15));
+            tracing::info!("Restarting rpicam-vid in 2 seconds...");
+            thread::sleep(Duration::from_secs(2));
         }
     }
 }
 
+const MAX_NAL_BUF: usize = 512 * 1024; // 512 KB hard cap
+
 fn extract_next_nal(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    // Hard cap: if no start code found within 512KB, drain and reset
+    if buf.len() > MAX_NAL_BUF {
+        tracing::warn!("NAL buffer overflow ({}B), resetting", buf.len());
+        buf.clear();
+        return None;
+    }
     // Scan for H.264 NAL start codes: 0x00000001 or 0x000001
     let mut start = None;
     for i in 0..buf.len().saturating_sub(3) {
@@ -482,19 +494,22 @@ fn send_fec_group(
         return;
     }
 
+    let mut group_ok = true;
     for (i, shard) in shards.iter().enumerate() {
-        let mut packet = Vec::with_capacity(8 + shard.len());
+        // Header: [4B seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
+        let mut packet = Vec::with_capacity(10 + shard.len());
         packet.extend_from_slice(&seq.to_le_bytes());
         packet.push(i as u8);
         packet.push(TOTAL_SHARDS as u8);
+        packet.push(chunks.len() as u8); // actual data shards (may be < DATA_SHARDS for partial groups)
+        packet.push(0u8); // padding
         packet.extend_from_slice(&(shard.len() as u16).to_le_bytes());
         packet.extend_from_slice(shard);
 
         match socket.send_to(&packet, target) {
-            Ok(_) => {
-                *fail_count = 0;
-            }
+            Ok(_) => {}
             Err(e) => {
+                group_ok = false;
                 *fail_count = fail_count.saturating_add(1);
                 tracing::warn!("Video send error: {} (fail_count={})", e, fail_count);
                 if *fail_count > 30 {
@@ -506,9 +521,9 @@ fn send_fec_group(
                 }
             }
         }
-
-        // UDP packet pacing: disabled for now to maximize throughput
-        // std::thread::sleep(std::time::Duration::from_micros(150));
+    }
+    if group_ok {
+        *fail_count = 0;
     }
 }
 
@@ -549,9 +564,15 @@ fn rc_receiver(running: Arc<AtomicBool>) {
                     channels.push(ch);
                 }
 
-                // Write channels to file for external integration
+                // Write channels to file for external integration (atomic write)
                 let ch_str: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
-                let _ = std::fs::write(rc_file_path, ch_str.join(","));
+                let tmp_path = format!("{}.tmp", rc_file_path);
+                if let Ok(mut f) = std::fs::File::create(&tmp_path) {
+                    use std::io::Write;
+                    let _ = f.write_all(ch_str.join(",").as_bytes());
+                    let _ = f.flush();
+                    let _ = std::fs::rename(&tmp_path, rc_file_path);
+                }
             }
             Err(e) => {
                 tracing::warn!("RC recv error: {}", e);

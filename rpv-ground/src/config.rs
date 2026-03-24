@@ -13,7 +13,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            camera_ip: "192.168.100.113".to_string(),
+            camera_ip: "192.168.100.1".to_string(),
             video_port: 5600,
             telemetry_port: 5601,
             rc_port: 5602,
@@ -24,12 +24,12 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load() -> Self {
+    pub fn load() -> (Self, bool) {
         let config_path = config_path();
         if let Ok(data) = std::fs::read_to_string(&config_path) {
-            toml::from_str(&data).unwrap_or_default()
+            (toml::from_str(&data).unwrap_or_default(), false)
         } else {
-            Config::default()
+            (Config::default(), true)
         }
     }
 

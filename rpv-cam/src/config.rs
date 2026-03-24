@@ -8,20 +8,20 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            ground_ip: "192.168.100.116".to_string(),
+            ground_ip: "192.168.100.2".to_string(),
         }
     }
 }
 
 impl Config {
-    pub fn load() -> Self {
+    pub fn load() -> (Self, bool) {
         let config_path = config_path();
         if let Ok(data) = std::fs::read_to_string(&config_path) {
-            toml::from_str(&data).unwrap_or_default()
+            (toml::from_str(&data).unwrap_or_default(), false)
         } else {
             let cfg = Config::default();
             cfg.save();
-            cfg
+            (cfg, true)
         }
     }
 

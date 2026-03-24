@@ -16,7 +16,11 @@ impl RCTx {
             socket: None,
             cam_ip,
             port,
-            channels: Arc::new(Mutex::new(vec![1500; 16])),
+            channels: Arc::new(Mutex::new({
+                let mut ch = vec![1500u16; 16];
+                ch[2] = 1000; // throttle low on init (safety critical)
+                ch
+            })),
         }
     }
 

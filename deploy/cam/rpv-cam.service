@@ -4,12 +4,14 @@ After=network.target
 Wants=network.target
 
 [Service]
-ExecStartPre=/usr/local/bin/rpv-net-setup.sh
+ExecStartPre=/usr/local/bin/rpv-net-setup-pre.sh
 ExecStart=/usr/local/bin/rpv-cam
-Restart=always
+ExecStopPost=/usr/local/bin/rpv-net-teardown.sh
+Restart=on-failure
+RestartSec=5
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=50
-RestartSec=3
+Environment=RUST_LOG=info
 StandardOutput=journal
 StandardError=journal
 
