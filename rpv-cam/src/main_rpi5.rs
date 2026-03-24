@@ -1,5 +1,6 @@
 mod config;
 mod discover;
+mod fc;
 mod video_tx;
 
 use std::net::{IpAddr, UdpSocket};
@@ -48,6 +49,13 @@ fn main() {
     let ground_addr: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(Some(ground_ip)));
     let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
+    // Start MAVLink FC link
+    let (fc_rc_tx, fc_telem_rx) = match fc::start(running.clone(), &config.fc_port, config.fc_baud)
+    {
+        Some(link) => (Some(link.rc_tx), Some(link.telem_rx)),
+        None => (None, None),
+    };
+
     // Start heartbeat receiver
     let hb_running = running.clone();
     let hb_last = Arc::clone(&last_heartbeat);
@@ -71,17 +79,21 @@ fn main() {
         video_tx::run(video_running, video_ground, 3_000_000, 10, Some("wlan1"));
     });
 
-    // Start RC receiver with failsafe
+    // Start RC receiver — routes UDP RC to MAVLink (or falls back to file)
     let rc_running = running.clone();
     let _rc_handle = thread::spawn(move || {
-        rc_receiver_with_failsafe(rc_running);
+        if let Some(rc_tx) = fc_rc_tx {
+            rc_to_mavlink(rc_running, rc_tx);
+        } else {
+            rc_to_file_with_failsafe(rc_running);
+        }
     });
 
     // Start telemetry sender
     let telem_running = running.clone();
     let telem_ground = Arc::clone(&ground_addr);
     let _telem_handle = thread::spawn(move || {
-        telemetry_sender(telem_running, telem_ground);
+        telemetry_sender(telem_running, telem_ground, fc_telem_rx);
     });
 
     // Wait for shutdown
@@ -165,7 +177,8 @@ fn heartbeat_monitor(
     }
 }
 
-fn rc_receiver_with_failsafe(running: Arc<AtomicBool>) {
+/// Route UDP RC packets to MAVLink RC_CHANNELS_OVERRIDE via the FC serial link.
+fn rc_to_mavlink(running: Arc<AtomicBool>, rc_tx: std::sync::mpsc::SyncSender<Vec<u16>>) {
     let bind_addr = format!("0.0.0.0:{}", RC_PORT);
     let socket = match UdpSocket::bind(&bind_addr) {
         Ok(s) => s,
@@ -176,7 +189,51 @@ fn rc_receiver_with_failsafe(running: Arc<AtomicBool>) {
     };
 
     let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
-    tracing::info!("RC receiver with failsafe listening on {}", bind_addr);
+    tracing::info!("RC receiver (MAVLink) listening on {}", bind_addr);
+
+    let mut buf = [0u8; 256];
+
+    while running.load(Ordering::SeqCst) {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _addr)) => {
+                if len < 4 {
+                    continue;
+                }
+
+                let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                let expected = 4 + count * 2;
+
+                if len < expected || count > 126 {
+                    continue;
+                }
+
+                let mut channels = Vec::with_capacity(count);
+                for i in 0..count {
+                    let offset = 4 + i * 2;
+                    let ch = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
+                    channels.push(ch);
+                }
+
+                let _ = rc_tx.try_send(channels);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Fallback: write RC channels to file with failsafe (no FC connected).
+fn rc_to_file_with_failsafe(running: Arc<AtomicBool>) {
+    let bind_addr = format!("0.0.0.0:{}", RC_PORT);
+    let socket = match UdpSocket::bind(&bind_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to bind RC socket on {}: {}", bind_addr, e);
+            return;
+        }
+    };
+
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+    tracing::info!("RC receiver (file fallback) listening on {}", bind_addr);
 
     let mut buf = [0u8; 256];
     let rc_file_path = "/tmp/rpv_rc_channels";
@@ -241,7 +298,11 @@ fn check_camera_available() -> bool {
     false
 }
 
-fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
+fn telemetry_sender(
+    running: Arc<AtomicBool>,
+    ground_addr: Arc<Mutex<Option<IpAddr>>>,
+    fc_telem_rx: Option<std::sync::mpsc::Receiver<fc::FcTelemetry>>,
+) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => {
@@ -250,13 +311,19 @@ fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAd
         }
     };
 
-    tracing::warn!("Telemetry: all flight fields are placeholder zeros — no FC integration yet");
-    tracing::info!("Telemetry sender ready");
+    let has_fc = fc_telem_rx.is_some();
+    if has_fc {
+        tracing::info!("Telemetry sender ready (FC telemetry)");
+    } else {
+        tracing::warn!("Telemetry: all flight fields are placeholder zeros — no FC integration");
+        tracing::info!("Telemetry sender ready (no FC)");
+    }
 
     let interval = Duration::from_millis(200);
     let camera_check_interval = Duration::from_secs(5);
     let mut last_camera_check = Instant::now();
     let mut camera_ok = check_camera_available();
+    let mut fc_telem = fc::FcTelemetry::default();
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
@@ -264,20 +331,26 @@ fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAd
             last_camera_check = Instant::now();
         }
 
+        if let Some(ref rx) = fc_telem_rx {
+            while let Ok(t) = rx.try_recv() {
+                fc_telem = t;
+            }
+        }
+
         if let Some(ip) = *ground_addr.lock().unwrap() {
             let target_addr = format!("{}:{}", ip, TELEMETRY_PORT);
 
             let telem = serde_json::json!({
-                "lat": 0.0,
-                "lon": 0.0,
-                "alt": 0.0,
-                "heading": 0.0,
-                "speed": 0.0,
-                "satellites": 0,
-                "battery_v": 0.0,
-                "battery_pct": 0,
-                "mode": "UNKNOWN",
-                "armed": false,
+                "lat": fc_telem.lat,
+                "lon": fc_telem.lon,
+                "alt": fc_telem.alt,
+                "heading": fc_telem.heading,
+                "speed": fc_telem.speed,
+                "satellites": fc_telem.satellites as u32,
+                "battery_v": fc_telem.battery_v,
+                "battery_pct": if fc_telem.battery_pct >= 0 { fc_telem.battery_pct as u32 } else { 0 },
+                "mode": fc_telem.mode,
+                "armed": fc_telem.armed,
                 "camera_ok": camera_ok,
             });
 
