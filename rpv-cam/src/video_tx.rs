@@ -15,9 +15,11 @@ const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
 
-/// Maximum shard payload: L2 header (8) + video packet header (10) + shard data
-/// Must stay under ~1400 bytes for safe 802.11 frames.
-const MAX_SHARD_PAYLOAD: usize = link::MAX_PAYLOAD - 10; // 10 bytes for video packet header
+/// Maximum shard data bytes per fragment.
+/// Wire frame = 802.11(24) + L2(8) + video_hdr(10) + frag_idx(1) + shard_data.
+/// Constraint: 8 + 10 + 1 + shard_data <= MAX_PAYLOAD(1400).
+/// So shard_data <= 1381.
+const MAX_SHARD_DATA: usize = link::MAX_PAYLOAD - 8 - 10 - 1;
 
 /// Run the video capture and streaming loop.
 ///
@@ -42,7 +44,8 @@ pub fn run(
     let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
         .expect("Failed to create Reed-Solomon encoder");
 
-    let mut l2_seq: u32 = 0;
+    let mut fec_block_seq: u32 = 0;
+    let mut l2_pkt_seq: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
         tracing::info!(
@@ -136,7 +139,7 @@ pub fn run(
                         let mut off = 0;
                         let mut frag_idx: u8 = 0;
                         while off < nal.len() {
-                            let end = (off + MAX_SHARD_PAYLOAD).min(nal.len());
+                            let end = (off + MAX_SHARD_DATA).min(nal.len());
                             let mut frag = Vec::with_capacity(1 + end - off);
                             frag.push(frag_idx);
                             frag.extend_from_slice(&nal[off..end]);
@@ -150,7 +153,8 @@ pub fn run(
                                     &rs,
                                     &fec_buffer,
                                     drone_id,
-                                    &mut l2_seq,
+                                    &mut fec_block_seq,
+                                    &mut l2_pkt_seq,
                                     &mut fail_count,
                                 );
                                 fec_buffer.clear();
@@ -180,7 +184,7 @@ pub fn run(
                     let mut off = 0;
                     let mut frag_idx: u8 = 0;
                     while off < nal.len() {
-                        let end = (off + MAX_SHARD_PAYLOAD).min(nal.len());
+                        let end = (off + MAX_SHARD_DATA).min(nal.len());
                         let mut frag = Vec::with_capacity(1 + end - off);
                         frag.push(frag_idx);
                         frag.extend_from_slice(&nal[off..end]);
@@ -191,7 +195,8 @@ pub fn run(
                                 &rs,
                                 &fec_buffer,
                                 drone_id,
-                                &mut l2_seq,
+                                &mut fec_block_seq,
+                                &mut l2_pkt_seq,
                                 &mut fail_count,
                             );
                             fec_buffer.clear();
@@ -211,7 +216,8 @@ pub fn run(
                 &rs,
                 &fec_buffer,
                 drone_id,
-                &mut l2_seq,
+                &mut fec_block_seq,
+                &mut l2_pkt_seq,
                 &mut fail_count,
             );
             fec_buffer.clear();
@@ -292,7 +298,8 @@ fn send_fec_group(
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
     chunks: &[Vec<u8>],
     drone_id: u8,
-    l2_seq: &mut u32,
+    fec_block_seq: &mut u32,
+    l2_pkt_seq: &mut u32,
     fail_count: &mut u8,
 ) {
     if chunks.is_empty() {
@@ -300,6 +307,16 @@ fn send_fec_group(
     }
 
     let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(1);
+
+    // Safety check: shard data + frag_idx must fit within MAX_SHARD_DATA
+    if shard_size > MAX_SHARD_DATA {
+        tracing::warn!(
+            "Shard size {} exceeds MAX_SHARD_DATA {}, truncating",
+            shard_size,
+            MAX_SHARD_DATA
+        );
+        // This shouldn't happen if NAL fragmentation is correct, but guard against it
+    }
 
     let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
     for chunk in chunks {
@@ -329,9 +346,9 @@ fn send_fec_group(
             thread::sleep(MIN_SEND_INTERVAL - elapsed);
         }
 
-        // Video packet header: [4B seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
+        // Video packet header: [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
         let mut payload = Vec::with_capacity(10 + shard.len());
-        payload.extend_from_slice(&l2_seq.to_le_bytes());
+        payload.extend_from_slice(&fec_block_seq.to_le_bytes());
         payload.push(i as u8);
         payload.push(TOTAL_SHARDS as u8);
         payload.push(chunks.len() as u8);
@@ -339,17 +356,18 @@ fn send_fec_group(
         payload.extend_from_slice(&(shard.len() as u16).to_le_bytes());
         payload.extend_from_slice(shard);
 
-        // Wrap in L2 header and send
+        // Wrap in L2 header and send (L2 seq is per-packet, not per-FEC-block)
         let header = link::L2Header {
             drone_id,
             payload_type: link::PAYLOAD_VIDEO,
-            seq: *l2_seq,
+            seq: *l2_pkt_seq,
         };
         let frame = header.encode(&payload);
 
         match socket.send(&frame) {
             Ok(_) => {
                 last_send = Instant::now();
+                *l2_pkt_seq = l2_pkt_seq.wrapping_add(1);
             }
             Err(e) => {
                 group_ok = false;
@@ -366,7 +384,7 @@ fn send_fec_group(
         }
     }
 
-    *l2_seq = l2_seq.wrapping_add(1);
+    *fec_block_seq = fec_block_seq.wrapping_add(1);
     if group_ok {
         *fail_count = 0;
     }

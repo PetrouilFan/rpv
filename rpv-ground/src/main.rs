@@ -441,6 +441,8 @@ fn main() -> Result<(), eframe::Error> {
 
     // ---- Background threads ----
 
+    let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+
     // RX dispatcher: single reader from raw socket, strips Radiotap, dispatches by L2 type
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
@@ -448,6 +450,7 @@ fn main() -> Result<(), eframe::Error> {
     let rx_telem_tx = telem_payload_tx;
     let rx_link_status = Arc::clone(&link_status_shared);
     let rx_drone_id = config.drone_id;
+    let rx_last_hb = Arc::clone(&last_heartbeat);
     let _rx_handle = std::thread::spawn(move || {
         rx_dispatcher(
             rx_running,
@@ -455,6 +458,7 @@ fn main() -> Result<(), eframe::Error> {
             rx_drone_id,
             rx_video_tx,
             rx_telem_tx,
+            rx_last_hb,
             rx_link_status,
         );
     });
@@ -484,6 +488,14 @@ fn main() -> Result<(), eframe::Error> {
     let hb_drone_id = config.drone_id;
     let _hb_handle = std::thread::spawn(move || {
         heartbeat_sender(hb_running, hb_socket, hb_drone_id);
+    });
+
+    // Heartbeat monitor thread: detects when camera stops sending heartbeats
+    let hm_running = running.clone();
+    let hm_last = Arc::clone(&last_heartbeat);
+    let hm_link_status = Arc::clone(&link_status_shared);
+    let _hm_handle = std::thread::spawn(move || {
+        heartbeat_monitor(hm_running, hm_last, hm_link_status);
     });
 
     // Run egui on main thread with custom wgpu limits for Pi 5 V3D GPU
@@ -537,6 +549,7 @@ fn rx_dispatcher(
     drone_id: u8,
     video_tx: crossbeam_channel::Sender<Vec<u8>>,
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
+    last_heartbeat: Arc<Mutex<Instant>>,
     link_status: Arc<Mutex<LinkStatus>>,
 ) {
     tracing::info!("RX dispatcher started (raw socket)");
@@ -602,9 +615,10 @@ fn rx_dispatcher(
                     }
                 }
             }
-            _ => {
-                // Ignore RC/heartbeat from ground (we send those)
+            link::PAYLOAD_HEARTBEAT => {
+                *last_heartbeat.lock().unwrap() = Instant::now();
             }
+            _ => {}
         }
     }
 
@@ -638,5 +652,38 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
 
         l2_seq = l2_seq.wrapping_add(1);
         std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Heartbeat monitor — detects when camera stops sending heartbeats.
+fn heartbeat_monitor(
+    running: Arc<AtomicBool>,
+    last_heartbeat: Arc<Mutex<Instant>>,
+    link_status: Arc<Mutex<LinkStatus>>,
+) {
+    tracing::info!("Heartbeat monitor started (timeout: 3s)");
+    std::thread::sleep(std::time::Duration::from_secs(3)); // initial grace period
+
+    let mut was_connected = true;
+
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let elapsed = last_heartbeat.lock().unwrap().elapsed();
+        if elapsed > std::time::Duration::from_secs(3) {
+            if was_connected {
+                tracing::warn!("Camera heartbeat lost ({}s)", elapsed.as_secs());
+                if let Ok(mut status) = link_status.lock() {
+                    *status = LinkStatus::SignalLost;
+                }
+                was_connected = false;
+            }
+        } else if !was_connected {
+            tracing::info!("Camera heartbeat restored");
+            if let Ok(mut status) = link_status.lock() {
+                *status = LinkStatus::Connected;
+            }
+            was_connected = true;
+        }
     }
 }

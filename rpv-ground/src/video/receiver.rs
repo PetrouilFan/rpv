@@ -13,8 +13,6 @@ struct RsBlock {
     shard_sizes: Vec<usize>,
     received: usize,
     actual_data_shards: usize,
-    #[allow(dead_code)]
-    first_recv: Instant,
 }
 
 /// Video receiver that processes FEC-encoded video payloads
@@ -56,8 +54,6 @@ impl VideoReceiver {
                     return;
                 }
             };
-
-            let recv_time = Instant::now();
 
             // Video packet header: [4B seq][1B shard_index][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
             if payload.len() < 10 {
@@ -113,7 +109,6 @@ impl VideoReceiver {
                 shard_sizes: vec![0; TOTAL_SHARDS],
                 received: 0,
                 actual_data_shards,
-                first_recv: recv_time,
             });
 
             if block.shards[shard_index].is_none() {

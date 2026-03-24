@@ -423,12 +423,15 @@ fn main() -> Result<(), eframe::Error> {
         config.save();
     }
 
+    let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
     let rx_video_tx = video_payload_tx;
     let rx_telem_tx = telem_payload_tx;
     let rx_link_status = Arc::clone(&link_status_shared);
     let rx_drone_id = config.drone_id;
+    let rx_last_hb = Arc::clone(&last_heartbeat);
     let _rx_handle = std::thread::spawn(move || {
         rx_dispatcher(
             rx_running,
@@ -436,6 +439,7 @@ fn main() -> Result<(), eframe::Error> {
             rx_drone_id,
             rx_video_tx,
             rx_telem_tx,
+            rx_last_hb,
             rx_link_status,
         );
     });
@@ -461,6 +465,13 @@ fn main() -> Result<(), eframe::Error> {
     let hb_drone_id = config.drone_id;
     let _hb_handle = std::thread::spawn(move || {
         heartbeat_sender(hb_running, hb_socket, hb_drone_id);
+    });
+
+    let hm_running = running.clone();
+    let hm_last = Arc::clone(&last_heartbeat);
+    let hm_link_status = Arc::clone(&link_status_shared);
+    let _hm_handle = std::thread::spawn(move || {
+        heartbeat_monitor(hm_running, hm_last, hm_link_status);
     });
 
     let native_options = eframe::NativeOptions {
@@ -510,6 +521,7 @@ fn rx_dispatcher(
     drone_id: u8,
     video_tx: crossbeam_channel::Sender<Vec<u8>>,
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
+    last_heartbeat: Arc<Mutex<Instant>>,
     link_status: Arc<Mutex<LinkStatus>>,
 ) {
     tracing::info!("RX dispatcher started (raw socket)");
@@ -572,7 +584,42 @@ fn rx_dispatcher(
                     }
                 }
             }
+            link::PAYLOAD_HEARTBEAT => {
+                *last_heartbeat.lock().unwrap() = Instant::now();
+            }
             _ => {}
+        }
+    }
+}
+
+fn heartbeat_monitor(
+    running: Arc<AtomicBool>,
+    last_heartbeat: Arc<Mutex<Instant>>,
+    link_status: Arc<Mutex<LinkStatus>>,
+) {
+    tracing::info!("Heartbeat monitor started (timeout: 3s)");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let mut was_connected = true;
+
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let elapsed = last_heartbeat.lock().unwrap().elapsed();
+        if elapsed > std::time::Duration::from_secs(3) {
+            if was_connected {
+                tracing::warn!("Camera heartbeat lost ({}s)", elapsed.as_secs());
+                if let Ok(mut status) = link_status.lock() {
+                    *status = LinkStatus::SignalLost;
+                }
+                was_connected = false;
+            }
+        } else if !was_connected {
+            tracing::info!("Camera heartbeat restored");
+            if let Ok(mut status) = link_status.lock() {
+                *status = LinkStatus::Connected;
+            }
+            was_connected = true;
         }
     }
 }

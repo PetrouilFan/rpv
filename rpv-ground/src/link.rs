@@ -15,11 +15,6 @@ pub const PAYLOAD_TELEMETRY: u8 = 0x02;
 pub const PAYLOAD_RC: u8 = 0x03;
 pub const PAYLOAD_HEARTBEAT: u8 = 0x04;
 
-/// Maximum safe payload size for 802.11 frame without fragmentation.
-/// Conservative limit: ~1400 bytes after accounting for L2 headers.
-#[allow(dead_code)]
-pub const MAX_PAYLOAD: usize = 1400;
-
 #[derive(Debug, Clone, Copy)]
 pub struct L2Header {
     pub drone_id: u8,
