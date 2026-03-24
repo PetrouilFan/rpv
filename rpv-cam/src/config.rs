@@ -3,12 +3,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub ground_ip: String,
+    #[serde(default = "default_fc_port")]
+    pub fc_port: String,
+    #[serde(default = "default_fc_baud")]
+    pub fc_baud: u32,
+}
+
+fn default_fc_port() -> String {
+    "/dev/ttyAMA0".to_string()
+}
+
+fn default_fc_baud() -> u32 {
+    115200
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             ground_ip: "192.168.100.2".to_string(),
+            fc_port: default_fc_port(),
+            fc_baud: default_fc_baud(),
         }
     }
 }
