@@ -29,7 +29,8 @@ fn write_link_status(status: &str) {
 fn get_interface_ip(iface: &str) -> Option<IpAddr> {
     let output = std::process::Command::new("ip")
         .args(&["addr", "show", iface])
-        .output().ok()?;
+        .output()
+        .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let line = line.trim();
@@ -50,7 +51,7 @@ fn main() {
 
     tracing::info!("rpv-cam starting (H.264 + XOR 4+1)");
 
-    let config = config::Config::load();
+    let (config, _was_default) = config::Config::load();
     tracing::info!("Config: {:?}", config);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -154,41 +155,50 @@ fn heartbeat_monitor(
     last_heartbeat: Arc<Mutex<Instant>>,
     fallback_ip: Option<IpAddr>,
 ) {
+    use std::sync::atomic::AtomicBool as AtomicBoolFlag;
     tracing::info!("Heartbeat monitor started (timeout: 3s)");
     thread::sleep(Duration::from_secs(3));
+
+    let rediscovering = Arc::new(AtomicBoolFlag::new(false));
 
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_secs(1));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > Duration::from_secs(3) {
-            tracing::warn!("Heartbeat lost ({}s), triggering re-discovery...", elapsed.as_secs());
+        if elapsed > Duration::from_secs(3) && !rediscovering.load(Ordering::SeqCst) {
+            tracing::warn!(
+                "Heartbeat lost ({}s), triggering re-discovery...",
+                elapsed.as_secs()
+            );
             write_link_status("searching");
 
+            rediscovering.store(true, Ordering::SeqCst);
+            let rd = Arc::clone(&rediscovering);
             let rediscover_ground = Arc::clone(&ground_addr);
+            let rediscover_last_hb = Arc::clone(&last_heartbeat);
             let rediscover_fallback = fallback_ip;
             thread::spawn(move || {
-                match std::panic::catch_unwind(|| discover::discover_ground(5, rediscover_fallback)) {
+                match std::panic::catch_unwind(|| discover::discover_ground(5, rediscover_fallback))
+                {
                     Ok(new_ip) => {
                         tracing::info!("Re-discovered ground station at {}", new_ip);
                         *rediscover_ground.lock().unwrap() = Some(new_ip);
+                        *rediscover_last_hb.lock().unwrap() = Instant::now();
                         write_link_status("connected");
                     }
                     Err(_) => {
                         tracing::error!("Discovery panicked, will retry");
                     }
                 }
+                rd.store(false, Ordering::SeqCst);
             });
-
-            thread::sleep(Duration::from_secs(6));
         }
     }
 }
 
 fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
     // Bind to wlan0 IP specifically for better routing
-    let bind_ip = get_interface_ip("wlan0")
-        .unwrap_or("0.0.0.0".parse().unwrap());
+    let bind_ip = get_interface_ip("wlan0").unwrap_or("0.0.0.0".parse().unwrap());
     tracing::info!("Video sender binding to {}", bind_ip);
 
     let socket = match UdpSocket::bind(format!("{}:0", bind_ip)) {
@@ -213,27 +223,41 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
             return;
         }
     };
-    tracing::info!("Video sender ready (XOR {}+{})", DATA_CHUNKS, TOTAL_CHUNKS - DATA_CHUNKS);
+    tracing::info!(
+        "Video sender ready (XOR {}+{})",
+        DATA_CHUNKS,
+        TOTAL_CHUNKS - DATA_CHUNKS
+    );
 
     while running.load(Ordering::SeqCst) {
         tracing::info!("Starting rpicam-vid H.264 baseline...");
 
         let child = Command::new("rpicam-vid")
             .args(&[
-                "--width", "960",
-                "--height", "540",
-                "--framerate", "30",
-                "--codec", "h264",
-                "--profile", "baseline",
-                "--level", "4.1",
-                "--bitrate", "3000000",
+                "--width",
+                "960",
+                "--height",
+                "540",
+                "--framerate",
+                "30",
+                "--codec",
+                "h264",
+                "--profile",
+                "baseline",
+                "--level",
+                "4.1",
+                "--bitrate",
+                "3000000",
                 "--low-latency",
                 "--flush",
                 "--inline",
-                "--intra", "10",  // Keyframe every 10 frames for fast recovery
+                "--intra",
+                "10", // Keyframe every 10 frames for fast recovery
                 "--nopreview",
-                "-t", "0",
-                "-o", "-",
+                "-t",
+                "0",
+                "-o",
+                "-",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -370,6 +394,7 @@ fn send_xor_block(
     }
 
     // Send all data chunks + parity
+    let mut group_ok = true;
     for (i, chunk) in chunks.iter().chain(std::iter::once(&parity)).enumerate() {
         // Header: [4B block_seq][1B chunk_index][1B total_chunks][2B payload_len][8B send_ts]
         let mut packet = Vec::with_capacity(16 + chunk.len());
@@ -381,9 +406,24 @@ fn send_xor_block(
         packet.extend_from_slice(chunk);
 
         match socket.send_to(&packet, target) {
-            Ok(_) => {
-                *fail_count = 0;
+            Ok(_) => {}
+            Err(e) => {
+                group_ok = false;
+                *fail_count = fail_count.saturating_add(1);
+                if *fail_count <= 5 {
+                    tracing::warn!("Video send error: {}", e);
+                }
+                if *fail_count > 30 {
+                    tracing::warn!("Too many send failures, relying on heartbeat for re-discovery");
+                    *fail_count = 0;
+                    return;
+                }
             }
+        }
+    }
+    if group_ok {
+        *fail_count = 0;
+    }
             Err(e) => {
                 *fail_count = fail_count.saturating_add(1);
                 if *fail_count <= 5 {
@@ -468,7 +508,13 @@ fn rc_receiver_with_failsafe(running: Arc<AtomicBool>) {
                 }
 
                 let ch_str: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
-                let _ = std::fs::write(rc_file_path, ch_str.join(","));
+                let tmp_path = format!("{}.tmp", rc_file_path);
+                if let Ok(mut f) = std::fs::File::create(&tmp_path) {
+                    use std::io::Write;
+                    let _ = f.write_all(ch_str.join(",").as_bytes());
+                    let _ = f.flush();
+                    let _ = std::fs::rename(&tmp_path, rc_file_path);
+                }
                 last_rc_time = Instant::now();
             }
             Err(_) => {

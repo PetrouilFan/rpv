@@ -233,6 +233,7 @@ impl eframe::App for RpvApp {
 
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
+    let telem = state.telemetry.lock().unwrap().clone();  // ONE lock, then clone
 
     egui::Area::new(egui::Id::new("osd_top_left"))
         .fixed_pos(egui::pos2(10.0, 10.0))
@@ -255,12 +256,9 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                         );
                         ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
                     } else {
-                        // Blinking dot for searching/lost
-                        let ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let blink = (ms / 500) % 2 == 0;
+                        // Blinking dot for searching/lost — use egui time, no syscall
+                        let t = ui.ctx().input(|i| i.time);
+                        let blink = (t * 2.0) as u64 % 2 == 0;
                         if blink {
                             let dot_size = 10.0;
                             let (rect, _) = ui.allocate_exact_size(
@@ -295,7 +293,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_top_right"))
         .fixed_pos(egui::pos2(screen.max.x - 170.0, 10.0))
         .show(ui.ctx(), |ui| {
-            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 let pct = telem.battery_pct as f32;
                 let bar_color = if pct > 30.0 {
@@ -343,7 +340,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_bottom_left"))
         .fixed_pos(egui::pos2(10.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
-            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(format!("SPD: {:.1} m/s", telem.speed))
@@ -361,7 +357,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_bottom_right"))
         .fixed_pos(egui::pos2(screen.max.x - 210.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
-            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(format!("HDG: {:.0}deg", telem.heading))
@@ -392,7 +387,7 @@ fn main() -> Result<(), eframe::Error> {
 
     tracing::info!("rpv ground station starting");
 
-    let config = Config::load();
+    let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
 
     // Shared running flag for ctrl+c
@@ -430,7 +425,9 @@ fn main() -> Result<(), eframe::Error> {
     let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared));
     let telemetry_state = telemetry.get_state();
 
-    config.save();
+    if was_default {
+        config.save();
+    }
 
     let bg_video_frame_tx = video_frame_tx;
     let bg_telemetry = telemetry;

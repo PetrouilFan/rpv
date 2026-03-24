@@ -46,15 +46,30 @@ impl VideoDecoder {
     }
 }
 
-pub fn nv12_to_rgba(y_plane: &[u8], uv_plane: &[u8], stride: usize, width: usize, height: usize, rgba: &mut [u8]) {
+pub fn nv12_to_rgba(
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    rgba: &mut [u8],
+) {
     let mut i = 0;
     for row in 0..height {
         let uv_row = row / 2;
         for col in 0..width {
-            let y_val = y_plane[row * stride + col] as i32;
-            
+            let y_idx = row * stride + col;
+            if y_idx >= y_plane.len() {
+                break;
+            }
+            let y_val = y_plane[y_idx] as i32;
+
             // NV12: UV is interleaved, stride applies to UV plane too
             let uv_idx = uv_row * stride + (col & !1);
+            if uv_idx + 1 >= uv_plane.len() {
+                i += 4;
+                continue;
+            }
             let u_val = uv_plane[uv_idx] as i32 - 128;
             let v_val = uv_plane[uv_idx + 1] as i32 - 128;
 
@@ -63,7 +78,7 @@ pub fn nv12_to_rgba(y_plane: &[u8], uv_plane: &[u8], stride: usize, width: usize
             let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
             let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
             let b = ((298 * c + 517 * u_val + 128) >> 8).clamp(0, 255) as u8;
-            
+
             rgba[i] = r;
             rgba[i + 1] = g;
             rgba[i + 2] = b;
@@ -81,41 +96,64 @@ fn decode_loop(
 ) {
     // NV12 format: Y plane (width * height) + UV plane (width * height / 2)
     // Stride is typically aligned to 32 or 64 bytes on Pi hardware
-    let stride = ((width + 31) / 32) * 32;  // Align to 32 bytes
+    let stride = ((width + 31) / 32) * 32; // Align to 32 bytes
     let y_size = (stride * height) as usize;
     let uv_size = (stride * height / 2) as usize;
     let total_size = y_size + uv_size;
 
-    info!("H.264 decoder initialized: {}x{} stride={} NV12", width, height, stride);
+    info!(
+        "H.264 decoder initialized: {}x{} stride={} NV12",
+        width, height, stride
+    );
 
     loop {
         // Try hardware decode first with NV12 output
         let hw_args = vec![
-            "-loglevel", "error",
-            "-hwaccel", "v4l2m2m",
-            "-hwaccel_output_format", "nv12",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-thread_queue_size", "4096",
-            "-f", "h264",
-            "-i", "pipe:0",
-            "-threads", "2",
-            "-f", "rawvideo",
-            "-pix_fmt", "nv12",
+            "-loglevel",
+            "error",
+            "-hwaccel",
+            "v4l2m2m",
+            "-hwaccel_output_format",
+            "nv12",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-thread_queue_size",
+            "4096",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-threads",
+            "2",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "nv12",
             "pipe:1",
         ];
 
         // Software fallback with NV12
         let sw_args = vec![
-            "-loglevel", "error",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-thread_queue_size", "4096",
-            "-f", "h264",
-            "-i", "pipe:0",
-            "-threads", "2",
-            "-f", "rawvideo",
-            "-pix_fmt", "nv12",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-thread_queue_size",
+            "4096",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-threads",
+            "2",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "nv12",
             "pipe:1",
         ];
 
@@ -138,7 +176,10 @@ fn decode_loop(
 
         let mut child = match child {
             Ok(c) => {
-                info!("FFmpeg decoder started: {}x{} NV12 (stride={})", width, height, stride);
+                info!(
+                    "FFmpeg decoder started: {}x{} NV12 (stride={})",
+                    width, height, stride
+                );
                 c
             }
             Err(e) => {
@@ -200,7 +241,10 @@ fn decode_loop(
                         }
                     }
                     Err(e) => {
-                        error!("ffmpeg stdout read error after {} frames: {}", frame_count, e);
+                        error!(
+                            "ffmpeg stdout read error after {} frames: {}",
+                            frame_count, e
+                        );
                         break;
                     }
                 }

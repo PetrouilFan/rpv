@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -30,14 +30,14 @@ struct RsBlock {
 pub struct VideoReceiver {
     tx: mpsc::Sender<VideoFrame>,
     port: u16,
-    cam_ip: std::sync::Arc<Mutex<Option<std::net::IpAddr>>>,
+    cam_ip: std::sync::Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
 }
 
 impl VideoReceiver {
     pub async fn new(
         port: u16,
         tx: mpsc::Sender<VideoFrame>,
-        cam_ip: std::sync::Arc<Mutex<Option<std::net::IpAddr>>>,
+        cam_ip: std::sync::Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
     ) -> std::io::Result<Self> {
         info!(
             "Video receiver (RS {}+{}) ready on port {}",
@@ -99,18 +99,28 @@ impl VideoReceiver {
 
         loop {
             match socket.recv_from(&mut buf).await {
-                Ok((len, _addr)) => {
+                Ok((len, src)) => {
+                    // Enforce source IP filter
+                    {
+                        let guard = self.cam_ip.lock().unwrap();
+                        if let Some(allowed_ip) = *guard {
+                            if allowed_ip != src.ip() {
+                                continue;
+                            }
+                        }
+                    }
                     let recv_time = Instant::now();
 
-                    // Header: [4B seq][1B shard_index][1B total_shards][2B shard_len] = 8 bytes
-                    if len < 8 {
+                    // Header: [4B seq][1B shard_index][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
+                    if len < 10 {
                         continue;
                     }
 
                     let block_seq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let shard_index = buf[4] as usize;
                     let total_shards = buf[5] as usize;
-                    let shard_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+                    let _data_shards = buf[6] as usize;  // actual data shards (may be < DATA_SHARDS for partial)
+                    let shard_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
 
                     if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
                         warn!(
@@ -120,7 +130,7 @@ impl VideoReceiver {
                         continue;
                     }
 
-                    let payload_start = 8;
+                    let payload_start = 10;
                     let payload_end = payload_start + shard_len;
                     if payload_end > len {
                         continue;
@@ -266,7 +276,7 @@ impl VideoReceiver {
                             last_loss_rate = loss_rate;
 
                             let cam_ip = {
-                                let ip = self.cam_ip.lock().await;
+                                let ip = self.cam_ip.lock().unwrap();
                                 *ip
                             };
                             if let Some(cam_ip) = cam_ip {
