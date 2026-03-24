@@ -22,6 +22,7 @@ struct RsBlock {
     shards: Vec<Option<Vec<u8>>>,
     shard_sizes: Vec<usize>,
     received: usize,
+    actual_data_shards: usize,
     first_recv: Instant,
 }
 
@@ -105,7 +106,7 @@ impl VideoReceiver {
                     let block_seq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let shard_index = buf[4] as usize;
                     let total_shards = buf[5] as usize;
-                    let _data_shards = buf[6] as usize;  // actual data shards (may be < DATA_SHARDS for partial)
+                    let actual_data_shards = buf[6] as usize;
                     let shard_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
 
                     if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
@@ -152,6 +153,7 @@ impl VideoReceiver {
                         shards: vec![None; TOTAL_SHARDS],
                         shard_sizes: vec![0; TOTAL_SHARDS],
                         received: 0,
+                        actual_data_shards: actual_data_shards,
                         first_recv: recv_time,
                     });
 
@@ -167,10 +169,10 @@ impl VideoReceiver {
                             let block = blocks.get(&block_seq).unwrap();
                             if block.received >= DATA_SHARDS {
                                 // Enough shards received, attempt RS reconstruction
-                                let reconstructed = reconstruct_rs_block(&rs, block);
+                                let reconstructed = reconstruct_rs_block(&rs, block, block.actual_data_shards);
                                 if let Some(data_shards) = reconstructed {
                                     // Process shards: FU-A reassembly
-                                    for shard_data in &data_shards {
+                                    for shard_data in data_shards.iter().take(block.actual_data_shards) {
                                         if shard_data.is_empty() {
                                             continue;
                                         }
@@ -247,6 +249,7 @@ impl VideoReceiver {
 fn reconstruct_rs_block(
     rs: &ReedSolomon,
     block: &RsBlock,
+    actual_data_shards: usize,
 ) -> Option<Vec<Vec<u8>>> {
     let max_size = block.shard_sizes.iter().max().copied().unwrap_or(0);
     if max_size == 0 {
@@ -269,9 +272,8 @@ fn reconstruct_rs_block(
         return None;
     }
 
-    // Return only the data shards (first DATA_SHARDS)
-    let mut result = Vec::with_capacity(DATA_SHARDS);
-    for i in 0..DATA_SHARDS {
+    let mut result = Vec::with_capacity(actual_data_shards);
+    for i in 0..actual_data_shards {
         result.push(shard_refs[i].clone().unwrap_or_default());
     }
     Some(result)

@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::receiver::VideoReceiver;
-use crate::video::decoder::{VideoDecoder, DecodedYUV};
+use crate::video::decoder::{VideoDecoder, DecodedFrame as DecodedYUV};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LinkStatus {
@@ -511,6 +511,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
+            present_mode: wgpu::PresentMode::Mailbox,
             device_descriptor: std::sync::Arc::new(|_adapter| {
                 let limits = wgpu::Limits {
                     max_texture_dimension_1d: 4096,
