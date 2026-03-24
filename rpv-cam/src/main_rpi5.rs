@@ -49,7 +49,7 @@ fn main() {
         .with_level(true)
         .init();
 
-    tracing::info!("rpv-cam starting (H.264 + XOR 4+1)");
+    tracing::info!("rpv-cam starting (H.264 + RS {DATA_SHARDS}+{PARITY_SHARDS})");
 
     let (config, _was_default) = config::Config::load();
     tracing::info!("Config: {:?}", config);
@@ -344,6 +344,45 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
             }
         }
 
+        // Force-flush trailing NAL if buffer contains at least a start code
+        if nal_buf.len() > 4 {
+            let start_code_len = if nal_buf.len() > 3 && nal_buf[2] == 0 && nal_buf[3] == 1 {
+                4
+            } else {
+                3
+            };
+            let nal = nal_buf[start_code_len..].to_vec();
+            if !nal.is_empty() {
+                let mut off = 0;
+                let mut frag_idx: u8 = 0;
+                while off < nal.len() {
+                    let end = (off + 1200).min(nal.len());
+                    let mut frag = Vec::with_capacity(1 + end - off);
+                    frag.push(frag_idx);
+                    frag.extend_from_slice(&nal[off..end]);
+                    fec_buffer.push(frag);
+                    if fec_buffer.len() == DATA_SHARDS {
+                        if let Some(ip) = *ground_addr.lock().unwrap() {
+                            let target = format!("{}:{}", ip, VIDEO_PORT);
+                            send_fec_group(
+                                &socket,
+                                &rs,
+                                &fec_buffer,
+                                seq,
+                                &target,
+                                &mut fail_count,
+                            );
+                            seq = seq.wrapping_add(1);
+                        }
+                        fec_buffer.clear();
+                    }
+                    off = end;
+                    frag_idx += 1;
+                }
+            }
+            nal_buf.clear();
+        }
+
         // Send any remaining partial group
         if !fec_buffer.is_empty() {
             if let Some(ip) = *ground_addr.lock().unwrap() {
@@ -571,6 +610,7 @@ fn telemetry_sender(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAd
         }
     };
 
+    tracing::warn!("Telemetry: all flight fields are placeholder zeros — no FC integration yet");
     tracing::info!("Telemetry sender ready");
 
     let interval = Duration::from_millis(200);
