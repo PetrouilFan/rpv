@@ -38,5 +38,5 @@ impl Config {
 
 fn config_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(format!("{}/.config/rpv/config.toml", home))
+    std::path::PathBuf::from(format!("{}/.config/rpv/cam.toml", home))
 }

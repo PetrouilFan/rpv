@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
-
-const FEEDBACK_PORT: u16 = 5604;
 
 const DATA_SHARDS: usize = 2;
 const PARITY_SHARDS: usize = 1;
@@ -72,15 +70,6 @@ impl VideoReceiver {
         };
         info!("Video receiver listening on {}", bind_addr);
 
-        let feedback_socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to bind feedback socket: {}", e);
-                return;
-            }
-        };
-        info!("Feedback sender ready on port {}", FEEDBACK_PORT);
-
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 
@@ -88,10 +77,7 @@ impl VideoReceiver {
         let mut blocks: HashMap<u32, RsBlock> = HashMap::new();
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
-        let mut last_feedback_time = Instant::now();
-        let mut last_loss_rate: u8 = 0;
         let mut block_count: u64 = 0;
-        let mut loss_samples: Vec<bool> = Vec::new();
 
         // FU-A reassembly state
         let mut nal_buf: Vec<u8> = Vec::new();
@@ -136,20 +122,6 @@ impl VideoReceiver {
                         continue;
                     }
                     let payload = buf[payload_start..payload_end].to_vec();
-
-                    // Track sequence for loss calculation
-                    if let Some(current) = next_block {
-                        let gap = block_seq.wrapping_sub(current);
-                        if gap > 0 && gap < 100 {
-                            for _ in 0..gap {
-                                loss_samples.push(false);
-                            }
-                        }
-                    }
-                    loss_samples.push(true);
-                    if loss_samples.len() > 120 {
-                        loss_samples.drain(..loss_samples.len() - 120);
-                    }
 
                     // Initialize next_block if needed
                     if next_block.is_none() {
@@ -225,6 +197,7 @@ impl VideoReceiver {
                                                 block_count += 1;
                                             }
                                             nal_buf.clear();
+                                            nal_buf.extend_from_slice(&[0, 0, 0, 1]); // Annex-B start code
                                             nal_buf.extend_from_slice(frag_payload);
                                             nal_started = true;
                                         } else if nal_started {
@@ -260,38 +233,6 @@ impl VideoReceiver {
                                 last_decode_time = Instant::now();
                             }
                         }
-                    }
-
-                    // Send loss feedback periodically
-                    if last_feedback_time.elapsed().as_secs() >= 1 && loss_samples.len() >= 10 {
-                        let received_count = loss_samples.iter().filter(|&&r| r).count();
-                        let total_count = loss_samples.len();
-                        let loss_rate = if total_count > 0 {
-                            ((total_count - received_count) * 100 / total_count) as u8
-                        } else {
-                            0
-                        };
-
-                        if (loss_rate as i16 - last_loss_rate as i16).abs() > 5 {
-                            last_loss_rate = loss_rate;
-
-                            let cam_ip = {
-                                let ip = self.cam_ip.lock().unwrap();
-                                *ip
-                            };
-                            if let Some(cam_ip) = cam_ip {
-                                let target = format!("{}:{}", cam_ip, FEEDBACK_PORT);
-                                let pkt = [b'L', loss_rate, 0, 0];
-                                let _ = feedback_socket.send_to(&pkt, &target).await;
-                                info!(
-                                    "FEEDBACK: loss_rate={}% ({}/{})",
-                                    loss_rate, received_count, total_count
-                                );
-                            }
-                        }
-
-                        loss_samples.clear();
-                        last_feedback_time = Instant::now();
                     }
                 }
                 Err(e) => {

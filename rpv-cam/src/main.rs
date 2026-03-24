@@ -15,7 +15,6 @@ const VIDEO_PORT: u16 = 5600;
 const TELEMETRY_PORT: u16 = 5601;
 const RC_PORT: u16 = 5602;
 const HEARTBEAT_PORT: u16 = 5603;
-const FEEDBACK_PORT: u16 = 5604;
 
 const DATA_SHARDS: usize = 2;
 const PARITY_SHARDS: usize = 1;
@@ -56,9 +55,6 @@ fn main() {
     let ground_addr: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(Some(ground_ip)));
     let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
-    // Adaptive bitrate state: (loss_rate, timestamp)
-    let bitrate_state: Arc<Mutex<(u8, Instant)>> = Arc::new(Mutex::new((0, Instant::now())));
-
     // Start heartbeat receiver
     let hb_running = running.clone();
     let hb_last = Arc::clone(&last_heartbeat);
@@ -75,19 +71,11 @@ fn main() {
         heartbeat_monitor(hm_running, hm_ground, hm_last, hm_fallback);
     });
 
-    // Start feedback receiver (adaptive bitrate)
-    let fb_running = running.clone();
-    let fb_bitrate = Arc::clone(&bitrate_state);
-    let fb_handle = thread::spawn(move || {
-        feedback_receiver(fb_running, fb_bitrate);
-    });
-
     // Start video capture and streaming
     let video_running = running.clone();
     let video_ground = Arc::clone(&ground_addr);
-    let video_bitrate = Arc::clone(&bitrate_state);
     let video_handle = thread::spawn(move || {
-        video_loop(video_running, video_ground, video_bitrate);
+        video_loop(video_running, video_ground);
     });
 
     // Start RC receiver
@@ -105,7 +93,6 @@ fn main() {
 
     hb_handle.join().ok();
     hm_handle.join().ok();
-    fb_handle.join().ok();
     video_handle.join().ok();
     rc_handle.join().ok();
     telem_handle.join().ok();
@@ -193,45 +180,7 @@ fn heartbeat_monitor(
     }
 }
 
-fn feedback_receiver(running: Arc<AtomicBool>, bitrate_state: Arc<Mutex<(u8, Instant)>>) {
-    let socket = match UdpSocket::bind(format!("0.0.0.0:{}", FEEDBACK_PORT)) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                "Failed to bind feedback socket on port {}: {}",
-                FEEDBACK_PORT,
-                e
-            );
-            return;
-        }
-    };
-
-    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
-    tracing::info!("Feedback receiver listening on port {}", FEEDBACK_PORT);
-
-    let mut buf = [0u8; 64];
-
-    while running.load(Ordering::SeqCst) {
-        match socket.recv_from(&mut buf) {
-            Ok((len, _addr)) => {
-                if len >= 2 && buf[0] == b'L' {
-                    let loss_rate = buf[1];
-                    *bitrate_state.lock().unwrap() = (loss_rate, Instant::now());
-                    tracing::info!("FEEDBACK: received loss_rate={}%", loss_rate);
-                }
-            }
-            Err(_) => {
-                // timeout or error, keep waiting
-            }
-        }
-    }
-}
-
-fn video_loop(
-    running: Arc<AtomicBool>,
-    ground_addr: Arc<Mutex<Option<IpAddr>>>,
-    bitrate_state: Arc<Mutex<(u8, Instant)>>,
-) {
+fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => {
             let _ = s.set_write_timeout(Some(Duration::from_secs(1)));

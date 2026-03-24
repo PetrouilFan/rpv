@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-IFACE="wlan1"   # RTL8812AU
+IFACE="wlan1"   # RTL8821AU
 
 # Idempotent teardown
 pkill hostapd 2>/dev/null || true

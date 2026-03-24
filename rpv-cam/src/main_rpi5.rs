@@ -7,18 +7,18 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use reed_solomon_erasure::ReedSolomon;
 
 const VIDEO_PORT: u16 = 5600;
 const TELEMETRY_PORT: u16 = 5601;
 const RC_PORT: u16 = 5602;
 const HEARTBEAT_PORT: u16 = 5603;
-const FEEDBACK_PORT: u16 = 5604;
 
-// XOR 2+1: 2 data chunks + 1 parity (simpler, fewer packets)
-const DATA_CHUNKS: usize = 2;
-const TOTAL_CHUNKS: usize = 3; // 2 data + 1 parity
-const MAX_CHUNK_SIZE: usize = 1200; // Safe MTU payload
+const DATA_SHARDS: usize = 2;
+const PARITY_SHARDS: usize = 1;
+const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 
 const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
@@ -109,12 +109,6 @@ fn main() {
         telemetry_sender(telem_running, telem_ground);
     });
 
-    // Start feedback receiver (for adaptive bitrate)
-    let fb_running = running.clone();
-    let _fb_handle = thread::spawn(move || {
-        feedback_receiver(fb_running);
-    });
-
     // Wait for shutdown
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(500));
@@ -197,8 +191,8 @@ fn heartbeat_monitor(
 }
 
 fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>) {
-    // Bind to wlan0 IP specifically for better routing
-    let bind_ip = get_interface_ip("wlan0").unwrap_or("0.0.0.0".parse().unwrap());
+    // Bind to wlan1 IP specifically for better routing
+    let bind_ip = get_interface_ip("wlan1").unwrap_or("0.0.0.0".parse().unwrap());
     tracing::info!("Video sender binding to {}", bind_ip);
 
     let socket = match UdpSocket::bind(format!("{}:0", bind_ip)) {
@@ -223,11 +217,10 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
             return;
         }
     };
-    tracing::info!(
-        "Video sender ready (XOR {}+{})",
-        DATA_CHUNKS,
-        TOTAL_CHUNKS - DATA_CHUNKS
-    );
+    tracing::info!("Video sender ready (FEC {}+{})", DATA_SHARDS, PARITY_SHARDS);
+
+    let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
+        .expect("Failed to create Reed-Solomon encoder");
 
     while running.load(Ordering::SeqCst) {
         tracing::info!("Starting rpicam-vid H.264 baseline...");
@@ -252,7 +245,7 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
                 "--flush",
                 "--inline",
                 "--intra",
-                "10", // Keyframe every 10 frames for fast recovery
+                "10",
                 "--nopreview",
                 "-t",
                 "0",
@@ -289,13 +282,18 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
             }
         });
 
-        tracing::info!("rpicam-vid started, streaming H.264 baseline with XOR 4+1...");
+        tracing::info!(
+            "rpicam-vid started, streaming H.264 with FEC {}+{}...",
+            DATA_SHARDS,
+            PARITY_SHARDS
+        );
 
         let mut buf = vec![0u8; 65536];
         let mut total_bytes = 0u64;
-        let mut block_seq: u32 = 0;
+        let mut seq: u32 = 0;
         let mut fail_count: u8 = 0;
-        let mut chunk_buffer: Vec<Vec<u8>> = Vec::with_capacity(DATA_CHUNKS);
+        let mut fec_buffer: Vec<Vec<u8>> = Vec::with_capacity(DATA_SHARDS);
+        let mut nal_buf: Vec<u8> = Vec::new();
 
         while running.load(Ordering::SeqCst) {
             match reader.read(&mut buf) {
@@ -304,33 +302,40 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
                     break;
                 }
                 Ok(n) => {
-                    // Sequential chunking - no NAL boundary detection
-                    let mut offset = 0;
-                    while offset < n {
-                        let chunk_size = (n - offset).min(MAX_CHUNK_SIZE);
-                        chunk_buffer.push(buf[offset..offset + chunk_size].to_vec());
-                        offset += chunk_size;
+                    nal_buf.extend_from_slice(&buf[..n]);
+                    total_bytes += n as u64;
 
-                        // When we have 4 data chunks, compute XOR parity and send
-                        if chunk_buffer.len() == DATA_CHUNKS {
-                            if let Some(ip) = *ground_addr.lock().unwrap() {
-                                let target = format!("{}:{}", ip, VIDEO_PORT);
-                                send_xor_block(
-                                    &socket,
-                                    &chunk_buffer,
-                                    block_seq,
-                                    &target,
-                                    &mut fail_count,
-                                );
-                                block_seq = block_seq.wrapping_add(1);
-                                if block_seq % 100 == 0 {
-                                    tracing::info!("Video sender: sent {} blocks", block_seq);
+                    // Extract complete NALUs and send
+                    while let Some(nal) = extract_next_nal(&mut nal_buf) {
+                        // Split into fragments at 1200 bytes with fragment index
+                        let mut off = 0;
+                        let mut frag_idx: u8 = 0;
+                        while off < nal.len() {
+                            let end = (off + 1200).min(nal.len());
+                            let mut frag = Vec::with_capacity(1 + end - off);
+                            frag.push(frag_idx);
+                            frag.extend_from_slice(&nal[off..end]);
+                            fec_buffer.push(frag);
+                            off = end;
+                            frag_idx += 1;
+
+                            if fec_buffer.len() == DATA_SHARDS {
+                                if let Some(ip) = *ground_addr.lock().unwrap() {
+                                    let target = format!("{}:{}", ip, VIDEO_PORT);
+                                    send_fec_group(
+                                        &socket,
+                                        &rs,
+                                        &fec_buffer,
+                                        seq,
+                                        &target,
+                                        &mut fail_count,
+                                    );
+                                    seq = seq.wrapping_add(1);
                                 }
+                                fec_buffer.clear();
                             }
-                            chunk_buffer.clear();
                         }
                     }
-                    total_bytes += n as u64;
                 }
                 Err(e) => {
                     tracing::error!("Read error: {}", e);
@@ -339,12 +344,13 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
             }
         }
 
-        // Send any remaining partial block
-        if !chunk_buffer.is_empty() {
+        // Send any remaining partial group
+        if !fec_buffer.is_empty() {
             if let Some(ip) = *ground_addr.lock().unwrap() {
                 let target = format!("{}:{}", ip, VIDEO_PORT);
-                send_xor_block(&socket, &chunk_buffer, block_seq, &target, &mut fail_count);
+                send_fec_group(&socket, &rs, &fec_buffer, seq, &target, &mut fail_count);
             }
+            fec_buffer.clear();
         }
 
         let _ = child.kill();
@@ -362,48 +368,102 @@ fn video_loop(running: Arc<AtomicBool>, ground_addr: Arc<Mutex<Option<IpAddr>>>)
     }
 }
 
-fn send_xor_block(
-    socket: &UdpSocket,
-    chunks: &[Vec<u8>],
-    block_seq: u32,
-    target: &str,
-    fail_count: &mut u8,
-) {
-    let send_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
+const MAX_NAL_BUF: usize = 512 * 1024; // 512 KB hard cap
 
-    let data_count = chunks.len();
-    if data_count == 0 {
-        return;
+fn extract_next_nal(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() > MAX_NAL_BUF {
+        tracing::warn!("NAL buffer overflow ({}B), resetting", buf.len());
+        buf.clear();
+        return None;
     }
-
-    // Find max chunk size for parity computation
-    let max_size = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
-    if max_size == 0 {
-        return;
+    let mut start = None;
+    for i in 0..buf.len().saturating_sub(3) {
+        if buf[i] == 0 && buf[i + 1] == 0 {
+            if buf[i + 2] == 0 && i + 3 < buf.len() && buf[i + 3] == 1 {
+                start = Some(i);
+                break;
+            }
+            if buf[i + 2] == 1 {
+                start = Some(i);
+                break;
+            }
+        }
     }
+    let start = start?;
 
-    // Compute XOR parity
-    let mut parity = vec![0u8; max_size];
-    for chunk in chunks {
-        for (p, &b) in parity.iter_mut().zip(chunk.iter()) {
-            *p ^= b;
+    let sc_len = if start + 3 < buf.len() && buf[start + 2] == 0 && buf[start + 3] == 1 {
+        4
+    } else {
+        3
+    };
+
+    let search_from = start + sc_len;
+    let mut end = None;
+    for i in search_from..buf.len().saturating_sub(3) {
+        if buf[i] == 0 && buf[i + 1] == 0 {
+            if buf[i + 2] == 0 && i + 3 < buf.len() && buf[i + 3] == 1 {
+                end = Some(i);
+                break;
+            }
+            if buf[i + 2] == 1 {
+                end = Some(i);
+                break;
+            }
         }
     }
 
-    // Send all data chunks + parity
+    if let Some(end) = end {
+        let nal = buf[start + sc_len..end].to_vec();
+        buf.drain(..end);
+        Some(nal)
+    } else {
+        None
+    }
+}
+
+fn send_fec_group(
+    socket: &UdpSocket,
+    rs: &reed_solomon_erasure::galois_8::ReedSolomon,
+    chunks: &[Vec<u8>],
+    seq: u32,
+    target: &str,
+    fail_count: &mut u8,
+) {
+    if chunks.is_empty() {
+        return;
+    }
+
+    let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(1);
+
+    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
+    for chunk in chunks {
+        let mut shard = vec![0u8; shard_size];
+        shard[..chunk.len()].copy_from_slice(chunk);
+        shards.push(shard);
+    }
+    while shards.len() < DATA_SHARDS {
+        shards.push(vec![0u8; shard_size]);
+    }
+    for _ in 0..PARITY_SHARDS {
+        shards.push(vec![0u8; shard_size]);
+    }
+
+    if let Err(e) = rs.encode(&mut shards) {
+        tracing::warn!("Reed-Solomon encode error: {:?}", e);
+        return;
+    }
+
     let mut group_ok = true;
-    for (i, chunk) in chunks.iter().chain(std::iter::once(&parity)).enumerate() {
-        // Header: [4B block_seq][1B chunk_index][1B total_chunks][2B payload_len][8B send_ts]
-        let mut packet = Vec::with_capacity(16 + chunk.len());
-        packet.extend_from_slice(&block_seq.to_le_bytes());
-        packet.push(i as u8);  // chunk_index (0-1=data, 2=parity)
-        packet.push(TOTAL_CHUNKS as u8);  // total_chunks (always 3)
-        packet.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
-        packet.extend_from_slice(&send_ts.to_le_bytes());
-        packet.extend_from_slice(chunk);
+    for (i, shard) in shards.iter().enumerate() {
+        // Header: [4B seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
+        let mut packet = Vec::with_capacity(10 + shard.len());
+        packet.extend_from_slice(&seq.to_le_bytes());
+        packet.push(i as u8);
+        packet.push(TOTAL_SHARDS as u8);
+        packet.push(chunks.len() as u8);
+        packet.push(0u8);
+        packet.extend_from_slice(&(shard.len() as u16).to_le_bytes());
+        packet.extend_from_slice(shard);
 
         match socket.send_to(&packet, target) {
             Ok(_) => {}
@@ -423,48 +483,6 @@ fn send_xor_block(
     }
     if group_ok {
         *fail_count = 0;
-    }
-            Err(e) => {
-                *fail_count = fail_count.saturating_add(1);
-                if *fail_count <= 5 {
-                    tracing::warn!("Video send error: {}", e);
-                }
-                if *fail_count > 30 {
-                    tracing::warn!("Too many send failures, relying on heartbeat for re-discovery");
-                    *fail_count = 0;
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn feedback_receiver(running: Arc<AtomicBool>) {
-    let socket = match UdpSocket::bind(format!("0.0.0.0:{}", FEEDBACK_PORT)) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Failed to bind feedback socket: {}", e);
-            return;
-        }
-    };
-
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
-    tracing::info!("Feedback receiver listening on port {}", FEEDBACK_PORT);
-
-    let mut buf = [0u8; 64];
-
-    while running.load(Ordering::SeqCst) {
-        match socket.recv_from(&mut buf) {
-            Ok((len, _addr)) => {
-                if len >= 4 && buf[0] == b'L' {
-                    let loss_rate = buf[1];
-                    if loss_rate > 50 {
-                        tracing::warn!("High loss rate reported: {}%", loss_rate);
-                    }
-                }
-            }
-            Err(_) => {}
-        }
     }
 }
 
@@ -518,10 +536,11 @@ fn rc_receiver_with_failsafe(running: Arc<AtomicBool>) {
                 last_rc_time = Instant::now();
             }
             Err(_) => {
-                // Check for failsafe
                 if last_rc_time.elapsed() > failsafe_timeout {
-                    // Neutralize channels (center all sticks)
-                    let _ = std::fs::write(rc_file_path, "1500,1500,1000,1500");
+                    // Remove the RC file so external flight controller integration
+                    // triggers its internal MAVLink/Betaflight failsafe when the
+                    // file stops updating.
+                    let _ = std::fs::remove_file(rc_file_path);
                 }
             }
         }

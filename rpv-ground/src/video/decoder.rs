@@ -158,36 +158,69 @@ fn decode_loop(
         ];
 
         // Try hardware decode first
-        let child = Command::new("ffmpeg")
+        let mut child = match Command::new("ffmpeg")
             .args(&hw_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .or_else(|_| {
-                warn!("Hardware decode failed, falling back to software");
+        {
+            Ok(mut c) => {
+                // Give HW decoder a moment to initialize
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                match c.try_wait() {
+                    Ok(Some(status)) => {
+                        warn!(
+                            "HW decode (v4l2m2m) exited immediately with {}, falling back to SW",
+                            status
+                        );
+                        let _ = c.kill();
+                        let _ = c.wait();
+                        Command::new("ffmpeg")
+                            .args(&sw_args)
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .unwrap_or_else(|e| {
+                                panic!("Failed to spawn ffmpeg SW fallback: {}", e);
+                            })
+                    }
+                    Ok(None) => c,
+                    Err(e) => {
+                        warn!("HW decode wait error: {}, falling back to SW", e);
+                        let _ = c.kill();
+                        let _ = c.wait();
+                        Command::new("ffmpeg")
+                            .args(&sw_args)
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .unwrap_or_else(|e| {
+                                panic!("Failed to spawn ffmpeg SW fallback: {}", e);
+                            })
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to spawn ffmpeg HW, trying SW: {}", e);
                 Command::new("ffmpeg")
                     .args(&sw_args)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
-            });
-
-        let mut child = match child {
-            Ok(c) => {
-                info!(
-                    "FFmpeg decoder started: {}x{} NV12 (stride={})",
-                    width, height, stride
-                );
-                c
-            }
-            Err(e) => {
-                error!("Failed to spawn ffmpeg: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
+                    .unwrap_or_else(|e| {
+                        panic!("Failed to spawn ffmpeg SW fallback: {}", e);
+                    })
             }
         };
+
+        info!(
+            "FFmpeg decoder started: {}x{} NV12 (stride={})",
+            width, height, stride
+        );
 
         let mut stdin = child.stdin.take().expect("No stdin");
         let stdout = child.stdout.take().expect("No stdout");
@@ -217,10 +250,6 @@ fn decode_loop(
             loop {
                 match reader.read_exact(&mut frame_buf) {
                     Ok(()) => {
-                        // Extract NV12 planes
-                        let y_data = frame_buf[0..y_size].to_vec();
-                        let uv_data = frame_buf[y_size..y_size + uv_size].to_vec();
-
                         let frame = DecodedFrame {
                             nv12_data: frame_buf.clone(),
                             width,
@@ -279,6 +308,4 @@ fn decode_loop(
         info!("Restarting ffmpeg decoder...");
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-
-    info!("Decoder thread exiting");
 }
