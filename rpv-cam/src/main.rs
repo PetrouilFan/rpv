@@ -131,6 +131,14 @@ fn rx_dispatcher(
     let mut reject_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
+        // RC failsafe: runs every iteration including after recv timeout.
+        // If no RC data received for 2s while using file fallback, delete the
+        // RC file so the FC reads nothing (safe hover/RTL) instead of stale inputs.
+        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
+            let _ = std::fs::remove_file(rc_file_path);
+            failsafe_active = true;
+        }
+
         let len = match socket.recv(&mut buf) {
             Ok(0) => continue, // timeout
             Ok(n) => n,
@@ -216,12 +224,6 @@ fn rx_dispatcher(
             _ => {
                 // Ignore video/telemetry from ground (we're the camera)
             }
-        }
-
-        // RC failsafe for file fallback
-        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
-            let _ = std::fs::remove_file(rc_file_path);
-            failsafe_active = true;
         }
     }
 

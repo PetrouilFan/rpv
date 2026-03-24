@@ -101,10 +101,13 @@ impl RawSocket {
     }
 
     /// Send a raw 802.11 frame.
-    /// Constructs a broadcast data frame header and appends `payload` (L2 header + data)
-    /// as the frame body. The kernel adds the Radiotap header on TX.
+    /// Prepends a minimal Radiotap header + broadcast data frame header.
+    /// The Radiotap header is required by mac80211 for injected frames in monitor mode.
     pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        let mut frame = Vec::with_capacity(IEEE80211_HDR_LEN + payload.len());
+        // Minimal Radiotap header: version=0, pad=0, hdr_len=8, present=0
+        let radiotap: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut frame = Vec::with_capacity(radiotap.len() + IEEE80211_HDR_LEN + payload.len());
+        frame.extend_from_slice(&radiotap);
         frame.extend_from_slice(&build_data_frame_header());
         frame.extend_from_slice(payload);
 
@@ -195,17 +198,24 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
         return None;
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
-    let _to_ds = (fc >> 8) & 1;
-    let _from_ds = (fc >> 9) & 1;
+    let frame_type = (fc >> 2) & 0x3; // 0=Management, 1=Control, 2=Data
+    let to_ds = (fc >> 8) & 1;
+    let from_ds = (fc >> 9) & 1;
     let subtype = (fc >> 4) & 0xF;
 
-    let base_len = if _to_ds == 1 && _from_ds == 1 {
+    // Only Data frames (type=2) have variable-length headers with QoS
+    if frame_type != 2 {
+        // Management and Control frames: 24 bytes (no QoS, no 4-addr)
+        return if frame.len() >= 24 { Some(24) } else { None };
+    }
+
+    let base_len = if to_ds == 1 && from_ds == 1 {
         30 // 4-address frame
     } else {
         24 // standard 3-address frame
     };
 
-    // QoS data frames have an extra 2-byte QoS Control field
+    // QoS data frames (subtype bit 3 set) have an extra 2-byte QoS Control field
     let qos_bit = subtype & 0x8 != 0;
     let hdr_len = if qos_bit { base_len + 2 } else { base_len };
 
@@ -220,31 +230,89 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
 /// Returns the L2 protocol payload (our link.rs header + application data).
 /// Returns None if parsing fails.
 pub fn recv_strip_headers(frame: &[u8], log_rejections: bool) -> Option<&[u8]> {
+    recv_extract(frame, log_rejections).map(|(payload, _rssi)| payload)
+}
+
+/// Strip Radiotap + 802.11 header, returning the L2 payload and optional RSSI (dBm).
+pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Option<i8>)> {
+    let rssi = parse_radiotap_rssi(frame);
     let after_radiotap = strip_radiotap(frame)?;
     let hdr_len = ieee80211_hdr_len(after_radiotap)?;
 
-    // Some drivers insert an LLC/SNAP header (8 bytes: AA AA 03 00 00 00 + ethertype)
-    // after the 802.11 header for data frames. Check for it.
     let after_80211 = &after_radiotap[hdr_len..];
     if after_80211.len() >= 8
         && after_80211[0] == 0xAA
         && after_80211[1] == 0xAA
         && after_80211[2] == 0x03
     {
-        // Skip LLC/SNAP (8 bytes)
         let payload = &after_80211[8..];
         if payload.is_empty() {
             return None;
         }
-        return Some(payload);
-    }
-
-    if log_rejections && after_80211.len() >= 4 {
-        // This branch is hit when there's no LLC/SNAP — payload is directly after 802.11 header
+        return Some((payload, rssi));
     }
 
     if after_80211.is_empty() {
         return None;
     }
-    Some(after_80211)
+    Some((after_80211, rssi))
+}
+
+/// Parse antenna signal (RSSI in dBm) from the Radiotap header if present.
+/// Radiotap fields are variable-length and ordered by the present bitmask.
+/// Antenna signal is present bit 5. Field sizes (bytes):
+///   0:TSFT(8) 1:FLAGS(1) 2:RATE(1) 3:CHANNEL(4) 4:FHSS(2) 5:SIGNAL(1) 6:NOISE(1)
+fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
+    if frame.len() < 8 {
+        return None;
+    }
+    let hdr_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+    if hdr_len < 8 || hdr_len > frame.len() {
+        return None;
+    }
+
+    let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+
+    // Field sizes for present bits 0..31 (only bits 0-6 are common)
+    const FIELD_SIZES: [u8; 32] = [
+        8, // 0: TSFT
+        1, // 1: FLAGS
+        1, // 2: RATE
+        4, // 3: CHANNEL
+        2, // 4: FHSS
+        1, // 5: ANTENNA SIGNAL (this is what we want)
+        1, // 6: ANTENNA NOISE
+        2, // 7: LOCK QUALITY
+        2, // 8: TX ATTENUATION
+        2, // 9: dB TX ATTENUATION
+        1, // 10: dBm TX POWER
+        1, // 11: ANTENNA
+        1, // 12: dB ANTENNA SIGNAL
+        1, // 13: dB ANTENNA NOISE
+        2, // 14: RX FLAGS
+        4, 4, 4, 4, // 15-18: various
+        2, 2, 2, 2, // 19-22
+        1, 1, 1, 1, // 23-26
+        8, 2, 4, 2, 1, // 27-31
+    ];
+
+    // Check if bit 5 (antenna signal) is present
+    if present & (1 << 5) == 0 {
+        return None;
+    }
+
+    // Walk through all present bits before bit 5 to find offset
+    let mut offset = 8; // start after the first present word
+    for bit in 0..5u32 {
+        if present & (1 << bit) != 0 {
+            offset += FIELD_SIZES[bit as usize] as usize;
+        }
+    }
+
+    // Antenna signal is at `offset` within the Radiotap header
+    if offset >= hdr_len {
+        return None;
+    }
+    let signal = frame[offset] as i8; // signed dBm value
+    Some(signal)
 }

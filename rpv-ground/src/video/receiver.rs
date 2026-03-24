@@ -7,12 +7,15 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 const DATA_SHARDS: usize = 2;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+const VIDEO_HDR_FIXED: usize = 10; // block_seq(4) + shard_idx(1) + total(1) + data(1) + pad(1) + shard_len(2)
+const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + TOTAL_SHARDS * 2; // + shard_sizes array
 
 struct RsBlock {
     shards: Vec<Option<Vec<u8>>>,
     shard_sizes: Vec<usize>,
     received: usize,
     actual_data_shards: usize,
+    original_sizes: Vec<usize>,
 }
 
 /// Video receiver that processes FEC-encoded video payloads
@@ -55,8 +58,8 @@ impl VideoReceiver {
                 }
             };
 
-            // Video packet header: [4B seq][1B shard_index][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
-            if payload.len() < 10 {
+            // Video packet header: fixed(10) + shard_sizes(TOTAL_SHARDS*2)
+            if payload.len() < VIDEO_HDR_LEN {
                 continue;
             }
 
@@ -66,6 +69,14 @@ impl VideoReceiver {
             let actual_data_shards = payload[6] as usize;
             let shard_len = u16::from_le_bytes([payload[8], payload[9]]) as usize;
 
+            // Read original shard sizes (before FEC padding) from header
+            let mut orig_sizes = Vec::with_capacity(TOTAL_SHARDS);
+            for j in 0..TOTAL_SHARDS {
+                let off = VIDEO_HDR_FIXED + j * 2;
+                let sz = u16::from_le_bytes([payload[off], payload[off + 1]]) as usize;
+                orig_sizes.push(sz);
+            }
+
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
                 warn!(
                     "RS: invalid shard idx={} total={}",
@@ -74,7 +85,7 @@ impl VideoReceiver {
                 continue;
             }
 
-            let payload_start = 10;
+            let payload_start = VIDEO_HDR_LEN;
             let payload_end = payload_start + shard_len;
             if payload_end > payload.len() {
                 continue;
@@ -109,6 +120,7 @@ impl VideoReceiver {
                 shard_sizes: vec![0; TOTAL_SHARDS],
                 received: 0,
                 actual_data_shards,
+                original_sizes: orig_sizes.clone(),
             });
 
             if block.shards[shard_index].is_none() {
@@ -124,12 +136,23 @@ impl VideoReceiver {
                         let reconstructed =
                             reconstruct_rs_block(&rs, block, block.actual_data_shards);
                         if let Some(data_shards) = reconstructed {
-                            for shard_data in data_shards.iter().take(block.actual_data_shards) {
-                                if shard_data.is_empty() {
+                            for (idx, shard_data) in data_shards
+                                .iter()
+                                .take(block.actual_data_shards)
+                                .enumerate()
+                            {
+                                // Trim FEC padding using original size from header
+                                let orig_len = block.original_sizes.get(idx).copied().unwrap_or(0);
+                                let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
+                                    &shard_data[..orig_len]
+                                } else {
+                                    shard_data
+                                };
+                                if trimmed.is_empty() {
                                     continue;
                                 }
-                                let frag_index = shard_data[0];
-                                let frag_payload = &shard_data[1..];
+                                let frag_index = trimmed[0];
+                                let frag_payload = &trimmed[1..];
 
                                 if frag_index == 0 {
                                     if nal_started && !nal_buf.is_empty() {
@@ -159,18 +182,27 @@ impl VideoReceiver {
                         blocks.remove(&block_seq);
                         next_block = Some(current_seq.wrapping_add(1));
                         last_decode_time = Instant::now();
-                    } else if last_decode_time.elapsed().as_millis() > 50 {
-                        warn!(
-                            "RS: block {} stalled (had {}/{} shards), dropping",
-                            current_seq, block.received, DATA_SHARDS
-                        );
-                        if nal_started {
-                            nal_buf.clear();
-                            nal_started = false;
+                    }
+                }
+
+                // Stall timeout check: runs regardless of whether we received
+                // a packet matching current_seq. Handles the case where an entire
+                // FEC block is lost in RF and no matching packets arrive.
+                if let Some(cur) = next_block {
+                    if let Some(block) = blocks.get(&cur) {
+                        if last_decode_time.elapsed().as_millis() > 50 {
+                            warn!(
+                                "RS: block {} stalled (had {}/{} shards), dropping",
+                                cur, block.received, DATA_SHARDS
+                            );
+                            if nal_started {
+                                nal_buf.clear();
+                                nal_started = false;
+                            }
+                            blocks.remove(&cur);
+                            next_block = Some(cur.wrapping_add(1));
+                            last_decode_time = Instant::now();
                         }
-                        blocks.remove(&block_seq);
-                        next_block = Some(current_seq.wrapping_add(1));
-                        last_decode_time = Instant::now();
                     }
                 }
             }

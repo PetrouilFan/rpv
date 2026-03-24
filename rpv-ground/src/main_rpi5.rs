@@ -41,6 +41,7 @@ pub struct AppState {
     pub config: Config,
     pub telemetry: Arc<Mutex<Telemetry>>,
     pub running: Arc<AtomicBool>,
+    pub rssi: Arc<Mutex<Option<i8>>>,
 }
 
 pub struct RpvApp {
@@ -58,6 +59,7 @@ impl RpvApp {
         telemetry: Arc<Mutex<Telemetry>>,
         running: Arc<AtomicBool>,
         link_status_shared: Arc<Mutex<LinkStatus>>,
+        rssi: Arc<Mutex<Option<i8>>>,
     ) -> Self {
         let w = config.video_width as usize;
         let h = config.video_height as usize;
@@ -73,6 +75,7 @@ impl RpvApp {
                 config,
                 telemetry,
                 running,
+                rssi,
             },
             frame_rx,
             rgba_buf: vec![0u8; w * h * 4],
@@ -287,6 +290,29 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                         .size(12.0)
                         .color(fps_color),
                 );
+
+                let rssi_val = state.rssi.lock().unwrap().clone();
+                if let Some(rssi_dbm) = rssi_val {
+                    let (rssi_text, rssi_color) = if rssi_dbm >= -50 {
+                        (
+                            format!("SIG: {} dBm (excellent)", rssi_dbm),
+                            egui::Color32::GREEN,
+                        )
+                    } else if rssi_dbm >= -70 {
+                        (
+                            format!("SIG: {} dBm (good)", rssi_dbm),
+                            egui::Color32::from_rgb(100, 255, 100),
+                        )
+                    } else if rssi_dbm >= -80 {
+                        (
+                            format!("SIG: {} dBm (weak)", rssi_dbm),
+                            egui::Color32::YELLOW,
+                        )
+                    } else {
+                        (format!("SIG: {} dBm (poor)", rssi_dbm), egui::Color32::RED)
+                    };
+                    ui.label(egui::RichText::new(rssi_text).size(12.0).color(rssi_color));
+                }
             });
         });
 
@@ -425,6 +451,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
+    let rssi_shared: Arc<Mutex<Option<i8>>> = Arc::new(Mutex::new(None));
+
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
     let rx_video_tx = video_payload_tx;
@@ -432,6 +460,7 @@ fn main() -> Result<(), eframe::Error> {
     let rx_link_status = Arc::clone(&link_status_shared);
     let rx_drone_id = config.drone_id;
     let rx_last_hb = Arc::clone(&last_heartbeat);
+    let rx_rssi = Arc::clone(&rssi_shared);
     let _rx_handle = std::thread::spawn(move || {
         rx_dispatcher(
             rx_running,
@@ -441,6 +470,7 @@ fn main() -> Result<(), eframe::Error> {
             rx_telem_tx,
             rx_last_hb,
             rx_link_status,
+            rx_rssi,
         );
     });
 
@@ -510,6 +540,7 @@ fn main() -> Result<(), eframe::Error> {
                 telemetry_state,
                 app_running,
                 link_status_shared,
+                rssi_shared,
             )))
         }),
     )
@@ -523,6 +554,7 @@ fn rx_dispatcher(
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
     last_heartbeat: Arc<Mutex<Instant>>,
     link_status: Arc<Mutex<LinkStatus>>,
+    rssi: Arc<Mutex<Option<i8>>>,
 ) {
     tracing::info!("RX dispatcher started (raw socket)");
     let mut buf = vec![0u8; 65536];
@@ -538,7 +570,7 @@ fn rx_dispatcher(
             }
         };
 
-        let payload = match rawsock::recv_strip_headers(&buf[..len], reject_count < 10) {
+        let (payload, frame_rssi) = match rawsock::recv_extract(&buf[..len], reject_count < 10) {
             Some(p) => p,
             None => {
                 reject_count += 1;
@@ -552,6 +584,10 @@ fn rx_dispatcher(
                 continue;
             }
         };
+
+        if let Some(rssi_val) = frame_rssi {
+            *rssi.lock().unwrap() = Some(rssi_val);
+        }
 
         if !link::L2Header::matches_magic(payload) {
             reject_count += 1;

@@ -16,10 +16,12 @@ const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
 
 /// Maximum shard data bytes per fragment.
-/// Wire frame = 802.11(24) + L2(8) + video_hdr(10) + frag_idx(1) + shard_data.
-/// Constraint: 8 + 10 + 1 + shard_data <= MAX_PAYLOAD(1400).
-/// So shard_data <= 1381.
-const MAX_SHARD_DATA: usize = link::MAX_PAYLOAD - 8 - 10 - 1;
+/// Wire frame = 802.11(24) + Radiotap(8) + L2(8) + video_hdr + frag_idx(1) + shard_data.
+/// video_hdr = 10 + TOTAL_SHARDS*2 (block_seq, indices, shard_sizes array).
+/// Radiotap is prepended by rawsock::send, not counted here.
+/// Constraint: L2(8) + video_hdr + frag_idx(1) + shard_data <= MAX_PAYLOAD(1400).
+const VIDEO_HDR_LEN: usize = 10 + TOTAL_SHARDS * 2; // 10 + 6 = 16 for 2+1 FEC
+const MAX_SHARD_DATA: usize = link::MAX_PAYLOAD - 8 - VIDEO_HDR_LEN - 1;
 
 /// Run the video capture and streaming loop.
 ///
@@ -339,6 +341,17 @@ fn send_fec_group(
     let mut group_ok = true;
     let mut last_send = Instant::now();
 
+    // Collect original shard sizes (before FEC padding) for the header.
+    // This lets the receiver trim padding from FEC-reconstructed shards.
+    let mut shard_sizes = Vec::with_capacity(TOTAL_SHARDS);
+    for chunk in chunks.iter() {
+        shard_sizes.push(chunk.len() as u16);
+    }
+    // Zero-fill for missing data shards and parity shards
+    while shard_sizes.len() < TOTAL_SHARDS {
+        shard_sizes.push(0);
+    }
+
     for (i, shard) in shards.iter().enumerate() {
         // Token-bucket pacing: enforce minimum interval between sends
         let elapsed = last_send.elapsed();
@@ -346,14 +359,21 @@ fn send_fec_group(
             thread::sleep(MIN_SEND_INTERVAL - elapsed);
         }
 
-        // Video packet header: [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
-        let mut payload = Vec::with_capacity(10 + shard.len());
+        // Video packet header:
+        // [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len]
+        // [TOTAL_SHARDS * 2B shard_sizes]
+        // = 10 + TOTAL_SHARDS*2 bytes
+        let mut payload = Vec::with_capacity(VIDEO_HDR_LEN + shard.len());
         payload.extend_from_slice(&fec_block_seq.to_le_bytes());
         payload.push(i as u8);
         payload.push(TOTAL_SHARDS as u8);
         payload.push(chunks.len() as u8);
         payload.push(0u8);
         payload.extend_from_slice(&(shard.len() as u16).to_le_bytes());
+        // Include all original shard sizes so receiver can trim padding
+        for sz in &shard_sizes {
+            payload.extend_from_slice(&sz.to_le_bytes());
+        }
         payload.extend_from_slice(shard);
 
         // Wrap in L2 header and send (L2 seq is per-packet, not per-FEC-block)

@@ -124,6 +124,11 @@ fn rx_dispatcher(
     let mut reject_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
+        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
+            let _ = std::fs::remove_file(rc_file_path);
+            failsafe_active = true;
+        }
+
         let len = match socket.recv(&mut buf) {
             Ok(0) => continue,
             Ok(n) => n,
@@ -203,11 +208,6 @@ fn rx_dispatcher(
                 *last_heartbeat.lock().unwrap() = Instant::now();
             }
             _ => {}
-        }
-
-        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
-            let _ = std::fs::remove_file(rc_file_path);
-            failsafe_active = true;
         }
     }
 }

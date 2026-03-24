@@ -95,9 +95,11 @@ impl RawSocket {
         Ok(Self { fd })
     }
 
-    /// Send a raw 802.11 frame with broadcast data header + payload.
+    /// Send a raw 802.11 frame with Radiotap + broadcast data header + payload.
     pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        let mut frame = Vec::with_capacity(IEEE80211_HDR_LEN + payload.len());
+        let radiotap: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut frame = Vec::with_capacity(radiotap.len() + IEEE80211_HDR_LEN + payload.len());
+        frame.extend_from_slice(&radiotap);
         frame.extend_from_slice(&build_data_frame_header());
         frame.extend_from_slice(payload);
 
@@ -171,9 +173,14 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
         return None;
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    let frame_type = (fc >> 2) & 0x3;
     let to_ds = (fc >> 8) & 1;
     let from_ds = (fc >> 9) & 1;
     let subtype = (fc >> 4) & 0xF;
+
+    if frame_type != 2 {
+        return if frame.len() >= 24 { Some(24) } else { None };
+    }
 
     let base_len = if to_ds == 1 && from_ds == 1 { 30 } else { 24 };
     let qos_bit = subtype & 0x8 != 0;
@@ -187,23 +194,61 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
 }
 
 /// Strip Radiotap + 802.11 header (+ optional LLC/SNAP) from received frame.
+#[allow(dead_code)]
 pub fn recv_strip_headers(frame: &[u8], _log_rejections: bool) -> Option<&[u8]> {
+    recv_extract(frame, _log_rejections).map(|(payload, _rssi)| payload)
+}
+
+/// Strip Radiotap + 802.11 header, returning the L2 payload and optional RSSI (dBm).
+pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Option<i8>)> {
+    let rssi = parse_radiotap_rssi(frame);
     let after_radiotap = strip_radiotap(frame)?;
     let hdr_len = ieee80211_hdr_len(after_radiotap)?;
     let after_80211 = &after_radiotap[hdr_len..];
 
-    // Some drivers insert LLC/SNAP (AA AA 03 ...) for data frames
     if after_80211.len() >= 8
         && after_80211[0] == 0xAA
         && after_80211[1] == 0xAA
         && after_80211[2] == 0x03
     {
-        return Some(&after_80211[8..]);
+        let payload = &after_80211[8..];
+        if payload.is_empty() {
+            return None;
+        }
+        return Some((payload, rssi));
     }
 
     if after_80211.is_empty() {
         None
     } else {
-        Some(after_80211)
+        Some((after_80211, rssi))
     }
+}
+
+fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
+    if frame.len() < 8 {
+        return None;
+    }
+    let hdr_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+    if hdr_len < 8 || hdr_len > frame.len() {
+        return None;
+    }
+    let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+    if present & (1 << 5) == 0 {
+        return None;
+    }
+    const FIELD_SIZES: [u8; 32] = [
+        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8, 2, 4,
+        2, 1,
+    ];
+    let mut offset = 8;
+    for bit in 0..5u32 {
+        if present & (1 << bit) != 0 {
+            offset += FIELD_SIZES[bit as usize] as usize;
+        }
+    }
+    if offset >= hdr_len {
+        return None;
+    }
+    Some(frame[offset] as i8)
 }
