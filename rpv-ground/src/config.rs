@@ -17,8 +17,8 @@ impl Default for Config {
             video_port: 5600,
             telemetry_port: 5601,
             rc_port: 5602,
-            video_width: 1280,
-            video_height: 720,
+            video_width: 960,
+            video_height: 540,
         }
     }
 }

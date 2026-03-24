@@ -10,17 +10,17 @@ mod rc {
 }
 
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex as StdMutex, Mutex};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use egui::{ColorImage, TextureHandle, Vec2};
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::receiver::VideoReceiver;
-use crate::video::decoder::{VideoDecoder, DecodedFrame as DecodedYUV};
+use crate::video::decoder::{VideoDecoder, DecodedYUV};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LinkStatus {
@@ -82,29 +82,30 @@ impl RpvApp {
     }
 
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
+        // Drain all queued frames, keep only the latest
         let mut latest = None;
-        let mut recv_count = 0;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
-            recv_count += 1;
-        }
-        if recv_count > 0 {
-            tracing::info!("UI received {} frames from decoder", recv_count);
         }
         let frame_data = latest;
 
         let mut had_frame = false;
-        if let Some(yuv) = frame_data {
-            let w = self.state.config.video_width as usize;
-            let h = self.state.config.video_height as usize;
-            let expected_y = w * h;
-            let expected_uv = (w / 2) * (h / 2);
+        if let Some(frame) = frame_data {
+            let w = frame.width as usize;
+            let h = frame.height as usize;
+            let stride = frame.stride as usize;
 
-            if yuv.y_data.len() == expected_y
-                && yuv.u_data.len() == expected_uv
-                && yuv.v_data.len() == expected_uv
-            {
-                yuv420p_to_rgba(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf);
+            // NV12 format: Y plane (stride * height) + UV plane (stride * height / 2)
+            let y_size = stride * h;
+            let uv_size = stride * h / 2;
+
+            if frame.nv12_data.len() >= y_size + uv_size {
+                let y_plane = &frame.nv12_data[0..y_size];
+                let uv_plane = &frame.nv12_data[y_size..y_size + uv_size];
+
+                // Convert NV12 to RGBA
+                crate::video::decoder::nv12_to_rgba(y_plane, uv_plane, stride, w, h, &mut self.rgba_buf);
+
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
 
                 if let Some(ref mut tex) = self.state.texture {
@@ -120,8 +121,8 @@ impl RpvApp {
                 self.state.frame_count += 1;
                 self.state.last_frame_time = Instant::now();
 
-                if self.state.frame_count == 60 {
-                    self.state.fps = 60.0 / self.state.fps_timer.elapsed().as_secs_f64();
+                if self.state.frame_count == 30 {
+                    self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
                     self.state.frame_count = 0;
                     self.state.fps_timer = Instant::now();
                 }
@@ -135,90 +136,6 @@ impl RpvApp {
             }
         }
         had_frame
-    }
-}
-
-#[inline(always)]
-fn yuv420p_to_rgba(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) {
-    use wide::f32x8;
-
-    let w2 = w / 2;
-    let total = w * h;
-    let simd_end = (total / 8) * 8;
-
-    // Process 8 pixels at a time
-    let mut i = 0;
-    let mut px = 0usize;
-    while px < simd_end {
-        let row = px / w;
-        let col = px % w;
-        let row2 = row / 2;
-
-        // Gather Y values for 8 pixels
-        let y_vals = f32x8::from([
-            y[px] as f32, y[px + 1] as f32, y[px + 2] as f32, y[px + 3] as f32,
-            y[px + 4] as f32, y[px + 5] as f32, y[px + 6] as f32, y[px + 7] as f32,
-        ]);
-
-        // Gather UV values (8 pixels span 4 UV samples horizontally)
-        let uv_base = row2 * w2 + (col / 2);
-        let u_vals = f32x8::from([
-            u[uv_base] as f32, u[uv_base] as f32,
-            u[uv_base + 1] as f32, u[uv_base + 1] as f32,
-            u[uv_base + 2] as f32, u[uv_base + 2] as f32,
-            u[uv_base + 3] as f32, u[uv_base + 3] as f32,
-        ]);
-        let v_vals = f32x8::from([
-            v[uv_base] as f32, v[uv_base] as f32,
-            v[uv_base + 1] as f32, v[uv_base + 1] as f32,
-            v[uv_base + 2] as f32, v[uv_base + 2] as f32,
-            v[uv_base + 3] as f32, v[uv_base + 3] as f32,
-        ]);
-
-        let c = y_vals - f32x8::splat(16.0);
-        let u_shifted = u_vals - f32x8::splat(128.0);
-        let v_shifted = v_vals - f32x8::splat(128.0);
-
-        let r = (f32x8::splat(1.164) * c + f32x8::splat(1.596) * v_shifted)
-            .max(f32x8::splat(0.0))
-            .min(f32x8::splat(255.0));
-        let g = (f32x8::splat(1.164) * c - f32x8::splat(0.392) * u_shifted - f32x8::splat(0.813) * v_shifted)
-            .max(f32x8::splat(0.0))
-            .min(f32x8::splat(255.0));
-        let b = (f32x8::splat(1.164) * c + f32x8::splat(2.017) * u_shifted)
-            .max(f32x8::splat(0.0))
-            .min(f32x8::splat(255.0));
-
-        let r_bytes: [f32; 8] = r.into();
-        let g_bytes: [f32; 8] = g.into();
-        let b_bytes: [f32; 8] = b.into();
-
-        for j in 0..8 {
-            rgba[i] = r_bytes[j] as u8;
-            rgba[i + 1] = g_bytes[j] as u8;
-            rgba[i + 2] = b_bytes[j] as u8;
-            rgba[i + 3] = 255;
-            i += 4;
-        }
-        px += 8;
-    }
-
-    // Scalar fallback for remaining pixels
-    while px < total {
-        let row = px / w;
-        let col = px % w;
-        let row2 = row / 2;
-        let y_val = y[px] as i32;
-        let uv_idx = row2 * w2 + (col / 2);
-        let u_val = u[uv_idx] as i32 - 128;
-        let v_val = v[uv_idx] as i32 - 128;
-        let c = y_val - 16;
-        rgba[i] = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
-        rgba[i + 1] = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
-        rgba[i + 2] = ((298 * c + 517 * u_val + 128) >> 8).clamp(0, 255) as u8;
-        rgba[i + 3] = 255;
-        i += 4;
-        px += 1;
     }
 }
 
@@ -254,11 +171,8 @@ impl eframe::App for RpvApp {
             }
         }
 
-        // Force immediate UI repaint if a new video frame arrived
-        if self.needs_repaint {
-            ctx.request_repaint();
-        } else if self.state.link_status == LinkStatus::Connected {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        if self.state.link_status == LinkStatus::Connected {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -319,8 +233,6 @@ impl eframe::App for RpvApp {
 
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
-
-    let telem = state.telemetry.lock().unwrap().clone();
 
     egui::Area::new(egui::Id::new("osd_top_left"))
         .fixed_pos(egui::pos2(10.0, 10.0))
@@ -383,6 +295,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_top_right"))
         .fixed_pos(egui::pos2(screen.max.x - 170.0, 10.0))
         .show(ui.ctx(), |ui| {
+            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 let pct = telem.battery_pct as f32;
                 let bar_color = if pct > 30.0 {
@@ -430,6 +343,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_bottom_left"))
         .fixed_pos(egui::pos2(10.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
+            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(format!("SPD: {:.1} m/s", telem.speed))
@@ -447,6 +361,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     egui::Area::new(egui::Id::new("osd_bottom_right"))
         .fixed_pos(egui::pos2(screen.max.x - 210.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
+            let telem = state.telemetry.lock().unwrap();
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(format!("HDG: {:.0}deg", telem.heading))
@@ -488,7 +403,7 @@ fn main() -> Result<(), eframe::Error> {
         r.store(false, Ordering::SeqCst);
     }).expect("Failed to set ctrl+c handler");
 
-    let (video_frame_tx, video_frame_rx) = mpsc::channel(32);
+    let (video_frame_tx, video_frame_rx) = mpsc::channel(64);
 
     // Shared link status between video receiver and UI
     let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
@@ -499,8 +414,7 @@ fn main() -> Result<(), eframe::Error> {
     if let Some(ip) = initial_cam_ip {
         tracing::info!("Using static camera IP from config: {}", ip);
     }
-    let cam_ip: Arc<StdMutex<Option<IpAddr>>> = Arc::new(StdMutex::new(initial_cam_ip));
-    let cam_ip_tokio: Arc<TokioMutex<Option<IpAddr>>> = Arc::new(TokioMutex::new(initial_cam_ip));
+    let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(initial_cam_ip));
 
     let discovery_running = running.clone();
     let bg_link_status = Arc::clone(&link_status_shared);
@@ -523,13 +437,12 @@ fn main() -> Result<(), eframe::Error> {
     let bg_config = config.clone();
     let bg_running = running.clone();
     let bg_cam_ip2 = Arc::clone(&cam_ip);
-    let bg_cam_ip_tokio = Arc::clone(&cam_ip_tokio);
 
     // Spawn tokio runtime in background thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_cam_ip_tokio).await
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;
@@ -601,7 +514,6 @@ fn main() -> Result<(), eframe::Error> {
             .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            present_mode: wgpu::PresentMode::Mailbox,
             device_descriptor: std::sync::Arc::new(|_adapter| {
                 let limits = wgpu::Limits {
                     max_texture_dimension_1d: 4096,

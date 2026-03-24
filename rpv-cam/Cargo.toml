@@ -10,5 +10,6 @@ toml = "0.8"
 ctrlc = "3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-reed-solomon-erasure = "6"
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 libc = "0.2"
+crossbeam-channel = "0.5"
