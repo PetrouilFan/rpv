@@ -94,17 +94,22 @@ impl RpvApp {
         let frame_data = latest;
 
         let mut had_frame = false;
-        if let Some(yuv) = frame_data {
-            let w = self.state.config.video_width as usize;
-            let h = self.state.config.video_height as usize;
-            let expected_y = w * h;
-            let expected_uv = (w / 2) * (h / 2);
+        if let Some(frame) = frame_data {
+            let w = frame.width as usize;
+            let h = frame.height as usize;
+            let stride = frame.stride as usize;
 
-            if yuv.y_data.len() == expected_y
-                && yuv.u_data.len() == expected_uv
-                && yuv.v_data.len() == expected_uv
-            {
-                yuv420p_to_rgba(&yuv.y_data, &yuv.u_data, &yuv.v_data, w, h, &mut self.rgba_buf);
+            // NV12 format: Y plane (stride * height) + UV plane (stride * height / 2)
+            let y_size = stride * h;
+            let uv_size = stride * h / 2;
+
+            if frame.nv12_data.len() >= y_size + uv_size {
+                let y_plane = &frame.nv12_data[0..y_size];
+                let uv_plane = &frame.nv12_data[y_size..y_size + uv_size];
+
+                // Convert NV12 to RGBA
+                crate::video::decoder::nv12_to_rgba(y_plane, uv_plane, stride, w, h, &mut self.rgba_buf);
+
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
 
                 if let Some(ref mut tex) = self.state.texture {
@@ -138,6 +143,7 @@ impl RpvApp {
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn yuv420p_to_rgba(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, rgba: &mut [u8]) {
     use wide::f32x8;
@@ -258,7 +264,7 @@ impl eframe::App for RpvApp {
         if self.needs_repaint {
             ctx.request_repaint();
         } else if self.state.link_status == LinkStatus::Connected {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -526,7 +532,8 @@ fn main() -> Result<(), eframe::Error> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_cam_ip2).await
+            let receiver_cam_ip = Arc::clone(&bg_cam_ip2);
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, receiver_cam_ip).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;

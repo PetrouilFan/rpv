@@ -439,7 +439,7 @@ fn main() -> Result<(), eframe::Error> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx).await
+            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, bg_cam_ip2).await
                 .expect("Failed to create video receiver");
 
             let telem_port = bg_config.telemetry_port;

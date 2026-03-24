@@ -2683,6 +2683,8 @@ version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7263373d500d4d4f505d43a2a662d475a894aa94503a1ee28e9188b5f3960d4f"
 dependencies = [
+ "cc",
+ "libc",
  "libm",
  "lru",
  "parking_lot 0.11.2",
@@ -2717,6 +2719,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "rpv-cam"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "ctrlc",
  "libc",
  "reed-solomon-erasure",
@@ -2745,6 +2748,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "wide",
 ]
 
 [[package]]
@@ -2799,6 +2803,15 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "safe_arch"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -3827,6 +3840,16 @@ dependencies = [
  "bitflags 2.11.0",
  "js-sys",
  "web-sys",
+]
+
+[[package]]
+name = "wide"
+version = "0.7.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]
