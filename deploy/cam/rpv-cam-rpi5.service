@@ -1,0 +1,19 @@
+[Unit]
+Description=RPV Camera Node (Pi 5)
+After=network.target
+Wants=network.target
+
+[Service]
+ExecStartPre=/usr/local/bin/rpv-net-setup-pre.sh
+ExecStart=/usr/local/bin/rpv-cam-rpi5
+ExecStopPost=/usr/local/bin/rpv-net-teardown.sh
+Restart=on-failure
+RestartSec=5
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

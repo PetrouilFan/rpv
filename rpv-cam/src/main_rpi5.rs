@@ -182,6 +182,7 @@ fn rc_receiver_with_failsafe(running: Arc<AtomicBool>) {
     let rc_file_path = "/tmp/rpv_rc_channels";
     let mut last_rc_time = Instant::now();
     let failsafe_timeout = Duration::from_secs(2);
+    let mut failsafe_active = false;
 
     while running.load(Ordering::SeqCst) {
         match socket.recv_from(&mut buf) {
@@ -213,13 +214,12 @@ fn rc_receiver_with_failsafe(running: Arc<AtomicBool>) {
                     let _ = std::fs::rename(&tmp_path, rc_file_path);
                 }
                 last_rc_time = Instant::now();
+                failsafe_active = false;
             }
             Err(_) => {
-                if last_rc_time.elapsed() > failsafe_timeout {
-                    // Remove the RC file so external flight controller integration
-                    // triggers its internal MAVLink/Betaflight failsafe when the
-                    // file stops updating.
+                if last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
                     let _ = std::fs::remove_file(rc_file_path);
+                    failsafe_active = true;
                 }
             }
         }
