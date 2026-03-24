@@ -171,7 +171,10 @@ impl eframe::App for RpvApp {
             }
         }
 
-        if self.state.link_status == LinkStatus::Connected {
+        // Force immediate UI repaint if a new video frame arrived
+        if self.needs_repaint {
+            ctx.request_repaint();
+        } else if self.state.link_status == LinkStatus::Connected {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));

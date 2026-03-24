@@ -188,40 +188,44 @@ pub fn run(
             }
         }
 
-        // Force-flush trailing NAL if buffer contains at least a start code
-        if nal_buf.len() > 4 {
-            let start_code_len = if nal_buf.len() > 3 && nal_buf[2] == 0 && nal_buf[3] == 1 {
+        // Force-flush trailing NAL if buffer begins with a valid start code
+        if nal_buf.len() > 4 && nal_buf[0] == 0 && nal_buf[1] == 0 {
+            let start_code_len = if nal_buf[2] == 0 && nal_buf[3] == 1 {
                 4
-            } else {
+            } else if nal_buf[2] == 1 {
                 3
+            } else {
+                0 // Not a valid start code
             };
-            let nal = nal_buf[start_code_len..].to_vec();
-            if !nal.is_empty() {
-                let mut off = 0;
-                let mut frag_idx: u8 = 0;
-                while off < nal.len() {
-                    let end = (off + 1200).min(nal.len());
-                    let mut frag = Vec::with_capacity(1 + end - off);
-                    frag.push(frag_idx);
-                    frag.extend_from_slice(&nal[off..end]);
-                    fec_buffer.push(frag);
-                    if fec_buffer.len() == DATA_SHARDS {
-                        if let Some(ip) = *ground_addr.lock().unwrap() {
-                            let target = format!("{}:{}", ip, VIDEO_PORT);
-                            send_fec_group(
-                                &socket,
-                                &rs,
-                                &fec_buffer,
-                                seq,
-                                &target,
-                                &mut fail_count,
-                            );
-                            seq = seq.wrapping_add(1);
+            if start_code_len > 0 {
+                let nal = nal_buf[start_code_len..].to_vec();
+                if !nal.is_empty() {
+                    let mut off = 0;
+                    let mut frag_idx: u8 = 0;
+                    while off < nal.len() {
+                        let end = (off + 1200).min(nal.len());
+                        let mut frag = Vec::with_capacity(1 + end - off);
+                        frag.push(frag_idx);
+                        frag.extend_from_slice(&nal[off..end]);
+                        fec_buffer.push(frag);
+                        if fec_buffer.len() == DATA_SHARDS {
+                            if let Some(ip) = *ground_addr.lock().unwrap() {
+                                let target = format!("{}:{}", ip, VIDEO_PORT);
+                                send_fec_group(
+                                    &socket,
+                                    &rs,
+                                    &fec_buffer,
+                                    seq,
+                                    &target,
+                                    &mut fail_count,
+                                );
+                                seq = seq.wrapping_add(1);
+                            }
+                            fec_buffer.clear();
                         }
-                        fec_buffer.clear();
+                        off = end;
+                        frag_idx += 1;
                     }
-                    off = end;
-                    frag_idx += 1;
                 }
             }
             nal_buf.clear();
