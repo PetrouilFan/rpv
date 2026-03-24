@@ -1,71 +1,56 @@
-use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
-use tokio::net::UdpSocket;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::info;
+
+use crate::link;
+use crate::rawsock::RawSocket;
 
 pub struct RCTx {
-    socket: Option<UdpSocket>,
-    cam_ip: Arc<Mutex<Option<IpAddr>>>,
-    port: u16,
-    channels: Arc<Mutex<Vec<u16>>>,
+    socket: Arc<RawSocket>,
+    drone_id: u8,
+    channels: std::sync::Mutex<Vec<u16>>,
+    l2_seq: u32,
 }
 
 impl RCTx {
-    pub fn new(cam_ip: Arc<Mutex<Option<IpAddr>>>, port: u16) -> Self {
+    pub fn new(socket: Arc<RawSocket>, drone_id: u8) -> Self {
         Self {
-            socket: None,
-            cam_ip,
-            port,
-            channels: Arc::new(Mutex::new({
+            socket,
+            drone_id,
+            channels: std::sync::Mutex::new({
                 let mut ch = vec![1500u16; 16];
                 ch[2] = 1000; // throttle low on init (safety critical)
                 ch
-            })),
+            }),
+            l2_seq: 0,
         }
     }
 
-    pub async fn run(&mut self) {
-        match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => self.socket = Some(s),
-            Err(e) => {
-                warn!("Failed to create RC socket: {}", e);
-                return;
-            }
-        }
-
-        info!("RC transmitter ready on port {}", self.port);
-
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(20));
+    pub fn run(&mut self) {
+        info!("RC transmitter ready (L2 broadcast, 50Hz)");
 
         loop {
-            interval.tick().await;
+            std::thread::sleep(std::time::Duration::from_millis(20));
 
-            let cam_addr = {
-                let locked = self.cam_ip.lock().unwrap();
-                locked.map(|ip| format!("{}:{}", ip, self.port))
-            };
-
-            let cam_addr = match cam_addr {
-                Some(addr) => addr,
-                None => continue,
-            };
-
-            // Clone channels data to avoid holding MutexGuard across await
             let channels = {
                 let locked = self.channels.lock().unwrap();
                 locked.clone()
             };
 
             let count = channels.len() as u32;
-            let mut packet = Vec::with_capacity(4 + channels.len() * 2);
-            packet.extend_from_slice(&count.to_le_bytes());
+            let mut payload = Vec::with_capacity(4 + channels.len() * 2);
+            payload.extend_from_slice(&count.to_le_bytes());
             for &ch in channels.iter() {
-                packet.extend_from_slice(&ch.to_le_bytes());
+                payload.extend_from_slice(&ch.to_le_bytes());
             }
 
-            if let Some(ref socket) = self.socket {
-                let _ = socket.send_to(&packet, &cam_addr).await;
-            }
+            let header = link::L2Header {
+                drone_id: self.drone_id,
+                payload_type: link::PAYLOAD_RC,
+                seq: self.l2_seq,
+            };
+            let frame = header.encode(&payload);
+            let _ = self.socket.send(&frame);
+            self.l2_seq = self.l2_seq.wrapping_add(1);
         }
     }
 }

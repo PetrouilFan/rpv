@@ -2,11 +2,22 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub ground_ip: String,
+    #[serde(default = "default_interface")]
+    pub interface: String,
+    #[serde(default = "default_drone_id")]
+    pub drone_id: u8,
     #[serde(default = "default_fc_port")]
     pub fc_port: String,
     #[serde(default = "default_fc_baud")]
     pub fc_baud: u32,
+}
+
+fn default_interface() -> String {
+    "wlan1".to_string()
+}
+
+fn default_drone_id() -> u8 {
+    0
 }
 
 fn default_fc_port() -> String {
@@ -20,7 +31,8 @@ fn default_fc_baud() -> u32 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            ground_ip: "192.168.100.2".to_string(),
+            interface: default_interface(),
+            drone_id: default_drone_id(),
             fc_port: default_fc_port(),
             fc_baud: default_fc_baud(),
         }

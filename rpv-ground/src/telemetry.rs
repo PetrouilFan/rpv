@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use tokio::net::UdpSocket;
+use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::LinkStatus;
@@ -46,13 +46,18 @@ impl Default for Telemetry {
 pub struct TelemetryReceiver {
     state: Arc<Mutex<Telemetry>>,
     link_status: Arc<Mutex<LinkStatus>>,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
 }
 
 impl TelemetryReceiver {
-    pub fn new(link_status: Arc<Mutex<LinkStatus>>) -> Self {
+    pub fn new(
+        link_status: Arc<Mutex<LinkStatus>>,
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(Telemetry::default())),
             link_status,
+            rx,
         }
     }
 
@@ -60,31 +65,25 @@ impl TelemetryReceiver {
         Arc::clone(&self.state)
     }
 
-    pub async fn run(&self, port: u16) {
-        let bind_addr = format!("0.0.0.0:{}", port);
-        let socket = match UdpSocket::bind(&bind_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to bind telemetry socket on {}: {}", bind_addr, e);
-                return;
-            }
-        };
+    pub fn run(&self) {
+        info!("Telemetry receiver ready (L2 payload channel)");
 
-        info!("Telemetry receiver listening on {}", bind_addr);
-        let mut buf = vec![0u8; 4096];
+        let mut last_telem_time = Instant::now();
+        let timeout = std::time::Duration::from_secs(3);
 
         loop {
-            let timeout = tokio::time::Duration::from_secs(3);
-            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, _))) => {
-                    if let Ok(json_str) = std::str::from_utf8(&buf[..len]) {
+            match self.rx.recv_timeout(timeout) {
+                Ok(payload) => {
+                    if let Ok(json_str) = std::str::from_utf8(&payload) {
                         if let Ok(telem) = serde_json::from_str::<Telemetry>(json_str) {
                             let mut state = self.state.lock().unwrap();
                             *state = telem;
+                            last_telem_time = Instant::now();
 
-                            // Set link to Connected when telemetry arrives
                             if let Ok(mut status) = self.link_status.lock() {
-                                if *status == LinkStatus::Searching || *status == LinkStatus::SignalLost {
+                                if *status == LinkStatus::Searching
+                                    || *status == LinkStatus::SignalLost
+                                {
                                     *status = LinkStatus::Connected;
                                     info!("Telemetry: camera connected");
                                 }
@@ -92,18 +91,19 @@ impl TelemetryReceiver {
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    warn!("Telemetry recv error: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-                Err(_) => {
-                    // Timeout - no telemetry for 3 seconds
-                    if let Ok(mut status) = self.link_status.lock() {
-                        if *status == LinkStatus::Connected {
-                            *status = LinkStatus::SignalLost;
-                            warn!("Telemetry: no data for 3s, signal lost");
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if last_telem_time.elapsed() > timeout {
+                        if let Ok(mut status) = self.link_status.lock() {
+                            if *status == LinkStatus::Connected {
+                                *status = LinkStatus::SignalLost;
+                                warn!("Telemetry: no data for 3s, signal lost");
+                            }
                         }
                     }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    info!("Telemetry payload channel closed");
+                    return;
                 }
             }
         }

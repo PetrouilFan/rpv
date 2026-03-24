@@ -2,23 +2,39 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub camera_ip: String,
-    pub video_port: u16,
-    pub telemetry_port: u16,
-    pub rc_port: u16,
+    #[serde(default = "default_interface")]
+    pub interface: String,
+    #[serde(default = "default_drone_id")]
+    pub drone_id: u8,
+    #[serde(default = "default_video_width")]
     pub video_width: u32,
+    #[serde(default = "default_video_height")]
     pub video_height: u32,
+}
+
+fn default_interface() -> String {
+    "wlan1".to_string()
+}
+
+fn default_drone_id() -> u8 {
+    0
+}
+
+fn default_video_width() -> u32 {
+    960
+}
+
+fn default_video_height() -> u32 {
+    540
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            camera_ip: "192.168.100.1".to_string(),
-            video_port: 5600,
-            telemetry_port: 5601,
-            rc_port: 5602,
-            video_width: 960,
-            video_height: 540,
+            interface: default_interface(),
+            drone_id: default_drone_id(),
+            video_width: default_video_width(),
+            video_height: default_video_height(),
         }
     }
 }

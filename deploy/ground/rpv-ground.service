@@ -5,14 +5,16 @@ Wants=graphical.target
 
 [Service]
 Type=simple
-User=petrouil
-Environment="WAYLAND_DISPLAY=wayland-0"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
+ExecStartPre=/usr/local/bin/rpv-net-setup-pre.sh
 ExecStart=/usr/local/bin/rpv-ground
+ExecStopPost=/usr/local/bin/rpv-net-teardown.sh
 Restart=always
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=50
 RestartSec=3
+Environment=RUST_LOG=info
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 StandardOutput=journal
 StandardError=journal
 

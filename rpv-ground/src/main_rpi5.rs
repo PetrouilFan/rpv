@@ -1,26 +1,26 @@
 mod config;
-mod discovery;
+mod link;
+mod rawsock;
 mod telemetry;
 mod video {
-    pub mod receiver;
     pub mod decoder;
+    pub mod receiver;
 }
 mod rc {
     pub mod joystick;
 }
 
-use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{ColorImage, TextureHandle, Vec2};
-use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::rawsock::RawSocket;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
+use crate::video::decoder::{DecodedFrame as DecodedYUV, VideoDecoder};
 use crate::video::receiver::VideoReceiver;
-use crate::video::decoder::{VideoDecoder, DecodedFrame as DecodedYUV};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LinkStatus {
@@ -82,7 +82,6 @@ impl RpvApp {
     }
 
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
-        // Drain all queued frames, keep only the latest
         let mut latest = None;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
@@ -95,7 +94,6 @@ impl RpvApp {
             let h = frame.height as usize;
             let stride = frame.stride as usize;
 
-            // NV12 format: Y plane (stride * height) + UV plane (stride * height / 2)
             let y_size = stride * h;
             let uv_size = stride * h / 2;
 
@@ -103,24 +101,28 @@ impl RpvApp {
                 let y_plane = &frame.nv12_data[0..y_size];
                 let uv_plane = &frame.nv12_data[y_size..y_size + uv_size];
 
-                // Convert NV12 to RGBA
-                crate::video::decoder::nv12_to_rgba(y_plane, uv_plane, stride, w, h, &mut self.rgba_buf);
+                crate::video::decoder::nv12_to_rgba(
+                    y_plane,
+                    uv_plane,
+                    stride,
+                    w,
+                    h,
+                    &mut self.rgba_buf,
+                );
 
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
 
                 if let Some(ref mut tex) = self.state.texture {
                     tex.set(image, egui::TextureOptions::LINEAR);
                 } else {
-                    self.state.texture = Some(ctx.load_texture(
-                        "video",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    self.state.texture =
+                        Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
                 }
 
                 self.state.frame_count += 1;
                 self.state.last_frame_time = Instant::now();
 
+                // 30-frame FPS window for Pi 5
                 if self.state.frame_count == 30 {
                     self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
                     self.state.frame_count = 0;
@@ -149,7 +151,6 @@ impl eframe::App for RpvApp {
         let had_frame = self.update_texture(ctx);
         self.needs_repaint = had_frame;
 
-        // Detect "no camera module" state
         if !self.has_ever_had_frame {
             let telem = self.state.telemetry.lock().unwrap();
             if !telem.camera_ok && self.state.link_status != LinkStatus::NoCamera {
@@ -161,9 +162,6 @@ impl eframe::App for RpvApp {
             }
         }
 
-        // Signal loss detection is handled by the telemetry receiver thread.
-        // The GUI just reads the shared link_status.
-
         if let Ok(shared) = self.state.link_status_shared.lock() {
             if *shared != self.state.link_status {
                 self.state.link_status = *shared;
@@ -171,7 +169,6 @@ impl eframe::App for RpvApp {
             }
         }
 
-        // Force immediate UI repaint if a new video frame arrived
         if self.needs_repaint {
             ctx.request_repaint();
         } else if self.state.link_status == LinkStatus::Connected {
@@ -181,7 +178,11 @@ impl eframe::App for RpvApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(egui::Color32::BLACK).inner_margin(0.0))
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::BLACK)
+                    .inner_margin(0.0),
+            )
             .show(ctx, |ui| {
                 let available = ui.available_size();
 
@@ -206,8 +207,7 @@ impl eframe::App for RpvApp {
                         egui::Color32::BLACK,
                     );
 
-                    egui::Image::from_texture(tex)
-                        .paint_at(ui, rect);
+                    egui::Image::from_texture(tex).paint_at(ui, rect);
                 } else {
                     ui.painter().rect_filled(
                         ui.available_rect_before_wrap(),
@@ -216,16 +216,16 @@ impl eframe::App for RpvApp {
                     );
                     let (wait_text, wait_color) = match self.state.link_status {
                         LinkStatus::Searching => ("Searching for camera...", egui::Color32::YELLOW),
-                        LinkStatus::SignalLost => ("Signal lost — reconnecting...", egui::Color32::RED),
+                        LinkStatus::SignalLost => {
+                            ("Signal lost — reconnecting...", egui::Color32::RED)
+                        }
                         LinkStatus::Connected => ("Waiting for video...", egui::Color32::GRAY),
-                        LinkStatus::NoCamera => ("No camera detected", egui::Color32::from_rgb(255, 160, 0)),
+                        LinkStatus::NoCamera => {
+                            ("No camera detected", egui::Color32::from_rgb(255, 160, 0))
+                        }
                     };
                     ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new(wait_text)
-                                .size(32.0)
-                                .color(wait_color),
-                        );
+                        ui.label(egui::RichText::new(wait_text).size(32.0).color(wait_color));
                     });
                 }
 
@@ -236,7 +236,7 @@ impl eframe::App for RpvApp {
 
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
-    let telem = state.telemetry.lock().unwrap().clone();  // ONE lock, then clone
+    let telem = state.telemetry.lock().unwrap().clone();
 
     egui::Area::new(egui::Id::new("osd_top_left"))
         .fixed_pos(egui::pos2(10.0, 10.0))
@@ -246,10 +246,11 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                     LinkStatus::Connected => ("LINK OK", egui::Color32::GREEN, true),
                     LinkStatus::Searching => ("SEARCHING", egui::Color32::YELLOW, false),
                     LinkStatus::SignalLost => ("SIGNAL LOST", egui::Color32::RED, false),
-                    LinkStatus::NoCamera => ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false),
+                    LinkStatus::NoCamera => {
+                        ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false)
+                    }
                 };
 
-                // Status dot + text row
                 ui.horizontal(|ui| {
                     if show_dot {
                         let dot_size = 10.0;
@@ -257,9 +258,9 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                             egui::vec2(dot_size, dot_size),
                             egui::Sense::hover(),
                         );
-                        ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
+                        ui.painter()
+                            .circle_filled(rect.center(), dot_size / 2.0, color);
                     } else {
-                        // Blinking dot for searching/lost — use egui time, no syscall
                         let t = ui.ctx().input(|i| i.time);
                         let blink = (t * 2.0) as u64 % 2 == 0;
                         if blink {
@@ -268,19 +269,15 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                                 egui::vec2(dot_size, dot_size),
                                 egui::Sense::hover(),
                             );
-                            ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
+                            ui.painter()
+                                .circle_filled(rect.center(), dot_size / 2.0, color);
                         } else {
                             ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                         }
                     }
-                    ui.label(
-                        egui::RichText::new(label)
-                            .size(14.0)
-                            .color(color),
-                    );
+                    ui.label(egui::RichText::new(label).size(14.0).color(color));
                 });
 
-                // FPS line
                 let fps_color = match state.link_status {
                     LinkStatus::Connected => egui::Color32::from_gray(200),
                     _ => egui::Color32::from_gray(100),
@@ -308,18 +305,15 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
 
                 let bar_width = 120.0;
                 let bar_height = 14.0;
-                let rect = egui::Rect::from_min_size(
-                    ui.cursor().min,
-                    egui::vec2(bar_width, bar_height),
-                );
+                let rect =
+                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(bar_width, bar_height));
                 ui.advance_cursor_after_rect(rect);
 
-                ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                ui.painter()
+                    .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
                 let fill_width = (bar_width * pct / 100.0).max(0.0);
-                let fill_rect = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(fill_width, bar_height),
-                );
+                let fill_rect =
+                    egui::Rect::from_min_size(rect.min, egui::vec2(fill_width, bar_height));
                 ui.painter().rect_filled(fill_rect, 2.0, bar_color);
 
                 ui.label(
@@ -388,128 +382,87 @@ fn main() -> Result<(), eframe::Error> {
         .with_target(false)
         .init();
 
-    tracing::info!("rpv ground station starting");
+    tracing::info!("rpv ground station starting (Pi 5, monitor mode)");
 
     let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
 
-    // Shared running flag for ctrl+c
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
         tracing::info!("Ctrl+C received, shutting down...");
         r.store(false, Ordering::SeqCst);
-    }).expect("Failed to set ctrl+c handler");
+    })
+    .expect("Failed to set ctrl+c handler");
 
-    let (video_frame_tx, video_frame_rx) = mpsc::channel(64);
+    let socket = match RawSocket::new(&config.interface) {
+        Ok(s) => {
+            tracing::info!("Raw socket bound to {} (monitor mode)", config.interface);
+            Arc::new(s)
+        }
+        Err(e) => {
+            tracing::error!("Failed to open raw socket on {}: {}", config.interface, e);
+            std::process::exit(1);
+        }
+    };
 
-    // Shared link status between video receiver and UI
     let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
 
-    // Shared camera IP for RC transmitter and heartbeat sender
-    // Pre-populate from config so we connect directly without waiting for broadcast discovery
-    let initial_cam_ip: Option<IpAddr> = config.camera_ip.parse().ok();
-    if let Some(ip) = initial_cam_ip {
-        tracing::info!("Using static camera IP from config: {}", ip);
-    }
-    let cam_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(initial_cam_ip));
-
-    let discovery_running = running.clone();
-    let bg_link_status = Arc::clone(&link_status_shared);
-    let bg_cam_ip = Arc::clone(&cam_ip);
-    std::thread::spawn(move || {
-        discovery::run(discovery_running, bg_link_status, bg_cam_ip);
-    });
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(32);
+    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
 
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
-    let frame_rx = decoder.get_rx();
-    decoder.spawn(video_frame_rx);
+    let ui_frame_rx = decoder.get_rx();
+    decoder.spawn(video_frame_rx_decoder);
 
-    let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared));
+    let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared), telem_payload_rx);
     let telemetry_state = telemetry.get_state();
 
     if was_default {
         config.save();
     }
 
-    let bg_video_frame_tx = video_frame_tx;
-    let bg_telemetry = telemetry;
-    let bg_config = config.clone();
-    let bg_running = running.clone();
-    let bg_cam_ip2 = Arc::clone(&cam_ip);
-
-    // Spawn tokio runtime in background thread
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let receiver_cam_ip = Arc::clone(&bg_cam_ip2);
-            let receiver = VideoReceiver::new(bg_config.video_port, bg_video_frame_tx, receiver_cam_ip).await
-                .expect("Failed to create video receiver");
-
-            let telem_port = bg_config.telemetry_port;
-            let rc_port = bg_config.rc_port;
-
-            tokio::spawn(async move {
-                receiver.run().await;
-            });
-
-            tokio::spawn(async move {
-                bg_telemetry.run(telem_port).await;
-            });
-
-            // RC transmitter with dynamic cam IP (discovery provides it)
-            let rc_cam_ip = Arc::clone(&bg_cam_ip2);
-            let mut rc = crate::rc::joystick::RCTx::new(rc_cam_ip, rc_port);
-            tokio::spawn(async move {
-                rc.run().await;
-            });
-
-            // Heartbeat sender (ground → camera)
-            let hb_cam_ip = Arc::clone(&bg_cam_ip2);
-            tokio::spawn(async move {
-                let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to bind heartbeat sender socket: {}", e);
-                        return;
-                    }
-                };
-                let hb_port = 5603u16;
-                let mut seq: u32 = 0;
-                tracing::info!("Heartbeat sender ready on port {}", hb_port);
-
-                loop {
-                    let target = {
-                        let locked = hb_cam_ip.lock().unwrap();
-                        locked.map(|ip| format!("{}:{}", ip, hb_port))
-                    };
-                    if let Some(addr) = target {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-
-                        let mut pkt = [0u8; 19];
-                        pkt[..7].copy_from_slice(b"rpv-bea");
-                        pkt[7..11].copy_from_slice(&seq.to_le_bytes());
-                        pkt[11..19].copy_from_slice(&ts.to_le_bytes());
-
-                        let _ = socket.send_to(&pkt, &addr).await;
-                        seq = seq.wrapping_add(1);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            });
-
-            // Stay alive until ctrl+c
-            while bg_running.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            tracing::info!("Background tasks shutting down");
-        });
+    let rx_running = running.clone();
+    let rx_socket = Arc::clone(&socket);
+    let rx_video_tx = video_payload_tx;
+    let rx_telem_tx = telem_payload_tx;
+    let rx_link_status = Arc::clone(&link_status_shared);
+    let rx_drone_id = config.drone_id;
+    let _rx_handle = std::thread::spawn(move || {
+        rx_dispatcher(
+            rx_running,
+            rx_socket,
+            rx_drone_id,
+            rx_video_tx,
+            rx_telem_tx,
+            rx_link_status,
+        );
     });
 
-    // Run egui on main thread with custom wgpu limits for Pi 5 V3D GPU
+    let vr = VideoReceiver::new(video_frame_tx, video_payload_rx);
+    let _vr_handle = std::thread::spawn(move || {
+        vr.run();
+    });
+
+    let _telem_handle = std::thread::spawn(move || {
+        telemetry.run();
+    });
+
+    let rc_socket = Arc::clone(&socket);
+    let rc_drone_id = config.drone_id;
+    let _rc_handle = std::thread::spawn(move || {
+        let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id);
+        rc.run();
+    });
+
+    let hb_running = running.clone();
+    let hb_socket = Arc::clone(&socket);
+    let hb_drone_id = config.drone_id;
+    let _hb_handle = std::thread::spawn(move || {
+        heartbeat_sender(hb_running, hb_socket, hb_drone_id);
+    });
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
@@ -540,7 +493,96 @@ fn main() -> Result<(), eframe::Error> {
         "rpv ground station",
         native_options,
         Box::new(|_cc| {
-            Ok(Box::new(RpvApp::new(config, frame_rx, telemetry_state, app_running, link_status_shared)))
+            Ok(Box::new(RpvApp::new(
+                config,
+                ui_frame_rx,
+                telemetry_state,
+                app_running,
+                link_status_shared,
+            )))
         }),
     )
+}
+
+fn rx_dispatcher(
+    running: Arc<AtomicBool>,
+    socket: Arc<RawSocket>,
+    drone_id: u8,
+    video_tx: crossbeam_channel::Sender<Vec<u8>>,
+    telem_tx: crossbeam_channel::Sender<Vec<u8>>,
+    link_status: Arc<Mutex<LinkStatus>>,
+) {
+    tracing::info!("RX dispatcher started (raw socket)");
+    let mut buf = vec![0u8; 65536];
+
+    while running.load(Ordering::SeqCst) {
+        let len = match socket.recv(&mut buf) {
+            Ok(0) => continue,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("RX recv error: {}", e);
+                continue;
+            }
+        };
+
+        let payload = match rawsock::strip_radiotap(&buf[..len]) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if !link::L2Header::matches_magic(payload) {
+            continue;
+        }
+        let (header, data) = match link::L2Header::decode(payload) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        if header.drone_id != drone_id {
+            continue;
+        }
+
+        match header.payload_type {
+            link::PAYLOAD_VIDEO => {
+                let _ = video_tx.try_send(data.to_vec());
+            }
+            link::PAYLOAD_TELEMETRY => {
+                let _ = telem_tx.try_send(data.to_vec());
+                if let Ok(mut status) = link_status.lock() {
+                    if *status == LinkStatus::Searching {
+                        *status = LinkStatus::Connected;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
+    tracing::info!("Heartbeat sender ready (L2 broadcast, 1Hz)");
+    let mut l2_seq: u32 = 0;
+
+    while running.load(Ordering::SeqCst) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut payload = Vec::with_capacity(19);
+        payload.extend_from_slice(b"rpv-bea");
+        payload.extend_from_slice(&l2_seq.to_le_bytes());
+        payload.extend_from_slice(&ts.to_le_bytes());
+
+        let header = link::L2Header {
+            drone_id,
+            payload_type: link::PAYLOAD_HEARTBEAT,
+            seq: l2_seq,
+        };
+        let frame = header.encode(&payload);
+        let _ = socket.send(&frame);
+
+        l2_seq = l2_seq.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }

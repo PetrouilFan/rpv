@@ -1,6 +1,5 @@
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::time::Instant;
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -10,7 +9,7 @@ pub struct DecodedFrame {
     pub height: u32,
     pub stride: u32,
     pub send_ts_us: Option<u64>,
-    pub recv_time: Option<Instant>,
+    pub recv_time: Option<std::time::Instant>,
 }
 
 pub struct VideoDecoder {
@@ -22,7 +21,6 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(width: u32, height: u32) -> Self {
-        // Small queue for low latency
         let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(4);
         Self {
             frame_tx,
@@ -36,7 +34,7 @@ impl VideoDecoder {
         self.frame_rx.clone()
     }
 
-    pub fn spawn(&self, rx: tokio::sync::mpsc::Receiver<crate::video::receiver::VideoFrame>) {
+    pub fn spawn(&self, rx: crossbeam_channel::Receiver<Vec<u8>>) {
         let frame_tx = self.frame_tx.clone();
         let width = self.width;
         let height = self.height;
@@ -64,7 +62,6 @@ pub fn nv12_to_rgba(
             }
             let y_val = y_plane[y_idx] as i32;
 
-            // NV12: UV is interleaved, stride applies to UV plane too
             let uv_idx = uv_row * stride + (col & !1);
             if uv_idx + 1 >= uv_plane.len() {
                 i += 4;
@@ -73,7 +70,6 @@ pub fn nv12_to_rgba(
             let u_val = uv_plane[uv_idx] as i32 - 128;
             let v_val = uv_plane[uv_idx + 1] as i32 - 128;
 
-            // BT.601 YUV to RGB conversion
             let c = y_val - 16;
             let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
             let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
@@ -90,13 +86,11 @@ pub fn nv12_to_rgba(
 
 fn decode_loop(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
-    mut rx: tokio::sync::mpsc::Receiver<crate::video::receiver::VideoFrame>,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
     width: u32,
     height: u32,
 ) {
-    // NV12 format: Y plane (width * height) + UV plane (width * height / 2)
-    // Stride is typically aligned to 32 or 64 bytes on Pi hardware
-    let stride = ((width + 31) / 32) * 32; // Align to 32 bytes
+    let stride = ((width + 31) / 32) * 32;
     let y_size = (stride * height) as usize;
     let uv_size = (stride * height / 2) as usize;
     let total_size = y_size + uv_size;
@@ -107,7 +101,6 @@ fn decode_loop(
     );
 
     loop {
-        // Try hardware decode first with NV12 output
         let hw_args = vec![
             "-loglevel",
             "error",
@@ -134,7 +127,6 @@ fn decode_loop(
             "pipe:1",
         ];
 
-        // Software fallback with NV12
         let sw_args = vec![
             "-loglevel",
             "error",
@@ -157,7 +149,6 @@ fn decode_loop(
             "pipe:1",
         ];
 
-        // Try hardware decode first
         let mut child = match Command::new("ffmpeg")
             .args(&hw_args)
             .stdin(Stdio::piped())
@@ -166,14 +157,10 @@ fn decode_loop(
             .spawn()
         {
             Ok(mut c) => {
-                // Give HW decoder a moment to initialize
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 match c.try_wait() {
                     Ok(Some(status)) => {
-                        warn!(
-                            "HW decode (v4l2m2m) exited immediately with {}, falling back to SW",
-                            status
-                        );
+                        warn!("HW decode exited with {}, falling back to SW", status);
                         let _ = c.kill();
                         let _ = c.wait();
                         Command::new("ffmpeg")
@@ -182,9 +169,7 @@ fn decode_loop(
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
                             .spawn()
-                            .unwrap_or_else(|e| {
-                                panic!("Failed to spawn ffmpeg SW fallback: {}", e);
-                            })
+                            .unwrap_or_else(|e| panic!("Failed to spawn ffmpeg SW: {}", e))
                     }
                     Ok(None) => c,
                     Err(e) => {
@@ -197,9 +182,7 @@ fn decode_loop(
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
                             .spawn()
-                            .unwrap_or_else(|e| {
-                                panic!("Failed to spawn ffmpeg SW fallback: {}", e);
-                            })
+                            .unwrap_or_else(|e| panic!("Failed to spawn ffmpeg SW: {}", e))
                     }
                 }
             }
@@ -211,9 +194,7 @@ fn decode_loop(
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
-                    .unwrap_or_else(|e| {
-                        panic!("Failed to spawn ffmpeg SW fallback: {}", e);
-                    })
+                    .unwrap_or_else(|e| panic!("Failed to spawn ffmpeg SW: {}", e))
             }
         };
 
@@ -226,7 +207,6 @@ fn decode_loop(
         let stdout = child.stdout.take().expect("No stdout");
         let stderr = child.stderr.take().expect("No stderr");
 
-        // Drain stderr in background
         let stderr_handle = std::thread::spawn(move || {
             let mut err_buf = Vec::new();
             let mut stderr_reader = BufReader::new(stderr);
@@ -240,7 +220,6 @@ fn decode_loop(
             }
         });
 
-        // Read decoded frames in background
         let frame_tx_clone = frame_tx.clone();
         let read_handle = std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -259,7 +238,6 @@ fn decode_loop(
                             recv_time: None,
                         };
 
-                        // Non-blocking send - drop frame if queue full
                         if let Err(_) = frame_tx_clone.try_send(frame) {
                             // Queue full, drop frame for low latency
                         }
@@ -283,22 +261,20 @@ fn decode_loop(
 
         // Feed H.264 data to ffmpeg stdin
         loop {
-            let frame = match rx.blocking_recv() {
-                Some(f) => f,
-                None => {
+            let data = match rx.recv() {
+                Ok(d) => d,
+                Err(_) => {
                     info!("Decoder input channel closed");
                     break;
                 }
             };
 
-            // Write immediately - no buffering delay
-            if stdin.write_all(&frame.data).is_err() {
+            if stdin.write_all(&data).is_err() {
                 warn!("ffmpeg stdin write error");
                 break;
             }
         }
 
-        // Cleanup
         drop(stdin);
         let _ = read_handle.join();
         let _ = stderr_handle.join();
