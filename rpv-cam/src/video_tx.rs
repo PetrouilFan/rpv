@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reed_solomon_erasure::ReedSolomon;
 
@@ -283,6 +283,10 @@ fn extract_next_nal(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
+/// Minimum interval between shard sends to prevent hardware queue overflow.
+/// At 50μs, max throughput is ~20,000 shards/sec = ~12MB/s. Conservative for 3Mbps link.
+const MIN_SEND_INTERVAL: Duration = Duration::from_micros(50);
+
 fn send_fec_group(
     socket: &RawSocket,
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
@@ -316,7 +320,15 @@ fn send_fec_group(
     }
 
     let mut group_ok = true;
+    let mut last_send = Instant::now();
+
     for (i, shard) in shards.iter().enumerate() {
+        // Token-bucket pacing: enforce minimum interval between sends
+        let elapsed = last_send.elapsed();
+        if elapsed < MIN_SEND_INTERVAL {
+            thread::sleep(MIN_SEND_INTERVAL - elapsed);
+        }
+
         // Video packet header: [4B seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
         let mut payload = Vec::with_capacity(10 + shard.len());
         payload.extend_from_slice(&l2_seq.to_le_bytes());
@@ -336,7 +348,9 @@ fn send_fec_group(
         let frame = header.encode(&payload);
 
         match socket.send(&frame) {
-            Ok(_) => {}
+            Ok(_) => {
+                last_send = Instant::now();
+            }
             Err(e) => {
                 group_ok = false;
                 *fail_count = fail_count.saturating_add(1);

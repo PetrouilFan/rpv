@@ -128,6 +128,7 @@ fn rx_dispatcher(
     let mut last_rc_time = Instant::now();
     let failsafe_timeout = Duration::from_secs(2);
     let mut failsafe_active = false;
+    let mut reject_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
@@ -139,14 +140,31 @@ fn rx_dispatcher(
             }
         };
 
-        // Strip Radiotap header (monitor mode adds it on RX)
-        let payload = match rawsock::strip_radiotap(&buf[..len]) {
+        // Strip Radiotap + 802.11 header (+ optional LLC/SNAP)
+        let payload = match rawsock::recv_strip_headers(&buf[..len], reject_count < 10) {
             Some(p) => p,
-            None => continue, // too short or malformed
+            None => {
+                reject_count += 1;
+                if reject_count <= 5 {
+                    tracing::debug!(
+                        "RX: rejected frame ({}B), first 8 bytes: {:02x?}",
+                        len,
+                        &buf[..8.min(len)]
+                    );
+                }
+                continue;
+            }
         };
 
         // Check magic and drone_id
         if !link::L2Header::matches_magic(payload) {
+            reject_count += 1;
+            if reject_count <= 5 {
+                tracing::debug!(
+                    "RX: magic mismatch, payload first 8 bytes: {:02x?}",
+                    &payload[..8.min(payload.len())]
+                );
+            }
             continue;
         }
         let (header, data) = match link::L2Header::decode(payload) {

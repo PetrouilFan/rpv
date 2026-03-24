@@ -1,17 +1,18 @@
 /// Raw AF_PACKET socket for send/receive on a WiFi interface in monitor mode.
 ///
-/// This bypasses the entire IP stack. Frames are sent and received as raw
-/// 802.11 payloads (the L2 header defined in `link.rs` is the application-layer
-/// content carried inside the raw frame).
+/// This bypasses the entire IP stack. On send, the module constructs a minimal
+/// 802.11 broadcast data frame with our L2 protocol payload as the frame body.
+/// On receive, it strips the Radiotap header + 802.11 MAC header to extract
+/// the L2 protocol payload.
 use std::io;
+
+const IEEE80211_HDR_LEN: usize = 24;
 
 pub struct RawSocket {
     fd: i32,
 }
 
 impl RawSocket {
-    /// Open a raw AF_PACKET socket bound to the given interface.
-    /// The interface must already be in monitor mode (use `iw dev wlan0 set type monitor`).
     pub fn new(iface: &str) -> io::Result<Self> {
         let fd = unsafe {
             libc::socket(
@@ -24,7 +25,6 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // Bind to interface index
         let iface_c = std::ffi::CString::new(iface)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface name"))?;
         let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
@@ -57,7 +57,6 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // Set a 500ms receive timeout so RX loop is interruptible
         let tv = libc::timeval {
             tv_sec: 0,
             tv_usec: 500_000,
@@ -72,7 +71,6 @@ impl RawSocket {
             );
         }
 
-        // Increase send buffer to 4MB
         let sndbuf: libc::c_int = 4 * 1024 * 1024;
         unsafe {
             libc::setsockopt(
@@ -83,8 +81,6 @@ impl RawSocket {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
-
-        // Increase receive buffer to 4MB
         let rcvbuf: libc::c_int = 4 * 1024 * 1024;
         unsafe {
             libc::setsockopt(
@@ -99,11 +95,20 @@ impl RawSocket {
         Ok(Self { fd })
     }
 
-    /// Send a raw frame (payload will be the L2 header + application data).
-    /// In monitor mode the kernel wraps this in a Radiotap + 802.11 header.
-    pub fn send(&self, data: &[u8]) -> io::Result<usize> {
-        let ret =
-            unsafe { libc::send(self.fd, data.as_ptr() as *const libc::c_void, data.len(), 0) };
+    /// Send a raw 802.11 frame with broadcast data header + payload.
+    pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        let mut frame = Vec::with_capacity(IEEE80211_HDR_LEN + payload.len());
+        frame.extend_from_slice(&build_data_frame_header());
+        frame.extend_from_slice(payload);
+
+        let ret = unsafe {
+            libc::send(
+                self.fd,
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
+            )
+        };
         if ret < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -111,16 +116,14 @@ impl RawSocket {
         }
     }
 
-    /// Receive a raw frame into the buffer. Returns the number of bytes read.
-    /// In monitor mode, received frames include a Radiotap header prefix.
-    /// The caller must strip Radiotap before parsing the L2 protocol header.
+    /// Receive a raw frame. Returns bytes read or 0 on timeout.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let ret =
             unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
-                Ok(0) // timeout, no data
+                Ok(0)
             } else {
                 Err(err)
             }
@@ -138,19 +141,69 @@ impl Drop for RawSocket {
     }
 }
 
-/// Strip the Radiotap header from a received monitor-mode frame.
-/// Returns a slice starting at the 802.11 header, or None if the frame
-/// is too short or malformed.
-///
-/// Radiotap header length is in bytes 2..4 (little-endian u16).
+fn build_data_frame_header() -> [u8; IEEE80211_HDR_LEN] {
+    let mut hdr = [0u8; IEEE80211_HDR_LEN];
+    hdr[0] = 0x08; // Data frame
+    hdr[1] = 0x00; // No flags
+    hdr[2] = 0x00; // Duration
+    hdr[3] = 0x00;
+    hdr[4..10].fill(0xFF); // DA: broadcast
+    hdr[10..16].fill(0xFF); // SA: broadcast
+    hdr[16..22].fill(0xFF); // BSSID: broadcast
+    hdr[22] = 0x00; // Sequence Control
+    hdr[23] = 0x00;
+    hdr
+}
+
 pub fn strip_radiotap(frame: &[u8]) -> Option<&[u8]> {
     if frame.len() < 4 {
         return None;
     }
-    // Radiotap version byte is at 0, skip/version check omitted for speed
     let hdr_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
     if hdr_len >= frame.len() || hdr_len < 8 {
         return None;
     }
     Some(&frame[hdr_len..])
+}
+
+pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
+    if frame.len() < 2 {
+        return None;
+    }
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    let to_ds = (fc >> 8) & 1;
+    let from_ds = (fc >> 9) & 1;
+    let subtype = (fc >> 4) & 0xF;
+
+    let base_len = if to_ds == 1 && from_ds == 1 { 30 } else { 24 };
+    let qos_bit = subtype & 0x8 != 0;
+    let hdr_len = if qos_bit { base_len + 2 } else { base_len };
+
+    if frame.len() < hdr_len {
+        None
+    } else {
+        Some(hdr_len)
+    }
+}
+
+/// Strip Radiotap + 802.11 header (+ optional LLC/SNAP) from received frame.
+pub fn recv_strip_headers(frame: &[u8], _log_rejections: bool) -> Option<&[u8]> {
+    let after_radiotap = strip_radiotap(frame)?;
+    let hdr_len = ieee80211_hdr_len(after_radiotap)?;
+    let after_80211 = &after_radiotap[hdr_len..];
+
+    // Some drivers insert LLC/SNAP (AA AA 03 ...) for data frames
+    if after_80211.len() >= 8
+        && after_80211[0] == 0xAA
+        && after_80211[1] == 0xAA
+        && after_80211[2] == 0x03
+    {
+        return Some(&after_80211[8..]);
+    }
+
+    if after_80211.is_empty() {
+        None
+    } else {
+        Some(after_80211)
+    }
 }
