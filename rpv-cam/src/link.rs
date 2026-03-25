@@ -27,15 +27,25 @@ pub struct L2Header {
 }
 
 impl L2Header {
+    /// Encode header + payload into a new Vec (legacy API).
+    #[allow(dead_code)]
     pub fn encode(&self, payload: &[u8]) -> Vec<u8> {
         let total = HEADER_LEN + payload.len();
         let mut buf = Vec::with_capacity(total);
+        self.encode_into(payload, &mut buf);
+        buf
+    }
+
+    /// Encode header + payload into a reusable buffer (avoids per-call allocation).
+    /// Clears the buffer first, then writes: MAGIC | drone_id | payload_type | seq | payload.
+    pub fn encode_into(&self, payload: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.reserve(HEADER_LEN + payload.len());
         buf.extend_from_slice(&MAGIC);
         buf.push(self.drone_id);
         buf.push(self.payload_type);
         buf.extend_from_slice(&self.seq.to_le_bytes());
         buf.extend_from_slice(payload);
-        buf
     }
 
     pub fn decode(frame: &[u8]) -> Option<(L2Header, &[u8])> {

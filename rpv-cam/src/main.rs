@@ -131,10 +131,16 @@ fn rx_dispatcher(
     let mut reject_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
-        // RC failsafe: runs every iteration including after recv timeout.
+        // RC failsafe: checked FIRST on every iteration, before any blocking recv.
         // If no RC data received for 2s while using file fallback, delete the
         // RC file so the FC reads nothing (safe hover/RTL) instead of stale inputs.
+        // This MUST run before socket.recv() so a long or repeated recv timeout
+        // cannot prevent the failsafe from triggering during total RF loss.
         if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
+            tracing::warn!(
+                "RC failsafe triggered: no data for {}s, clearing RC file",
+                failsafe_timeout.as_secs()
+            );
             let _ = std::fs::remove_file(rc_file_path);
             failsafe_active = true;
         }
@@ -293,6 +299,9 @@ fn telemetry_sender(
     let mut camera_ok = check_camera_available();
     let mut fc_telem = fc::FcTelemetry::default();
     let mut l2_seq: u32 = 0;
+    // Reusable buffers for send path
+    let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
+    let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
@@ -327,8 +336,8 @@ fn telemetry_sender(
                 payload_type: link::PAYLOAD_TELEMETRY,
                 seq: l2_seq,
             };
-            let frame = header.encode(data.as_bytes());
-            let _ = socket.send(&frame);
+            header.encode_into(data.as_bytes(), &mut l2_buf);
+            let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
             l2_seq = l2_seq.wrapping_add(1);
         }
 

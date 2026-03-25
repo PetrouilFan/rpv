@@ -16,12 +16,13 @@ const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
 
 /// Maximum shard data bytes per fragment.
-/// Wire frame = 802.11(24) + Radiotap(8) + L2(8) + video_hdr + frag_idx(1) + shard_data.
-/// video_hdr = 10 + TOTAL_SHARDS*2 (block_seq, indices, shard_sizes array).
+/// Wire frame = 802.11(24) + Radiotap(8) + L2(8) + video_hdr + frag_idx(2) + shard_data.
+/// video_hdr = 12 bytes for 2+1 FEC: [4B seq][1B idx][1B total][1B data][1B pad][2B s0][2B s1].
 /// Radiotap is prepended by rawsock::send, not counted here.
-/// Constraint: L2(8) + video_hdr + frag_idx(1) + shard_data <= MAX_PAYLOAD(1400).
-const VIDEO_HDR_LEN: usize = 10 + TOTAL_SHARDS * 2; // 10 + 6 = 16 for 2+1 FEC
-const MAX_SHARD_DATA: usize = link::MAX_PAYLOAD - 8 - VIDEO_HDR_LEN - 1;
+/// Constraint: L2(8) + video_hdr + frag_idx(2) + shard_data <= MAX_PAYLOAD(1400).
+const VIDEO_HDR_LEN: usize = 12;
+const FRAG_HDR_LEN: usize = 2; // u16 fragment index
+const MAX_SHARD_DATA: usize = link::MAX_PAYLOAD - 8 - VIDEO_HDR_LEN - FRAG_HDR_LEN;
 
 /// Run the video capture and streaming loop.
 ///
@@ -125,7 +126,19 @@ pub fn run(
         let mut total_bytes = u64::default();
         let mut fail_count: u8 = 0;
         let mut fec_buffer: Vec<Vec<u8>> = Vec::with_capacity(DATA_SHARDS);
-        let mut nal_buf: Vec<u8> = Vec::new();
+        // Cursor-based NAL buffer: head/tail avoid O(n) shifting on every extraction.
+        // Only compact (copy_within) when the buffer fills up.
+        let mut nal_buf: Vec<u8> = vec![0u8; MAX_NAL_BUF];
+        let mut nal_head: usize = 0;
+        let mut nal_tail: usize = 0;
+        // Tracks consecutive read cycles with zero NAL extractions while buffer is full.
+        // If excessive, the stream is garbage and we force-reset to avoid spinning.
+        let mut nal_idle_cycles: u32 = 0;
+        const NAL_IDLE_LIMIT: u32 = 200;
+        // Reusable buffers for send path (avoids per-packet allocations)
+        let mut l2_frame_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
+        let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
+        let mut video_payload_buf: Vec<u8> = Vec::with_capacity(VIDEO_HDR_LEN + MAX_SHARD_DATA);
 
         while running.load(Ordering::SeqCst) {
             match reader.read(&mut buf) {
@@ -134,16 +147,41 @@ pub fn run(
                     break;
                 }
                 Ok(n) => {
-                    nal_buf.extend_from_slice(&buf[..n]);
                     total_bytes += n as u64;
 
-                    while let Some(nal) = extract_next_nal(&mut nal_buf) {
+                    // Append new bytes into the NAL cursor buffer
+                    let copy_len = n.min(nal_buf.len().saturating_sub(nal_tail));
+                    if copy_len == 0 {
+                        // Buffer full — compact first
+                        if nal_head > 0 {
+                            let remaining = nal_tail - nal_head;
+                            nal_buf.copy_within(nal_head..nal_tail, 0);
+                            nal_head = 0;
+                            nal_tail = remaining;
+                            let retry = n.min(nal_buf.len().saturating_sub(nal_tail));
+                            nal_buf[nal_tail..nal_tail + retry].copy_from_slice(&buf[..retry]);
+                            nal_tail += retry;
+                        }
+                        // If still full after compaction, data is lost (overflow handled below)
+                    } else {
+                        nal_buf[nal_tail..nal_tail + copy_len].copy_from_slice(&buf[..copy_len]);
+                        nal_tail += copy_len;
+                    }
+
+                    // Extract complete NAL units using cursor (no drain/truncate)
+                    let mut extracted_any = false;
+                    while let Some((nal, consumed)) =
+                        extract_next_nal_cursor(&nal_buf, nal_head, nal_tail)
+                    {
+                        nal_head += consumed;
+                        extracted_any = true;
+
                         let mut off = 0;
-                        let mut frag_idx: u8 = 0;
+                        let mut frag_idx: u16 = 0;
                         while off < nal.len() {
                             let end = (off + MAX_SHARD_DATA).min(nal.len());
-                            let mut frag = Vec::with_capacity(1 + end - off);
-                            frag.push(frag_idx);
+                            let mut frag = Vec::with_capacity(FRAG_HDR_LEN + end - off);
+                            frag.extend_from_slice(&frag_idx.to_le_bytes());
                             frag.extend_from_slice(&nal[off..end]);
                             fec_buffer.push(frag);
                             off = end;
@@ -158,9 +196,42 @@ pub fn run(
                                     &mut fec_block_seq,
                                     &mut l2_pkt_seq,
                                     &mut fail_count,
+                                    &mut l2_frame_buf,
+                                    &mut send_buf,
+                                    &mut video_payload_buf,
                                 );
                                 fec_buffer.clear();
                             }
+                        }
+                    }
+
+                    // Compact when unconsumed prefix gets large
+                    if nal_head > 0 && nal_head == nal_tail {
+                        nal_head = 0;
+                        nal_tail = 0;
+                        nal_idle_cycles = 0;
+                    } else if nal_head > 0 && nal_head > nal_buf.len() / 2 {
+                        let remaining = nal_tail - nal_head;
+                        nal_buf.copy_within(nal_head..nal_tail, 0);
+                        nal_head = 0;
+                        nal_tail = remaining;
+                    }
+
+                    // Idle detection: if buffer is full and we extracted nothing,
+                    // the stream may be garbage. Force-reset after too many idle cycles.
+                    if extracted_any {
+                        nal_idle_cycles = 0;
+                    } else if nal_tail - nal_head >= nal_buf.len() {
+                        nal_idle_cycles += 1;
+                        if nal_idle_cycles >= NAL_IDLE_LIMIT {
+                            tracing::warn!(
+                                "NAL buffer idle reset ({} cycles, {}B unparseable)",
+                                nal_idle_cycles,
+                                nal_tail - nal_head
+                            );
+                            nal_head = 0;
+                            nal_tail = 0;
+                            nal_idle_cycles = 0;
                         }
                     }
                 }
@@ -171,44 +242,49 @@ pub fn run(
             }
         }
 
-        // Force-flush trailing NAL if buffer begins with a valid start code
-        if nal_buf.len() > 4 && nal_buf[0] == 0 && nal_buf[1] == 0 {
-            let start_code_len = if nal_buf[2] == 0 && nal_buf[3] == 1 {
-                4
-            } else if nal_buf[2] == 1 {
-                3
-            } else {
-                0
-            };
-            if start_code_len > 0 {
-                let nal = nal_buf[start_code_len..].to_vec();
-                if !nal.is_empty() {
-                    let mut off = 0;
-                    let mut frag_idx: u8 = 0;
-                    while off < nal.len() {
-                        let end = (off + MAX_SHARD_DATA).min(nal.len());
-                        let mut frag = Vec::with_capacity(1 + end - off);
-                        frag.push(frag_idx);
-                        frag.extend_from_slice(&nal[off..end]);
-                        fec_buffer.push(frag);
-                        if fec_buffer.len() == DATA_SHARDS {
-                            send_fec_group(
-                                &socket,
-                                &rs,
-                                &fec_buffer,
-                                drone_id,
-                                &mut fec_block_seq,
-                                &mut l2_pkt_seq,
-                                &mut fail_count,
-                            );
-                            fec_buffer.clear();
+        // Force-flush trailing NAL if cursor buffer has a valid start code
+        if nal_tail > nal_head + 4 {
+            let data = &nal_buf[nal_head..nal_tail];
+            if data[0] == 0 && data[1] == 0 {
+                let start_code_len = if data[2] == 0 && data[3] == 1 {
+                    4
+                } else if data[2] == 1 {
+                    3
+                } else {
+                    0
+                };
+                if start_code_len > 0 {
+                    let nal = data[start_code_len..].to_vec();
+                    if !nal.is_empty() {
+                        let mut off = 0;
+                        let mut frag_idx: u16 = 0;
+                        while off < nal.len() {
+                            let end = (off + MAX_SHARD_DATA).min(nal.len());
+                            let mut frag = Vec::with_capacity(FRAG_HDR_LEN + end - off);
+                            frag.extend_from_slice(&frag_idx.to_le_bytes());
+                            frag.extend_from_slice(&nal[off..end]);
+                            fec_buffer.push(frag);
+                            if fec_buffer.len() == DATA_SHARDS {
+                                send_fec_group(
+                                    &socket,
+                                    &rs,
+                                    &fec_buffer,
+                                    drone_id,
+                                    &mut fec_block_seq,
+                                    &mut l2_pkt_seq,
+                                    &mut fail_count,
+                                    &mut l2_frame_buf,
+                                    &mut send_buf,
+                                    &mut video_payload_buf,
+                                );
+                                fec_buffer.clear();
+                            }
+                            off = end;
+                            frag_idx += 1;
                         }
-                        off = end;
-                        frag_idx += 1;
                     }
                 }
             }
-            nal_buf.clear();
         }
 
         // Send any remaining partial group
@@ -221,6 +297,9 @@ pub fn run(
                 &mut fec_block_seq,
                 &mut l2_pkt_seq,
                 &mut fail_count,
+                &mut l2_frame_buf,
+                &mut send_buf,
+                &mut video_payload_buf,
             );
             fec_buffer.clear();
         }
@@ -240,55 +319,59 @@ pub fn run(
     }
 }
 
-fn extract_next_nal(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    if buf.len() > MAX_NAL_BUF {
-        tracing::warn!("NAL buffer overflow ({}B), resetting", buf.len());
-        buf.clear();
+/// Cursor-based NAL extractor. O(1) per extraction — no drain/truncate/copy_within.
+///
+/// Scans `buf[head..tail]` for two Annex-B start codes. If found, returns a
+/// slice pointing into `buf` (after the first start code, before the second)
+/// and the number of bytes consumed (from `head` to the second start code).
+///
+/// Returns `None` if no complete NAL unit is found.
+///
+/// The caller must advance `head += consumed` after copying the NAL data.
+fn extract_next_nal_cursor(buf: &[u8], head: usize, tail: usize) -> Option<(&[u8], usize)> {
+    let data = &buf[head..tail];
+    if data.len() < 4 {
         return None;
     }
-    let mut start = None;
-    for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == 0 && buf[i + 1] == 0 {
-            if buf[i + 2] == 0 && i + 3 < buf.len() && buf[i + 3] == 1 {
-                start = Some(i);
+
+    // Find first start code
+    let mut sc1_offset = None;
+    for i in 0..data.len().saturating_sub(3) {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1 {
+                sc1_offset = Some(i);
                 break;
             }
-            if buf[i + 2] == 1 {
-                start = Some(i);
+            if data[i + 2] == 1 {
+                sc1_offset = Some(i);
                 break;
             }
         }
     }
-    let start = start?;
+    let sc1 = sc1_offset?;
 
-    let sc_len = if start + 3 < buf.len() && buf[start + 2] == 0 && buf[start + 3] == 1 {
+    let sc1_len = if sc1 + 3 < data.len() && data[sc1 + 2] == 0 && data[sc1 + 3] == 1 {
         4
     } else {
         3
     };
 
-    let search_from = start + sc_len;
-    let mut end = None;
-    for i in search_from..buf.len().saturating_sub(3) {
-        if buf[i] == 0 && buf[i + 1] == 0 {
-            if buf[i + 2] == 0 && i + 3 < buf.len() && buf[i + 3] == 1 {
-                end = Some(i);
-                break;
-            }
-            if buf[i + 2] == 1 {
-                end = Some(i);
-                break;
+    let nal_start = sc1 + sc1_len;
+
+    // Find second start code after this one
+    for i in nal_start..data.len().saturating_sub(3) {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let is_sc4 = data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1;
+            let is_sc3 = data[i + 2] == 1;
+            if is_sc4 || is_sc3 {
+                let nal = &data[nal_start..i];
+                let consumed = i; // bytes consumed from head: sc1 through sc2 start
+                return Some((nal, consumed));
             }
         }
     }
 
-    if let Some(end) = end {
-        let nal = buf[start + sc_len..end].to_vec();
-        buf.drain(..end);
-        Some(nal)
-    } else {
-        None
-    }
+    None
 }
 
 /// Minimum interval between shard sends to prevent hardware queue overflow.
@@ -303,6 +386,9 @@ fn send_fec_group(
     fec_block_seq: &mut u32,
     l2_pkt_seq: &mut u32,
     fail_count: &mut u8,
+    l2_frame_buf: &mut Vec<u8>,
+    send_buf: &mut Vec<u8>,
+    video_payload_buf: &mut Vec<u8>,
 ) {
     if chunks.is_empty() {
         return;
@@ -310,14 +396,12 @@ fn send_fec_group(
 
     let shard_size = chunks.iter().map(|c| c.len()).max().unwrap_or(1);
 
-    // Safety check: shard data + frag_idx must fit within MAX_SHARD_DATA
     if shard_size > MAX_SHARD_DATA {
         tracing::warn!(
             "Shard size {} exceeds MAX_SHARD_DATA {}, truncating",
             shard_size,
             MAX_SHARD_DATA
         );
-        // This shouldn't happen if NAL fragmentation is correct, but guard against it
     }
 
     let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
@@ -341,50 +425,57 @@ fn send_fec_group(
     let mut group_ok = true;
     let mut last_send = Instant::now();
 
-    // Collect original shard sizes (before FEC padding) for the header.
-    // This lets the receiver trim padding from FEC-reconstructed shards.
-    let mut shard_sizes = Vec::with_capacity(TOTAL_SHARDS);
-    for chunk in chunks.iter() {
-        shard_sizes.push(chunk.len() as u16);
-    }
-    // Zero-fill for missing data shards and parity shards
-    while shard_sizes.len() < TOTAL_SHARDS {
-        shard_sizes.push(0);
-    }
+    // Original data shard lengths (before FEC padding). These are broadcast
+    // in every shard's header so the receiver can truncate reconstructed shards.
+    let shard0_len = chunks.get(0).map_or(0, |c| c.len()) as u16;
+    let shard1_len = chunks.get(1).map_or(0, |c| c.len()) as u16;
 
     for (i, shard) in shards.iter().enumerate() {
-        // Token-bucket pacing: enforce minimum interval between sends
         let elapsed = last_send.elapsed();
         if elapsed < MIN_SEND_INTERVAL {
             thread::sleep(MIN_SEND_INTERVAL - elapsed);
         }
 
-        // Video packet header:
-        // [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad][2B shard_len]
-        // [TOTAL_SHARDS * 2B shard_sizes]
-        // = 10 + TOTAL_SHARDS*2 bytes
-        let mut payload = Vec::with_capacity(VIDEO_HDR_LEN + shard.len());
-        payload.extend_from_slice(&fec_block_seq.to_le_bytes());
-        payload.push(i as u8);
-        payload.push(TOTAL_SHARDS as u8);
-        payload.push(chunks.len() as u8);
-        payload.push(0u8);
-        payload.extend_from_slice(&(shard.len() as u16).to_le_bytes());
-        // Include all original shard sizes so receiver can trim padding
-        for sz in &shard_sizes {
-            payload.extend_from_slice(&sz.to_le_bytes());
-        }
-        payload.extend_from_slice(shard);
+        // Send data shards at their actual length (not padded to max).
+        // The parity shard (last) must be full-size for RS math.
+        // The receiver pads smaller shards back to max for reconstruction.
+        let send_data = if i < DATA_SHARDS {
+            // Data shard: send only the original data bytes, trimming FEC padding
+            let orig_len = chunks.get(i).map_or(0, |c| c.len());
+            if orig_len > 0 && orig_len <= shard.len() {
+                &shard[..orig_len]
+            } else {
+                shard
+            }
+        } else {
+            // Parity shard: send full padded size
+            shard
+        };
 
-        // Wrap in L2 header and send (L2 seq is per-packet, not per-FEC-block)
+        // Build video payload into reusable video_payload_buf.
+        // Header (12 bytes): [4B block_seq][1B shard_idx][1B total_shards]
+        //   [1B data_shards][1B pad][2B shard0_len][2B shard1_len]
+        video_payload_buf.clear();
+        video_payload_buf.reserve(VIDEO_HDR_LEN + send_data.len());
+        video_payload_buf.extend_from_slice(&fec_block_seq.to_le_bytes());
+        video_payload_buf.push(i as u8);
+        video_payload_buf.push(TOTAL_SHARDS as u8);
+        video_payload_buf.push(chunks.len() as u8);
+        video_payload_buf.push(0u8); // pad
+        video_payload_buf.extend_from_slice(&shard0_len.to_le_bytes());
+        video_payload_buf.extend_from_slice(&shard1_len.to_le_bytes());
+        video_payload_buf.extend_from_slice(send_data);
+
+        // Encode L2 header + video payload into l2_frame_buf (reuses buffer)
         let header = link::L2Header {
             drone_id,
             payload_type: link::PAYLOAD_VIDEO,
             seq: *l2_pkt_seq,
         };
-        let frame = header.encode(&payload);
+        header.encode_into(video_payload_buf, l2_frame_buf);
 
-        match socket.send(&frame) {
+        // Send using reusable send_buf
+        match socket.send_with_buf(l2_frame_buf, send_buf) {
             Ok(_) => {
                 last_send = Instant::now();
                 *l2_pkt_seq = l2_pkt_seq.wrapping_add(1);

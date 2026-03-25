@@ -12,6 +12,18 @@ pub struct DecodedFrame {
     pub recv_time: Option<std::time::Instant>,
 }
 
+/// Trait abstracting the video decoder backend.
+/// Currently implemented by `FfmpegDecoder` (subprocess).
+/// A future implementation could use V4L2/DRM for hardware decode.
+pub trait VideoDecoderBackend: Send {
+    /// Run the decode loop, reading H.264 from `rx` and sending decoded NV12 frames to `frame_tx`.
+    fn decode_loop(
+        &self,
+        frame_tx: crossbeam_channel::Sender<DecodedFrame>,
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+    );
+}
+
 pub struct VideoDecoder {
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
     frame_rx: crossbeam_channel::Receiver<DecodedFrame>,
@@ -39,8 +51,25 @@ impl VideoDecoder {
         let width = self.width;
         let height = self.height;
         std::thread::spawn(move || {
-            decode_loop(frame_tx, rx, width, height);
+            let backend = FfmpegDecoder { width, height };
+            backend.decode_loop(frame_tx, rx);
         });
+    }
+}
+
+/// FFmpeg subprocess decoder backend.
+struct FfmpegDecoder {
+    width: u32,
+    height: u32,
+}
+
+impl VideoDecoderBackend for FfmpegDecoder {
+    fn decode_loop(
+        &self,
+        frame_tx: crossbeam_channel::Sender<DecodedFrame>,
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+    ) {
+        decode_loop_impl(frame_tx, rx, self.width, self.height);
     }
 }
 
@@ -84,7 +113,7 @@ pub fn nv12_to_rgba(
     }
 }
 
-fn decode_loop(
+fn decode_loop_impl(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
     width: u32,
@@ -99,6 +128,11 @@ fn decode_loop(
         "H.264 decoder initialized: {}x{} stride={} NV12",
         width, height, stride
     );
+
+    // Exponential backoff for decoder restarts to avoid CPU-burning tight loops
+    // when ffmpeg can't start (missing codec, bad install, etc.).
+    let mut restart_delay_ms: u64 = 200;
+    const MAX_RESTART_DELAY_MS: u64 = 5000;
 
     loop {
         let hw_args = vec![
@@ -149,6 +183,8 @@ fn decode_loop(
             "pipe:1",
         ];
 
+        // Try HW decode first, fall back to SW if it fails immediately.
+        // Use a short poll to detect early exit rather than a blind sleep.
         let mut child = match Command::new("ffmpeg")
             .args(&hw_args)
             .stdin(Stdio::piped())
@@ -157,7 +193,8 @@ fn decode_loop(
             .spawn()
         {
             Ok(mut c) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Brief poll: if ffmpeg exits within 200ms, it failed to init HW decode.
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 match c.try_wait() {
                     Ok(Some(status)) => {
                         warn!("HW decode exited with {}, falling back to SW", status);
@@ -203,7 +240,7 @@ fn decode_loop(
             width, height, stride
         );
 
-        let mut stdin = child.stdin.take().expect("No stdin");
+        let stdin = child.stdin.take().expect("No stdin");
         let stdout = child.stdout.take().expect("No stdout");
         let stderr = child.stderr.take().expect("No stderr");
 
@@ -259,7 +296,10 @@ fn decode_loop(
             info!("Read thread exiting after {} frames", frame_count);
         });
 
-        // Feed H.264 data to ffmpeg stdin
+        // Feed H.264 data to ffmpeg stdin.
+        // Writes run in a thread with a timeout to prevent hanging forever
+        // if ffmpeg dies but the pipe isn't fully closed yet.
+        let mut stdin_opt = Some(stdin);
         loop {
             let data = match rx.recv() {
                 Ok(d) => d,
@@ -269,19 +309,52 @@ fn decode_loop(
                 }
             };
 
-            if stdin.write_all(&data).is_err() {
-                warn!("ffmpeg stdin write error");
-                break;
+            let s = match stdin_opt.take() {
+                Some(s) => s,
+                None => break,
+            };
+
+            // Write in a thread so we can enforce a timeout.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let write_thread = std::thread::spawn(move || {
+                let mut s = s;
+                let result = s.write_all(&data);
+                let _ = done_tx.send(result);
+                s
+            });
+
+            match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(())) => {
+                    // Write succeeded, reclaim stdin
+                    stdin_opt = write_thread.join().ok();
+                }
+                Ok(Err(e)) => {
+                    warn!("ffmpeg stdin write error: {}", e);
+                    let _ = write_thread.join();
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    warn!("ffmpeg stdin write timed out (5s), killing decoder");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    warn!("ffmpeg write thread disconnected");
+                    break;
+                }
             }
         }
 
-        drop(stdin);
+        drop(stdin_opt);
         let _ = read_handle.join();
         let _ = stderr_handle.join();
         let _ = child.kill();
         let _ = child.wait();
 
-        info!("Restarting ffmpeg decoder...");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        info!(
+            "Restarting ffmpeg decoder (backoff {}ms)...",
+            restart_delay_ms
+        );
+        std::thread::sleep(std::time::Duration::from_millis(restart_delay_ms));
+        restart_delay_ms = (restart_delay_ms * 2).min(MAX_RESTART_DELAY_MS);
     }
 }

@@ -1,5 +1,6 @@
 mod config;
 mod link;
+mod link_state;
 mod rawsock;
 mod telemetry;
 mod video {
@@ -17,18 +18,11 @@ use std::time::Instant;
 use egui::{ColorImage, TextureHandle, Vec2};
 
 use crate::config::Config;
+use crate::link_state::{LinkStateHandle, LinkStatus};
 use crate::rawsock::RawSocket;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::decoder::{DecodedFrame as DecodedYUV, VideoDecoder};
 use crate::video::receiver::VideoReceiver;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LinkStatus {
-    Searching,
-    Connected,
-    SignalLost,
-    NoCamera,
-}
 
 pub struct AppState {
     pub texture: Option<TextureHandle>,
@@ -37,7 +31,7 @@ pub struct AppState {
     pub fps_timer: Instant,
     pub fps: f64,
     pub link_status: LinkStatus,
-    pub link_status_shared: Arc<Mutex<LinkStatus>>,
+    pub link_state: LinkStateHandle,
     pub config: Config,
     pub telemetry: Arc<Mutex<Telemetry>>,
     pub running: Arc<AtomicBool>,
@@ -58,7 +52,7 @@ impl RpvApp {
         frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
         telemetry: Arc<Mutex<Telemetry>>,
         running: Arc<AtomicBool>,
-        link_status_shared: Arc<Mutex<LinkStatus>>,
+        link_state: LinkStateHandle,
         rssi: Arc<Mutex<Option<i8>>>,
     ) -> Self {
         let w = config.video_width as usize;
@@ -71,7 +65,7 @@ impl RpvApp {
                 frame_count: 0,
                 fps: 0.0,
                 link_status: LinkStatus::Searching,
-                link_status_shared,
+                link_state,
                 config,
                 telemetry,
                 running,
@@ -136,10 +130,9 @@ impl RpvApp {
                     self.state.fps_timer = Instant::now();
                 }
 
-                if self.state.link_status != LinkStatus::Connected {
-                    self.state.link_status = LinkStatus::Connected;
-                    tracing::info!("Video: decoded frame received, link status = Connected");
-                }
+                // Notify link state machine that video is flowing.
+                // This only transitions Searching->Connected, never overrides SignalLost.
+                self.state.link_state.video_frame_decoded();
                 self.has_ever_had_frame = true;
                 had_frame = true;
             }
@@ -161,19 +154,19 @@ impl eframe::App for RpvApp {
         if !self.has_ever_had_frame {
             let telem = self.state.telemetry.lock().unwrap();
             if !telem.camera_ok && self.state.link_status != LinkStatus::NoCamera {
-                self.state.link_status = LinkStatus::NoCamera;
+                self.state.link_state.camera_unavailable();
                 self.needs_repaint = true;
             } else if telem.camera_ok && self.state.link_status == LinkStatus::NoCamera {
-                self.state.link_status = LinkStatus::Searching;
+                self.state.link_state.camera_available();
                 self.needs_repaint = true;
             }
         }
 
-        if let Ok(shared) = self.state.link_status_shared.lock() {
-            if *shared != self.state.link_status {
-                self.state.link_status = *shared;
-                self.needs_repaint = true;
-            }
+        // Read authoritative link state from the state machine.
+        let new_status = self.state.link_state.get();
+        if new_status != self.state.link_status {
+            self.state.link_status = new_status;
+            self.needs_repaint = true;
         }
 
         if self.needs_repaint {
@@ -443,8 +436,8 @@ fn main() -> Result<(), eframe::Error> {
         }
     };
 
-    // Shared link status
-    let link_status_shared: Arc<Mutex<LinkStatus>> = Arc::new(Mutex::new(LinkStatus::Searching));
+    // Shared link state machine
+    let link_state = LinkStateHandle::new();
 
     // Shared RSSI from camera (dBm, updated by RX dispatcher)
     let rssi_shared: Arc<Mutex<Option<i8>>> = Arc::new(Mutex::new(None));
@@ -462,7 +455,7 @@ fn main() -> Result<(), eframe::Error> {
     decoder.spawn(video_frame_rx_decoder);
 
     // Create telemetry receiver
-    let telemetry = TelemetryReceiver::new(Arc::clone(&link_status_shared), telem_payload_rx);
+    let telemetry = TelemetryReceiver::new(link_state.clone(), telem_payload_rx);
     let telemetry_state = telemetry.get_state();
 
     if was_default {
@@ -478,7 +471,6 @@ fn main() -> Result<(), eframe::Error> {
     let rx_socket = Arc::clone(&socket);
     let rx_video_tx = video_payload_tx;
     let rx_telem_tx = telem_payload_tx;
-    let rx_link_status = Arc::clone(&link_status_shared);
     let rx_drone_id = config.drone_id;
     let rx_last_hb = Arc::clone(&last_heartbeat);
     let rx_rssi = Arc::clone(&rssi_shared);
@@ -490,7 +482,6 @@ fn main() -> Result<(), eframe::Error> {
             rx_video_tx,
             rx_telem_tx,
             rx_last_hb,
-            rx_link_status,
             rx_rssi,
         );
     });
@@ -525,9 +516,9 @@ fn main() -> Result<(), eframe::Error> {
     // Heartbeat monitor thread: detects when camera stops sending heartbeats
     let hm_running = running.clone();
     let hm_last = Arc::clone(&last_heartbeat);
-    let hm_link_status = Arc::clone(&link_status_shared);
+    let hm_link_state = link_state.clone();
     let _hm_handle = std::thread::spawn(move || {
-        heartbeat_monitor(hm_running, hm_last, hm_link_status);
+        heartbeat_monitor(hm_running, hm_last, hm_link_state);
     });
 
     // Run egui on main thread with custom wgpu limits for Pi 5 V3D GPU
@@ -566,7 +557,7 @@ fn main() -> Result<(), eframe::Error> {
                 ui_frame_rx,
                 telemetry_state,
                 app_running,
-                link_status_shared,
+                link_state,
                 rssi_shared,
             )))
         }),
@@ -583,7 +574,6 @@ fn rx_dispatcher(
     video_tx: crossbeam_channel::Sender<Vec<u8>>,
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
     last_heartbeat: Arc<Mutex<Instant>>,
-    link_status: Arc<Mutex<LinkStatus>>,
     rssi: Arc<Mutex<Option<i8>>>,
 ) {
     tracing::info!("RX dispatcher started (raw socket)");
@@ -647,12 +637,6 @@ fn rx_dispatcher(
             }
             link::PAYLOAD_TELEMETRY => {
                 let _ = telem_tx.try_send(data.to_vec());
-                // Any telemetry received means link is active
-                if let Ok(mut status) = link_status.lock() {
-                    if *status == LinkStatus::Searching {
-                        *status = LinkStatus::Connected;
-                    }
-                }
             }
             link::PAYLOAD_HEARTBEAT => {
                 *last_heartbeat.lock().unwrap() = Instant::now();
@@ -695,34 +679,24 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
 }
 
 /// Heartbeat monitor — detects when camera stops sending heartbeats.
+/// This is the PRIMARY link liveness source. Only heartbeat transitions
+/// can override SignalLost back to Connected.
 fn heartbeat_monitor(
     running: Arc<AtomicBool>,
     last_heartbeat: Arc<Mutex<Instant>>,
-    link_status: Arc<Mutex<LinkStatus>>,
+    link_state: LinkStateHandle,
 ) {
     tracing::info!("Heartbeat monitor started (timeout: 3s)");
     std::thread::sleep(std::time::Duration::from_secs(3)); // initial grace period
-
-    let mut was_connected = true;
 
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
         if elapsed > std::time::Duration::from_secs(3) {
-            if was_connected {
-                tracing::warn!("Camera heartbeat lost ({}s)", elapsed.as_secs());
-                if let Ok(mut status) = link_status.lock() {
-                    *status = LinkStatus::SignalLost;
-                }
-                was_connected = false;
-            }
-        } else if !was_connected {
-            tracing::info!("Camera heartbeat restored");
-            if let Ok(mut status) = link_status.lock() {
-                *status = LinkStatus::Connected;
-            }
-            was_connected = true;
+            link_state.heartbeat_lost();
+        } else {
+            link_state.heartbeat_restored();
         }
     }
 }

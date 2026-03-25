@@ -60,10 +60,10 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // 500ms receive timeout for interruptible RX loop
+        // 100ms receive timeout for responsive shutdown (was 500ms)
         let tv = libc::timeval {
             tv_sec: 0,
-            tv_usec: 500_000,
+            tv_usec: 100_000,
         };
         unsafe {
             libc::setsockopt(
@@ -103,6 +103,7 @@ impl RawSocket {
     /// Send a raw 802.11 frame.
     /// Prepends a minimal Radiotap header + broadcast data frame header.
     /// The Radiotap header is required by mac80211 for injected frames in monitor mode.
+    #[allow(dead_code)]
     pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
         // Minimal Radiotap header: version=0, pad=0, hdr_len=8, present=0
         let radiotap: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -119,6 +120,26 @@ impl RawSocket {
                 0,
             )
         };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    /// Send using a reusable buffer to avoid per-call heap allocation.
+    /// Prepends Radiotap + 802.11 header to `payload`, sends, then returns
+    /// the buffer for reuse. The buffer is cleared before use.
+    pub fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {
+        static RADIOTAP: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let total = RADIOTAP.len() + IEEE80211_HDR_LEN + payload.len();
+        buf.clear();
+        buf.reserve(total);
+        buf.extend_from_slice(&RADIOTAP);
+        buf.extend_from_slice(&build_data_frame_header());
+        buf.extend_from_slice(payload);
+
+        let ret = unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
         if ret < 0 {
             Err(io::Error::last_os_error())
         } else {

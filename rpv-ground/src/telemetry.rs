@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::LinkStatus;
+use crate::link_state::LinkStateHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
@@ -45,18 +45,15 @@ impl Default for Telemetry {
 
 pub struct TelemetryReceiver {
     state: Arc<Mutex<Telemetry>>,
-    link_status: Arc<Mutex<LinkStatus>>,
+    link_state: LinkStateHandle,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
 }
 
 impl TelemetryReceiver {
-    pub fn new(
-        link_status: Arc<Mutex<LinkStatus>>,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
-    ) -> Self {
+    pub fn new(link_state: LinkStateHandle, rx: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
         Self {
             state: Arc::new(Mutex::new(Telemetry::default())),
-            link_status,
+            link_state,
             rx,
         }
     }
@@ -80,25 +77,17 @@ impl TelemetryReceiver {
                             *state = telem;
                             last_telem_time = Instant::now();
 
-                            if let Ok(mut status) = self.link_status.lock() {
-                                if *status == LinkStatus::Searching
-                                    || *status == LinkStatus::SignalLost
-                                {
-                                    *status = LinkStatus::Connected;
-                                    info!("Telemetry: camera connected");
-                                }
-                            }
+                            // Telemetry activity can transition Searching -> Connected,
+                            // but cannot override SignalLost (heartbeat has priority).
+                            self.link_state.telemetry_activity();
                         }
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Telemetry timeout is informational only — heartbeat handles
+                    // the actual SignalLost transition to avoid multi-writer races.
                     if last_telem_time.elapsed() > timeout {
-                        if let Ok(mut status) = self.link_status.lock() {
-                            if *status == LinkStatus::Connected {
-                                *status = LinkStatus::SignalLost;
-                                warn!("Telemetry: no data for 3s, signal lost");
-                            }
-                        }
+                        // No action needed; heartbeat_monitor is the authority.
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
