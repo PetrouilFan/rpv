@@ -4,16 +4,15 @@ use tracing::{info, warn};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-const DATA_SHARDS: usize = 2;
-const PARITY_SHARDS: usize = 1;
+const DATA_SHARDS: usize = 4;
+const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
-/// Fixed 12-byte video header:
-/// [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
-/// [2B shard0_len][2B shard1_len]
-const VIDEO_HDR_LEN: usize = 12;
-const SHARD0_LEN_OFFSET: usize = 8;
-const SHARD1_LEN_OFFSET: usize = 10;
-const DATA_START: usize = 12; // shard payload starts after header
+/// Video header layout (8 + 2*DATA_SHARDS bytes):
+///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
+///   [2B * DATA_SHARDS shard_len_array]
+const VIDEO_HDR_FIXED: usize = 8;
+const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
+const DATA_START: usize = VIDEO_HDR_LEN;
 
 /// How long to wait for the next video payload before checking stall timeouts.
 const RECV_TIMEOUT: Duration = Duration::from_millis(50);
@@ -26,11 +25,8 @@ struct RsBlock {
     shard_sizes: Vec<usize>,
     received: usize,
     actual_data_shards: usize,
-    /// Original data shard lengths before FEC padding, broadcast by the sender
-    /// in every shard's header. Used to truncate reconstructed shards so that
-    /// zero-fill padding from RS reconstruction does NOT enter the H.264 stream.
-    shard0_len: usize,
-    shard1_len: usize,
+    /// Original data shard lengths before FEC padding, broadcast by the sender.
+    shard_lens: [usize; DATA_SHARDS],
 }
 
 /// Video receiver that processes FEC-encoded video payloads
@@ -52,8 +48,6 @@ impl VideoReceiver {
         Self { tx, rx }
     }
 
-    /// Check whether the current block has stalled and flush/discard it if so.
-    /// Returns true if a stall was detected and handled.
     fn check_stall(
         blocks: &mut HashMap<u32, RsBlock>,
         next_block: &mut Option<u32>,
@@ -91,7 +85,7 @@ impl VideoReceiver {
         let mut blocks: HashMap<u32, RsBlock> = HashMap::new();
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
-        let mut block_count: u64 = 0;
+        let mut _block_count: u64 = 0;
         let mut fec_recovered: u64 = 0;
         let mut fec_dropped: u64 = 0;
 
@@ -99,13 +93,9 @@ impl VideoReceiver {
         let mut nal_started = false;
 
         loop {
-            // Use recv_timeout so stall detection fires even when no packets arrive.
-            // This is critical: without it, a full block loss causes a permanent stall
-            // because the stall check below was previously only reached after recv().
             let payload = match self.rx.recv_timeout(RECV_TIMEOUT) {
                 Ok(p) => p,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // No packet arrived — check if the current block has stalled.
                     Self::check_stall(
                         &mut blocks,
                         &mut next_block,
@@ -121,9 +111,6 @@ impl VideoReceiver {
                 }
             };
 
-            // Video packet header: 12 bytes fixed
-            // [4B block_seq][1B shard_idx][1B total_shards][1B data_shards]
-            // [1B pad][2B shard0_len][2B shard1_len]
             if payload.len() < VIDEO_HDR_LEN {
                 continue;
             }
@@ -131,13 +118,14 @@ impl VideoReceiver {
             let block_seq = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             let shard_index = payload[4] as usize;
             let total_shards = payload[5] as usize;
-            let actual_data_shards = payload[6] as usize;
-            let shard0_len =
-                u16::from_le_bytes([payload[SHARD0_LEN_OFFSET], payload[SHARD0_LEN_OFFSET + 1]])
-                    as usize;
-            let shard1_len =
-                u16::from_le_bytes([payload[SHARD1_LEN_OFFSET], payload[SHARD1_LEN_OFFSET + 1]])
-                    as usize;
+            let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
+
+            // Parse [u16; DATA_SHARDS] shard length array
+            let mut shard_lens = [0usize; DATA_SHARDS];
+            for i in 0..DATA_SHARDS {
+                let off = VIDEO_HDR_FIXED + i * 2;
+                shard_lens[i] = u16::from_le_bytes([payload[off], payload[off + 1]]) as usize;
+            }
 
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
                 warn!(
@@ -147,15 +135,10 @@ impl VideoReceiver {
                 continue;
             }
 
-            // Extract shard data: everything after the 12-byte video header.
-            // Data shards may be shorter than the FEC max (variable-size shards).
-            // The parity shard is always max_size. The receiver pads smaller
-            // shards during reconstruct_rs_block and truncates after recovery.
-            let payload_start = DATA_START;
-            if payload_start >= payload.len() {
+            if DATA_START >= payload.len() {
                 continue;
             }
-            let shard_data = payload[payload_start..].to_vec();
+            let shard_data = payload[DATA_START..].to_vec();
 
             if next_block.is_none() {
                 next_block = Some(block_seq);
@@ -185,8 +168,7 @@ impl VideoReceiver {
                 shard_sizes: vec![0; TOTAL_SHARDS],
                 received: 0,
                 actual_data_shards,
-                shard0_len,
-                shard1_len,
+                shard_lens,
             });
 
             if block.shards[shard_index].is_none() {
@@ -214,14 +196,7 @@ impl VideoReceiver {
                                 .take(block.actual_data_shards)
                                 .enumerate()
                             {
-                                // Truncate reconstructed shard to its original length.
-                                // This removes the zero-fill padding that RS reconstruction
-                                // injects, which would corrupt the H.264 bitstream if left in.
-                                let orig_len = if idx == 0 {
-                                    block.shard0_len
-                                } else {
-                                    block.shard1_len
-                                };
+                                let orig_len = block.shard_lens.get(idx).copied().unwrap_or(0);
                                 let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
                                     &shard_data[..orig_len]
                                 } else {
@@ -230,8 +205,6 @@ impl VideoReceiver {
                                 if trimmed.is_empty() {
                                     continue;
                                 }
-                                // Fragment index is u16 LE (2 bytes) to support large NALUs
-                                // that need more than 256 fragments.
                                 if trimmed.len() < 2 {
                                     continue;
                                 }
@@ -241,69 +214,19 @@ impl VideoReceiver {
                                 if frag_index == 0 {
                                     if nal_started && !nal_buf.is_empty() {
                                         let nal_data = std::mem::take(&mut nal_buf);
-                                        if let Err(e) = self.tx.try_send(nal_data) {
-                                            if block_count % 60 == 0 {
-                                                warn!("Video frame channel full, dropping: {}", e);
-                                            }
+                                        if let Err(e) = self.tx.send(nal_data) {
+                                            warn!("Video frame channel closed: {}", e);
                                         }
                                     }
                                     nal_buf.clear();
-                                    nal_buf.extend_from_slice(&[0, 0, 0, 1]); // Annex-B start code
+                                    nal_buf.extend_from_slice(&[0, 0, 0, 1]);
                                     nal_buf.extend_from_slice(frag_payload);
                                     nal_started = true;
                                 } else if nal_started {
                                     nal_buf.extend_from_slice(frag_payload);
                                 }
                             }
-                            // Count one completed block (not one per shard)
-                            block_count += 1;
-                            for (idx, shard_data) in data_shards
-                                .iter()
-                                .take(block.actual_data_shards)
-                                .enumerate()
-                            {
-                                // Truncate reconstructed shard to its original length.
-                                // This removes the zero-fill padding that RS reconstruction
-                                // injects, which would corrupt the H.264 bitstream if left in.
-                                let orig_len = if idx == 0 {
-                                    block.shard0_len
-                                } else {
-                                    block.shard1_len
-                                };
-                                let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
-                                    &shard_data[..orig_len]
-                                } else {
-                                    shard_data
-                                };
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-                                // Fragment index is u16 LE (2 bytes) to support large NALUs
-                                // that need more than 256 fragments.
-                                if trimmed.len() < 2 {
-                                    continue;
-                                }
-                                let frag_index = u16::from_le_bytes([trimmed[0], trimmed[1]]);
-                                let frag_payload = &trimmed[2..];
-
-                                if frag_index == 0 {
-                                    if nal_started && !nal_buf.is_empty() {
-                                        let nal_data = std::mem::take(&mut nal_buf);
-                                        if let Err(e) = self.tx.try_send(nal_data) {
-                                            if block_count % 60 == 0 {
-                                                warn!("Video frame channel full, dropping: {}", e);
-                                            }
-                                        }
-                                        block_count += 1;
-                                    }
-                                    nal_buf.clear();
-                                    nal_buf.extend_from_slice(&[0, 0, 0, 1]); // Annex-B start code
-                                    nal_buf.extend_from_slice(frag_payload);
-                                    nal_started = true;
-                                } else if nal_started {
-                                    nal_buf.extend_from_slice(frag_payload);
-                                }
-                            }
+                            _block_count += 1;
                         } else {
                             fec_dropped += 1;
                             warn!(
@@ -322,7 +245,6 @@ impl VideoReceiver {
                     }
                 }
 
-                // Stall timeout check for blocks that received some shards but not enough.
                 Self::check_stall(
                     &mut blocks,
                     &mut next_block,

@@ -75,8 +75,8 @@ impl RawSocket {
             );
         }
 
-        // 4MB send/receive buffers
-        let sndbuf: libc::c_int = 4 * 1024 * 1024;
+        // 8MB send/receive buffers
+        let sndbuf: libc::c_int = 8 * 1024 * 1024;
         unsafe {
             libc::setsockopt(
                 fd,
@@ -86,7 +86,7 @@ impl RawSocket {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
-        let rcvbuf: libc::c_int = 4 * 1024 * 1024;
+        let rcvbuf: libc::c_int = 8 * 1024 * 1024;
         unsafe {
             libc::setsockopt(
                 fd,

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use egui::{ColorImage, TextureHandle, Vec2};
+use egui::Vec2;
 
 use crate::config::Config;
 use crate::link_state::{LinkStateHandle, LinkStatus};
@@ -24,8 +24,310 @@ use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::decoder::{DecodedFrame as DecodedYUV, VideoDecoder};
 use crate::video::receiver::VideoReceiver;
 
+// ── GPU YUV→RGB conversion via egui PaintCallback ───────────────────
+
+const YUV_SHADER: &str = "
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    // Fullscreen triangle (3 vertices, no vertex buffer needed)
+    let x = f32((idx & 1u) << 2u) - 1.0;
+    let y = 1.0 - f32((idx & 2u) << 1u);
+    var out: VertexOutput;
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>(x * 0.5 + 0.5, y * 0.5 + 0.5);
+    return out;
+}
+
+@group(0) @binding(0) var t_y: texture_2d<f32>;
+@group(0) @binding(1) var t_uv: texture_2d<f32>;
+@group(0) @binding(2) var s: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let y_val = textureSample(t_y, s, in.uv).r * 255.0;
+    let uv_val = textureSample(t_uv, s, in.uv).rg * 255.0;
+    let c = y_val - 16.0;
+    let u = uv_val.r - 128.0;
+    let v = uv_val.g - 128.0;
+    let r = (298.0 * c + 409.0 * v + 128.0) / 256.0;
+    let g = (298.0 * c - 100.0 * u - 208.0 * v + 128.0) / 256.0;
+    let b = (298.0 * c + 517.0 * u + 128.0) / 256.0;
+    return vec4<f32>(
+        clamp(r / 255.0, 0.0, 1.0),
+        clamp(g / 255.0, 0.0, 1.0),
+        clamp(b / 255.0, 0.0, 1.0),
+        1.0
+    );
+}
+";
+
+/// GPU resources for YUV→RGB rendering. Shared between app and paint callback via Arc<Mutex>.
+struct YuvGpuResources {
+    #[allow(dead_code)]
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    y_texture: wgpu::Texture,
+    uv_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
+    video_width: u32,
+    video_height: u32,
+}
+
+impl YuvGpuResources {
+    fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        video_width: u32,
+        video_height: u32,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
+        let y_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("y_plane"),
+            size: wgpu::Extent3d {
+                width: video_width,
+                height: video_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uv_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("uv_plane"),
+            size: wgpu::Extent3d {
+                width: video_width / 2,
+                height: video_height / 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("yuv_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuv_bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&uv_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("yuv_shader"),
+            source: wgpu::ShaderSource::Wgsl(YUV_SHADER.into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("yuv_pl"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("yuv_rp"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            device,
+            queue,
+            y_texture,
+            uv_texture,
+            bind_group,
+            pipeline,
+            video_width,
+            video_height,
+        }
+    }
+
+    /// Upload NV12 planes to GPU textures (called from update, before paint)
+    fn upload(&self, nv12_data: &[u8], stride: u32) {
+        let w = self.video_width as usize;
+        let h = self.video_height as usize;
+        let stride = stride as usize;
+        let y_size = stride * h;
+
+        let y_data = &nv12_data[..y_size.min(nv12_data.len())];
+        for row in 0..h {
+            let src_start = row * stride;
+            let src_end = src_start + w;
+            if src_end > y_data.len() {
+                break;
+            }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.y_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: row as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &y_data[src_start..src_end],
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w as u32),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: w as u32,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        let uv_h = h / 2;
+        let uv_w = w;
+        if y_size < nv12_data.len() {
+            let uv_data = &nv12_data[y_size..];
+            for row in 0..uv_h {
+                let src_start = row * stride;
+                let src_end = src_start + uv_w;
+                if src_end > uv_data.len() {
+                    break;
+                }
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.uv_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: row as u32,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &uv_data[src_start..src_end],
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(uv_w as u32),
+                        rows_per_image: Some(1),
+                    },
+                    wgpu::Extent3d {
+                        width: uv_w as u32,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// egui PaintCallback that renders a fullscreen YUV→RGB quad
+struct YuvRenderCallback {
+    resources: Arc<Mutex<YuvGpuResources>>,
+}
+
+impl egui_wgpu::CallbackTrait for YuvRenderCallback {
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        _callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let res = self.resources.lock().unwrap();
+        render_pass.set_pipeline(&res.pipeline);
+        render_pass.set_bind_group(0, &res.bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+// ── App state ───────────────────────────────────────────────────────
+
 pub struct AppState {
-    pub texture: Option<TextureHandle>,
     pub last_frame_time: Instant,
     pub frame_count: u64,
     pub fps_timer: Instant,
@@ -41,9 +343,9 @@ pub struct AppState {
 pub struct RpvApp {
     state: AppState,
     frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
-    rgba_buf: Vec<u8>,
     needs_repaint: bool,
     has_ever_had_frame: bool,
+    yuv_gpu: Option<Arc<Mutex<YuvGpuResources>>>,
 }
 
 impl RpvApp {
@@ -55,11 +357,8 @@ impl RpvApp {
         link_state: LinkStateHandle,
         rssi: Arc<Mutex<Option<i8>>>,
     ) -> Self {
-        let w = config.video_width as usize;
-        let h = config.video_height as usize;
         Self {
             state: AppState {
-                texture: None,
                 last_frame_time: Instant::now(),
                 fps_timer: Instant::now(),
                 frame_count: 0,
@@ -72,54 +371,53 @@ impl RpvApp {
                 rssi,
             },
             frame_rx,
-            rgba_buf: vec![0u8; w * h * 4],
             needs_repaint: false,
             has_ever_had_frame: false,
+            yuv_gpu: None,
         }
     }
 
-    fn update_texture(&mut self, ctx: &egui::Context) -> bool {
+    fn ensure_gpu_resources(&mut self, frame: &eframe::Frame) {
+        if self.yuv_gpu.is_some() {
+            return;
+        }
+        if let Some(rs) = frame.wgpu_render_state() {
+            tracing::info!(
+                "Initializing GPU YUV→RGB pipeline ({}x{})",
+                self.state.config.video_width,
+                self.state.config.video_height
+            );
+            self.yuv_gpu = Some(Arc::new(Mutex::new(YuvGpuResources::new(
+                rs.device.clone(),
+                rs.queue.clone(),
+                self.state.config.video_width,
+                self.state.config.video_height,
+                rs.target_format,
+            ))));
+        }
+    }
+
+    fn process_frames(&mut self) -> bool {
         let mut latest = None;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
         }
-        let frame_data = latest;
 
         let mut had_frame = false;
-        if let Some(frame) = frame_data {
-            let w = frame.width as usize;
+        if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
             let h = frame.height as usize;
             let stride = frame.stride as usize;
-
             let y_size = stride * h;
             let uv_size = stride * h / 2;
 
             if frame.nv12_data.len() >= y_size + uv_size {
-                let y_plane = &frame.nv12_data[0..y_size];
-                let uv_plane = &frame.nv12_data[y_size..y_size + uv_size];
-
-                crate::video::decoder::nv12_to_rgba(
-                    y_plane,
-                    uv_plane,
-                    stride,
-                    w,
-                    h,
-                    &mut self.rgba_buf,
-                );
-
-                let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
-
-                if let Some(ref mut tex) = self.state.texture {
-                    tex.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.state.texture =
-                        Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
-                }
+                let res = gpu.lock().unwrap();
+                res.upload(&frame.nv12_data, frame.stride);
+                drop(res);
 
                 self.state.frame_count += 1;
                 self.state.last_frame_time = Instant::now();
 
-                // 30-frame FPS window for Pi 5
                 if self.state.frame_count == 30 {
                     self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
                     self.state.frame_count = 0;
@@ -136,13 +434,14 @@ impl RpvApp {
 }
 
 impl eframe::App for RpvApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.state.running.load(Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        let had_frame = self.update_texture(ctx);
+        self.ensure_gpu_resources(frame);
+        let had_frame = self.process_frames();
         self.needs_repaint = had_frame;
 
         if !self.has_ever_had_frame {
@@ -179,7 +478,7 @@ impl eframe::App for RpvApp {
             .show(ctx, |ui| {
                 let available = ui.available_size();
 
-                if let Some(ref tex) = self.state.texture {
+                if self.has_ever_had_frame {
                     let tex_size = Vec2::new(
                         self.state.config.video_width as f32,
                         self.state.config.video_height as f32,
@@ -200,7 +499,14 @@ impl eframe::App for RpvApp {
                         egui::Color32::BLACK,
                     );
 
-                    egui::Image::from_texture(tex).paint_at(ui, rect);
+                    // GPU YUV→RGB via egui PaintCallback
+                    if let Some(ref gpu) = self.yuv_gpu {
+                        let callback = YuvRenderCallback {
+                            resources: gpu.clone(),
+                        };
+                        let paint_cb = egui_wgpu::Callback::new_paint_callback(rect, callback);
+                        ui.painter().add(paint_cb);
+                    }
                 } else {
                     ui.painter().rect_filled(
                         ui.available_rect_before_wrap(),
@@ -425,7 +731,7 @@ fn main() -> Result<(), eframe::Error> {
     let link_state = LinkStateHandle::new();
 
     let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(32);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
 
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
@@ -440,7 +746,6 @@ fn main() -> Result<(), eframe::Error> {
     }
 
     let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
-
     let rssi_shared: Arc<Mutex<Option<i8>>> = Arc::new(Mutex::new(None));
 
     let rx_running = running.clone();
@@ -615,14 +920,14 @@ fn heartbeat_monitor(
     last_heartbeat: Arc<Mutex<Instant>>,
     link_state: LinkStateHandle,
 ) {
-    tracing::info!("Heartbeat monitor started (timeout: 3s)");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
+    std::thread::sleep(std::time::Duration::from_secs(1));
 
     while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > std::time::Duration::from_secs(3) {
+        if elapsed > std::time::Duration::from_millis(500) {
             link_state.heartbeat_lost();
         } else {
             link_state.heartbeat_restored();
@@ -631,7 +936,7 @@ fn heartbeat_monitor(
 }
 
 fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
-    tracing::info!("Heartbeat sender ready (L2 broadcast, 1Hz)");
+    tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
     let mut l2_seq: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
@@ -654,6 +959,6 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
         let _ = socket.send(&frame);
 
         l2_seq = l2_seq.wrapping_add(1);
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

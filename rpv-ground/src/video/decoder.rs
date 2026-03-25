@@ -1,6 +1,138 @@
-use std::io::{BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::ffi::CString;
 use tracing::{error, info, warn};
+
+// ── Minimal libavcodec FFI (FFmpeg 6.x layout) ─────────────────────
+
+/// Opaque codec context
+#[repr(C)]
+struct AvCodecContext {
+    _private: [u8; 0],
+}
+
+/// Opaque codec descriptor
+#[repr(C)]
+struct AvCodec {
+    _private: [u8; 0],
+}
+
+/// Opaque parser context
+#[repr(C)]
+struct AvCodecParserContext {
+    _private: [u8; 0],
+}
+
+/// AVPacket — fields must match FFmpeg 6.x AVPacket struct layout.
+/// We only touch data/size/buf; the rest are zeroed by av_packet_alloc.
+#[repr(C)]
+struct AvPacket {
+    _buf: *mut u8, // AVBufferRef*
+    pts: i64,
+    dts: i64,
+    data: *mut u8,
+    size: i32,
+    stream_index: i32,
+    flags: i32,
+    _side_data: *mut u8, // AVPacketSideData*
+    _side_data_elems: i32,
+    duration: i64,
+    pos: i64,
+    _opaque: *mut u8, // void* opaque_ref
+    _opaque2: i64,
+}
+
+/// AVFrame — fields must match FFmpeg 6.x AVFrame struct layout.
+#[repr(C)]
+struct AvFrame {
+    data: [*mut u8; 8],
+    linesize: [i32; 8],
+    _extended_data: *mut *mut u8,
+    width: i32,
+    height: i32,
+    nb_samples: i32,
+    format: i32,
+    _key_frame: i32,
+    _pict_type: i32,
+    _sample_aspect_ratio_num: i32,
+    _sample_aspect_ratio_den: i32,
+    pts: i64,
+    _pkt_pts: i64,
+    _pkt_dts: i64,
+    _coded_picture_number: i32,
+    _display_picture_number: i32,
+    quality: i32,
+    _opaque: *mut u8,
+    _repeat_pict: i32,
+    _interlaced_frame: i32,
+    _top_field_first: i32,
+    _palette_has_changed: i32,
+    _reordered_opaque: i64,
+    _sample_rate: i32,
+    _channel_layout: u64,
+    _buf: [*mut u8; 8],
+    _extended_buf: *mut *mut u8,
+    _nb_extended_buf: i32,
+    _side_data: *mut u8,
+    _nb_side_data: i32,
+    _flags: i32,
+    _color_range: i32,
+    _color_primaries: i32,
+    _color_trc: i32,
+    _colorspace: i32,
+    _chroma_location: i32,
+    _best_effort_timestamp: i64,
+    _pkt_pos: i64,
+    _pkt_duration: i64,
+    _metadata: *mut u8,
+    _decode_error_flags: i32,
+    _channels: i32,
+    _pkt_size: i32,
+    _qscale_table: *mut i8,
+    _qstride: i32,
+    _qscale_type: i32,
+    _qp_table_buf: *mut u8,
+    _hw_frames_ctx: *mut u8,
+    _opaque_ref: *mut u8,
+    _crop_top: usize,
+    _crop_bottom: usize,
+    _crop_left: usize,
+    _crop_right: usize,
+    _private_ref: *mut u8,
+    _hwaccel_picture_private: *mut u8,
+}
+
+// FFmpeg extern declarations
+extern "C" {
+    fn avcodec_alloc_context3(codec: *const AvCodec) -> *mut AvCodecContext;
+    fn avcodec_free_context(ctx: *mut *mut AvCodecContext);
+    fn avcodec_find_decoder_by_name(name: *const u8) -> *const AvCodec;
+    fn avcodec_open2(ctx: *mut AvCodecContext, codec: *const AvCodec, options: *mut u8) -> i32;
+    fn av_parser_init(codec_id: i32) -> *mut AvCodecParserContext;
+    fn av_parser_close(parser: *mut AvCodecParserContext);
+    fn av_parser_parse2(
+        parser: *mut AvCodecParserContext,
+        ctx: *mut AvCodecContext,
+        poutbuf: *mut *mut u8,
+        poutbuf_size: *mut i32,
+        buf: *const u8,
+        buf_size: i32,
+        pts: i64,
+        dts: i64,
+        pos: i64,
+    ) -> i32;
+    fn avcodec_send_packet(ctx: *mut AvCodecContext, pkt: *const AvPacket) -> i32;
+    fn avcodec_receive_frame(ctx: *mut AvCodecContext, frame: *mut AvFrame) -> i32;
+    fn av_packet_alloc() -> *mut AvPacket;
+    fn av_packet_free(pkt: *mut *mut AvPacket);
+    fn av_packet_unref(pkt: *mut AvPacket);
+    fn av_frame_alloc() -> *mut AvFrame;
+    fn av_frame_free(frame: *mut *mut AvFrame);
+}
+
+const AV_CODEC_ID_H264: i32 = 27;
+const AVERROR_EOF: i32 = -541478725; // FFERRTAG('E','O','F',' ')
+const AVERROR_EAGAIN: i32 = -11;
+
+// ── Public types ────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct DecodedFrame {
@@ -10,18 +142,6 @@ pub struct DecodedFrame {
     pub stride: u32,
     pub send_ts_us: Option<u64>,
     pub recv_time: Option<std::time::Instant>,
-}
-
-/// Trait abstracting the video decoder backend.
-/// Currently implemented by `FfmpegDecoder` (subprocess).
-/// A future implementation could use V4L2/DRM for hardware decode.
-pub trait VideoDecoderBackend: Send {
-    /// Run the decode loop, reading H.264 from `rx` and sending decoded NV12 frames to `frame_tx`.
-    fn decode_loop(
-        &self,
-        frame_tx: crossbeam_channel::Sender<DecodedFrame>,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
-    );
 }
 
 pub struct VideoDecoder {
@@ -51,28 +171,14 @@ impl VideoDecoder {
         let width = self.width;
         let height = self.height;
         std::thread::spawn(move || {
-            let backend = FfmpegDecoder { width, height };
-            backend.decode_loop(frame_tx, rx);
+            decode_loop_libavcodec(frame_tx, rx, width, height);
         });
     }
 }
 
-/// FFmpeg subprocess decoder backend.
-struct FfmpegDecoder {
-    width: u32,
-    height: u32,
-}
+// ── NV12 → RGBA (CPU fallback, kept for main.rs compat) ────────────
 
-impl VideoDecoderBackend for FfmpegDecoder {
-    fn decode_loop(
-        &self,
-        frame_tx: crossbeam_channel::Sender<DecodedFrame>,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
-    ) {
-        decode_loop_impl(frame_tx, rx, self.width, self.height);
-    }
-}
-
+#[allow(dead_code)]
 pub fn nv12_to_rgba(
     y_plane: &[u8],
     uv_plane: &[u8],
@@ -113,7 +219,9 @@ pub fn nv12_to_rgba(
     }
 }
 
-fn decode_loop_impl(
+// ── In-process libavcodec decode loop ──────────────────────────────
+
+fn decode_loop_libavcodec(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
     width: u32,
@@ -125,236 +233,184 @@ fn decode_loop_impl(
     let total_size = y_size + uv_size;
 
     info!(
-        "H.264 decoder initialized: {}x{} stride={} NV12",
+        "libavcodec H.264 decoder initialized: {}x{} stride={} NV12",
         width, height, stride
     );
 
-    // Exponential backoff for decoder restarts to avoid CPU-burning tight loops
-    // when ffmpeg can't start (missing codec, bad install, etc.).
-    let mut restart_delay_ms: u64 = 200;
-    const MAX_RESTART_DELAY_MS: u64 = 5000;
-
     loop {
-        let hw_args = vec![
-            "-loglevel",
-            "error",
-            "-hwaccel",
-            "v4l2m2m",
-            "-hwaccel_output_format",
-            "nv12",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-            "-thread_queue_size",
-            "4096",
-            "-f",
-            "h264",
-            "-i",
-            "pipe:0",
-            "-threads",
-            "2",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "nv12",
-            "pipe:1",
-        ];
+        let codec_name = CString::new("h264").unwrap();
+        let codec = unsafe { avcodec_find_decoder_by_name(codec_name.as_ptr() as *const u8) };
+        if codec.is_null() {
+            error!("libavcodec: h264 decoder not found");
+            return;
+        }
 
-        let sw_args = vec![
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-            "-thread_queue_size",
-            "4096",
-            "-f",
-            "h264",
-            "-i",
-            "pipe:0",
-            "-threads",
-            "2",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "nv12",
-            "pipe:1",
-        ];
+        let codec_ctx = unsafe { avcodec_alloc_context3(codec) };
+        if codec_ctx.is_null() {
+            error!("libavcodec: failed to alloc context");
+            return;
+        }
 
-        // Try HW decode first, fall back to SW if it fails immediately.
-        // Use a short poll to detect early exit rather than a blind sleep.
-        let mut child = match Command::new("ffmpeg")
-            .args(&hw_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(mut c) => {
-                // Brief poll: if ffmpeg exits within 200ms, it failed to init HW decode.
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                match c.try_wait() {
-                    Ok(Some(status)) => {
-                        warn!("HW decode exited with {}, falling back to SW", status);
-                        let _ = c.kill();
-                        let _ = c.wait();
-                        Command::new("ffmpeg")
-                            .args(&sw_args)
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .unwrap_or_else(|e| panic!("Failed to spawn ffmpeg SW: {}", e))
-                    }
-                    Ok(None) => c,
-                    Err(e) => {
-                        warn!("HW decode wait error: {}, falling back to SW", e);
-                        let _ = c.kill();
-                        let _ = c.wait();
-                        Command::new("ffmpeg")
-                            .args(&sw_args)
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .unwrap_or_else(|e| panic!("Failed to spawn ffmpeg SW: {}", e))
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to spawn ffmpeg HW, trying SW: {}", e);
-                Command::new("ffmpeg")
-                    .args(&sw_args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap_or_else(|e| panic!("Failed to spawn ffmpeg SW: {}", e))
-            }
-        };
+        let ret = unsafe { avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
+        if ret < 0 {
+            error!("libavcodec: failed to open h264 decoder (err {})", ret);
+            unsafe { avcodec_free_context(&mut { codec_ctx }) };
+            return;
+        }
+
+        let parser = unsafe { av_parser_init(AV_CODEC_ID_H264) };
+        if parser.is_null() {
+            error!("libavcodec: failed to init H.264 parser");
+            unsafe { avcodec_free_context(&mut { codec_ctx }) };
+            return;
+        }
+
+        let pkt = unsafe { av_packet_alloc() };
+        let frame = unsafe { av_frame_alloc() };
 
         info!(
-            "FFmpeg decoder started: {}x{} NV12 (stride={})",
+            "libavcodec H.264 decoder started: {}x{} NV12 (stride={})",
             width, height, stride
         );
 
-        let stdin = child.stdin.take().expect("No stdin");
-        let stdout = child.stdout.take().expect("No stdout");
-        let stderr = child.stderr.take().expect("No stderr");
+        let mut frame_count: u64 = 0;
+        let mut _decode_err_count: u32 = 0;
 
-        let stderr_handle = std::thread::spawn(move || {
-            let mut err_buf = Vec::new();
-            let mut stderr_reader = BufReader::new(stderr);
-            let _ = stderr_reader.read_to_end(&mut err_buf);
-            if !err_buf.is_empty() {
-                for line in String::from_utf8_lossy(&err_buf).lines() {
-                    if !line.is_empty() {
-                        warn!("ffmpeg: {}", line);
-                    }
+        'decode_loop: loop {
+            let nal_data = match rx.recv() {
+                Ok(d) => d,
+                Err(_) => {
+                    info!("Decoder input channel closed");
+                    break 'decode_loop;
                 }
-            }
-        });
+            };
 
-        let frame_tx_clone = frame_tx.clone();
-        let read_handle = std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut frame_buf = vec![0u8; total_size];
-            let mut frame_count = 0u64;
+            let mut parse_offset = 0usize;
+            while parse_offset < nal_data.len() {
+                let mut out_buf: *mut u8 = std::ptr::null_mut();
+                let mut out_size: i32 = 0;
 
-            loop {
-                match reader.read_exact(&mut frame_buf) {
-                    Ok(()) => {
-                        let frame = DecodedFrame {
-                            nv12_data: frame_buf.clone(),
-                            width,
-                            height,
+                let consumed = unsafe {
+                    av_parser_parse2(
+                        parser,
+                        codec_ctx,
+                        &mut out_buf,
+                        &mut out_size,
+                        nal_data[parse_offset..].as_ptr(),
+                        (nal_data.len() - parse_offset) as i32,
+                        -1,
+                        -1,
+                        0,
+                    )
+                };
+
+                if consumed < 0 {
+                    warn!("libavcodec: parser error {}", consumed);
+                    break;
+                }
+                parse_offset += consumed as usize;
+
+                if out_size > 0 && !out_buf.is_null() {
+                    unsafe {
+                        (*pkt).data = out_buf;
+                        (*pkt).size = out_size;
+                    }
+
+                    let send_ret = unsafe { avcodec_send_packet(codec_ctx, pkt) };
+                    if send_ret < 0 {
+                        _decode_err_count += 1;
+                        if _decode_err_count <= 5 {
+                            warn!("libavcodec: send_packet error {}", send_ret);
+                        }
+                        continue;
+                    }
+
+                    // Drain all available frames
+                    loop {
+                        let recv_ret = unsafe { avcodec_receive_frame(codec_ctx, frame) };
+                        if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
+                            break;
+                        }
+                        if recv_ret < 0 {
+                            _decode_err_count += 1;
+                            if _decode_err_count <= 5 {
+                                warn!("libavcodec: receive_frame error {}", recv_ret);
+                            }
+                            break;
+                        }
+
+                        let linesize0 = unsafe { (*frame).linesize[0] } as usize;
+                        let linesize1 = unsafe { (*frame).linesize[1] } as usize;
+                        let data0 = unsafe { (*frame).data[0] };
+                        let data1 = unsafe { (*frame).data[1] };
+                        let fw = unsafe { (*frame).width } as usize;
+                        let fh = unsafe { (*frame).height } as usize;
+
+                        if data0.is_null() || data1.is_null() {
+                            continue;
+                        }
+
+                        let mut nv12 = vec![0u8; total_size];
+
+                        // Copy Y plane (row by row for stride mismatch)
+                        let copy_w = fw.min(stride as usize);
+                        for row in 0..fh {
+                            let src = unsafe {
+                                std::slice::from_raw_parts(data0.add(row * linesize0), copy_w)
+                            };
+                            let dst_start = row * stride as usize;
+                            nv12[dst_start..dst_start + copy_w].copy_from_slice(src);
+                        }
+
+                        // Copy UV plane (NV12: interleaved U/V, half height)
+                        let uv_h = fh / 2;
+                        let uv_copy_w = copy_w.min(stride as usize);
+                        for row in 0..uv_h {
+                            let src = unsafe {
+                                std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w)
+                            };
+                            let dst_start = y_size + row * stride as usize;
+                            nv12[dst_start..dst_start + uv_copy_w].copy_from_slice(src);
+                        }
+
+                        let decoded = DecodedFrame {
+                            nv12_data: nv12,
+                            width: fw as u32,
+                            height: fh as u32,
                             stride,
                             send_ts_us: None,
                             recv_time: None,
                         };
 
-                        if let Err(_) = frame_tx_clone.try_send(frame) {
+                        if frame_tx.try_send(decoded).is_err() {
                             // Queue full, drop frame for low latency
                         }
 
                         frame_count += 1;
                         if frame_count % 30 == 0 {
-                            info!("Decoded {} frames (NV12)", frame_count);
+                            info!("Decoded {} frames (NV12, libavcodec)", frame_count);
                         }
                     }
-                    Err(e) => {
-                        error!(
-                            "ffmpeg stdout read error after {} frames: {}",
-                            frame_count, e
-                        );
-                        break;
+
+                    unsafe {
+                        av_packet_unref(pkt);
                     }
-                }
-            }
-            info!("Read thread exiting after {} frames", frame_count);
-        });
-
-        // Feed H.264 data to ffmpeg stdin.
-        // Writes run in a thread with a timeout to prevent hanging forever
-        // if ffmpeg dies but the pipe isn't fully closed yet.
-        let mut stdin_opt = Some(stdin);
-        loop {
-            let data = match rx.recv() {
-                Ok(d) => d,
-                Err(_) => {
-                    info!("Decoder input channel closed");
-                    break;
-                }
-            };
-
-            let s = match stdin_opt.take() {
-                Some(s) => s,
-                None => break,
-            };
-
-            // Write in a thread so we can enforce a timeout.
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let write_thread = std::thread::spawn(move || {
-                let mut s = s;
-                let result = s.write_all(&data);
-                let _ = done_tx.send(result);
-                s
-            });
-
-            match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(Ok(())) => {
-                    // Write succeeded, reclaim stdin
-                    stdin_opt = write_thread.join().ok();
-                }
-                Ok(Err(e)) => {
-                    warn!("ffmpeg stdin write error: {}", e);
-                    let _ = write_thread.join();
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    warn!("ffmpeg stdin write timed out (5s), killing decoder");
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    warn!("ffmpeg write thread disconnected");
-                    break;
                 }
             }
         }
 
-        drop(stdin_opt);
-        let _ = read_handle.join();
-        let _ = stderr_handle.join();
-        let _ = child.kill();
-        let _ = child.wait();
+        // Cleanup
+        unsafe {
+            av_parser_close(parser);
+            avcodec_free_context(&mut { codec_ctx });
+            av_packet_free(&mut { pkt });
+            av_frame_free(&mut { frame });
+        }
 
         info!(
-            "Restarting ffmpeg decoder (backoff {}ms)...",
-            restart_delay_ms
+            "libavcodec decoder stopped after {} frames, restarting...",
+            frame_count
         );
-        std::thread::sleep(std::time::Duration::from_millis(restart_delay_ms));
-        restart_delay_ms = (restart_delay_ms * 2).min(MAX_RESTART_DELAY_MS);
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

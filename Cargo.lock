@@ -2861,6 +2861,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "libc",
+ "pkg-config",
  "reed-solomon-erasure",
  "serde",
  "serde_json",

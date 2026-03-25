@@ -445,7 +445,8 @@ fn main() -> Result<(), eframe::Error> {
     // Channel for video NAL data: RX dispatcher -> VideoReceiver
     let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
     // Channel for decoded video frames: VideoReceiver -> VideoDecoder
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(32);
+    // Bounded(4) + blocking send forces FEC thread to pace the pipeline naturally
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     // Channel for telemetry JSON: RX dispatcher -> TelemetryReceiver
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
 
@@ -648,9 +649,9 @@ fn rx_dispatcher(
     tracing::info!("RX dispatcher stopped");
 }
 
-/// Heartbeat sender — sends heartbeat packets via raw socket at 1Hz.
+/// Heartbeat sender — sends heartbeat packets via raw socket at 10Hz.
 fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
-    tracing::info!("Heartbeat sender ready (L2 broadcast, 1Hz)");
+    tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
     let mut l2_seq: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
@@ -674,7 +675,7 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
         let _ = socket.send(&frame);
 
         l2_seq = l2_seq.wrapping_add(1);
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -686,14 +687,14 @@ fn heartbeat_monitor(
     last_heartbeat: Arc<Mutex<Instant>>,
     link_state: LinkStateHandle,
 ) {
-    tracing::info!("Heartbeat monitor started (timeout: 3s)");
-    std::thread::sleep(std::time::Duration::from_secs(3)); // initial grace period
+    tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
+    std::thread::sleep(std::time::Duration::from_secs(1)); // initial grace period
 
     while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > std::time::Duration::from_secs(3) {
+        if elapsed > std::time::Duration::from_millis(500) {
             link_state.heartbeat_lost();
         } else {
             link_state.heartbeat_restored();

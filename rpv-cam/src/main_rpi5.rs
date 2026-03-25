@@ -74,18 +74,37 @@ fn main() {
         rx_dispatcher(rx_running, rx_socket, rx_drone_id, rx_last_hb, rx_rc_tx);
     });
 
+    // High-priority TX channel: telemetry/RC/heartbeat preempt video shards
+    let (hp_tx, hp_rx): (
+        crossbeam_channel::Sender<Vec<u8>>,
+        crossbeam_channel::Receiver<Vec<u8>>,
+    ) = crossbeam_channel::unbounded();
+
     // Start video capture and streaming
     let video_running = running.clone();
     let video_socket = Arc::clone(&socket);
     let video_handle = thread::spawn(move || {
-        video_tx::run(video_running, video_socket, config.drone_id, 3_000_000, 10);
+        video_tx::run(
+            video_running,
+            video_socket,
+            config.drone_id,
+            3_000_000,
+            10,
+            Some(hp_rx),
+        );
     });
 
     // Start telemetry sender
     let telem_running = running.clone();
     let telem_socket = Arc::clone(&socket);
     let telem_handle = thread::spawn(move || {
-        telemetry_sender(telem_running, telem_socket, config.drone_id, fc_telem_rx);
+        telemetry_sender(
+            telem_running,
+            telem_socket,
+            config.drone_id,
+            fc_telem_rx,
+            hp_tx,
+        );
     });
 
     // Start heartbeat monitor
@@ -219,18 +238,18 @@ fn rx_dispatcher(
 }
 
 fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant>>) {
-    tracing::info!("Heartbeat monitor started (timeout: 3s)");
-    thread::sleep(Duration::from_secs(3));
+    tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
+    thread::sleep(Duration::from_secs(1));
 
     let mut was_connected = true;
 
     while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(100));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > Duration::from_secs(3) {
+        if elapsed > Duration::from_millis(500) {
             if was_connected {
-                tracing::warn!("Heartbeat lost ({}s)", elapsed.as_secs());
+                tracing::warn!("Heartbeat lost ({}ms)", elapsed.as_millis());
                 write_link_status("searching");
                 was_connected = false;
             }
@@ -262,7 +281,9 @@ fn telemetry_sender(
     socket: Arc<RawSocket>,
     drone_id: u8,
     fc_telem_rx: Option<std::sync::mpsc::Receiver<fc::FcTelemetry>>,
+    hp_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) {
+    let _ = socket; // socket no longer needed — telemetry goes through hp_tx
     let has_fc = fc_telem_rx.is_some();
     if has_fc {
         tracing::info!("Telemetry sender ready (FC telemetry, L2 broadcast)");
@@ -278,7 +299,6 @@ fn telemetry_sender(
     let mut fc_telem = fc::FcTelemetry::default();
     let mut l2_seq: u32 = 0;
     let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
-    let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
@@ -313,7 +333,8 @@ fn telemetry_sender(
                 seq: l2_seq,
             };
             header.encode_into(data.as_bytes(), &mut l2_buf);
-            let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
+            // Enqueue to high-priority TX channel (drained by video_tx before shards)
+            let _ = hp_tx.send(l2_buf.clone());
             l2_seq = l2_seq.wrapping_add(1);
         }
 

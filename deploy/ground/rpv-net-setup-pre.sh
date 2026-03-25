@@ -24,16 +24,23 @@ sleep 0.5
 iw dev "$IFACE" set type monitor
 ip link set "$IFACE" up
 
-# Set target frequency — must match camera's frequency exactly
-FREQ="${RPV_FREQ:-5180}"
+# Set target frequency — 2.4 GHz channel 6 (2437 MHz) for better penetration/range
+FREQ="${RPV_FREQ:-2437}"
 iw dev "$IFACE" set freq "$FREQ"
+
+# Max out TX power (fixed 3000 = 30 dBm)
+iw dev "$IFACE" set txpower fixed 3000 2>/dev/null || true
 
 # Disable power save — critical for latency
 iw dev "$IFACE" set power_save off 2>/dev/null || true
+
+# Bypass Linux socket buffer doubling: set hard ceiling to 8 MB
+sysctl -w net.core.rmem_max=8388608 2>/dev/null || true
+sysctl -w net.core.wmem_max=8388608 2>/dev/null || true
 
 # Set CPU governor to performance
 for gov in /sys/devices/system/cpu/*/cpufreq/scaling_governor; do
     echo performance > "$gov" 2>/dev/null || true
 done
 
-echo "Monitor mode ready on $IFACE @ 5180 MHz"
+echo "Monitor mode ready on $IFACE @ 2437 MHz (2.4 GHz ch6)"
