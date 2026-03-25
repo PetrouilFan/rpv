@@ -85,14 +85,21 @@ fn main() {
     // Start video capture and streaming
     let video_running = running.clone();
     let video_socket = Arc::clone(&socket);
+    let video_width = config.video_width;
+    let video_height = config.video_height;
+    let video_framerate = config.framerate;
+    let video_bitrate = config.bitrate;
     let video_handle = thread::spawn(move || {
         video_tx::run(
             video_running,
             video_socket,
             config.drone_id,
-            3_000_000,
+            video_bitrate,
             10,
             Some(hp_rx),
+            video_width,
+            video_height,
+            video_framerate,
         );
     });
 
@@ -283,18 +290,35 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant
 }
 
 fn check_camera_available() -> bool {
-    if let Ok(output) = std::process::Command::new("vcgencmd")
+    let child = match std::process::Command::new("vcgencmd")
         .arg("get_camera")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(val) = stdout.split("detected=").nth(1) {
-            if let Some(count) = val.split(',').next() {
-                return count.trim().parse::<i32>().unwrap_or(0) > 0;
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Spawn a watchdog that kills vcgencmd after 2s to avoid blocking telemetry
+    let child_id = child.id();
+    let _watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        unsafe { libc::kill(child_id as i32, libc::SIGKILL) };
+    });
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(val) = stdout.split("detected=").nth(1) {
+                if let Some(count) = val.split(',').next() {
+                    return count.trim().parse::<i32>().unwrap_or(0) > 0;
+                }
             }
+            false
         }
+        _ => false,
     }
-    false
 }
 
 /// Telemetry sender — sends FC telemetry (or placeholder) via raw socket.
@@ -323,6 +347,7 @@ fn telemetry_sender(
     let mut l2_seq: u32 = 0;
     // Reusable buffers for send path
     let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
+    let mut json_buf: Vec<u8> = Vec::with_capacity(512);
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
@@ -337,6 +362,8 @@ fn telemetry_sender(
             }
         }
 
+        // Serialize telemetry directly to json_buf (avoids json!() + to_string() allocs)
+        json_buf.clear();
         let telem = serde_json::json!({
             "lat": fc_telem.lat,
             "lon": fc_telem.lon,
@@ -351,15 +378,17 @@ fn telemetry_sender(
             "camera_ok": camera_ok,
         });
 
-        if let Ok(data) = serde_json::to_string(&telem) {
+        if serde_json::to_writer(&mut json_buf, &telem).is_ok() {
             let header = link::L2Header {
                 drone_id,
                 payload_type: link::PAYLOAD_TELEMETRY,
                 seq: l2_seq,
             };
-            header.encode_into(data.as_bytes(), &mut l2_buf);
-            // Enqueue to high-priority TX channel (drained by video_tx before shards)
-            let _ = hp_tx.send(l2_buf.clone());
+            header.encode_into(&json_buf, &mut l2_buf);
+            // Cap pending telemetry to avoid unbounded growth if video stalls
+            if hp_tx.len() <= 10 {
+                let _ = hp_tx.send(l2_buf.clone());
+            }
             l2_seq = l2_seq.wrapping_add(1);
         }
 

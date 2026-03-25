@@ -83,14 +83,21 @@ fn main() {
     // Start video capture and streaming
     let video_running = running.clone();
     let video_socket = Arc::clone(&socket);
+    let video_width = config.video_width;
+    let video_height = config.video_height;
+    let video_framerate = config.framerate;
+    let video_bitrate = config.bitrate;
     let video_handle = thread::spawn(move || {
         video_tx::run(
             video_running,
             video_socket,
             config.drone_id,
-            3_000_000,
+            video_bitrate,
             10,
             Some(hp_rx),
+            video_width,
+            video_height,
+            video_framerate,
         );
     });
 

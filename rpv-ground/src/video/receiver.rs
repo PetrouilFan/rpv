@@ -14,9 +14,6 @@ const VIDEO_HDR_FIXED: usize = 8;
 const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
-/// How long to wait for the next video payload before checking stall timeouts.
-const RECV_TIMEOUT: Duration = Duration::from_millis(50);
-
 /// If no FEC block completes within this window, drop the stalled block.
 const STALL_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -93,9 +90,11 @@ impl VideoReceiver {
         let mut nal_started = false;
 
         loop {
-            let payload = match self.rx.recv_timeout(RECV_TIMEOUT) {
+            // Fast path: drain buffered packets immediately without blocking
+            let payload = match self.rx.try_recv() {
                 Ok(p) => p,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // No data buffered — check stall, then block until data arrives
                     Self::check_stall(
                         &mut blocks,
                         &mut next_block,
@@ -103,9 +102,15 @@ impl VideoReceiver {
                         &mut nal_buf,
                         &mut nal_started,
                     );
-                    continue;
+                    match self.rx.recv() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            info!("Video payload channel closed");
+                            return;
+                        }
+                    }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     info!("Video payload channel closed");
                     return;
                 }
@@ -144,7 +149,9 @@ impl VideoReceiver {
                 next_block = Some(block_seq);
             } else if let Some(current) = next_block {
                 let gap = current.wrapping_sub(block_seq);
-                if gap > 1000 {
+                // Only accept reset if block_seq is AHEAD of current (legit restart,
+                // not a stale packet from a previous session near u32::MAX).
+                if gap > 1000 && block_seq > current {
                     info!(
                         "RS: camera restarted, seq reset {} -> {}",
                         current, block_seq

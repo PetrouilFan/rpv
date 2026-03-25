@@ -193,9 +193,19 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
 }
 
 /// Convert 16-bit channel values (from UDP RC) to RC_CHANNELS_OVERRIDE.
-/// Values of 0 map to UINT16_MAX (ignore), matching the MAVLink spec.
+/// MAVLink RC_CHANNELS_OVERRIDE only supports 8 channels. Values of 0 mean
+/// "release back to RC radio" per the MAVLink spec (used for missing channels).
 fn channels_to_override(channels: &[u16], target_system: u8) -> MavMessage {
     let ch = |i: usize| -> u16 { channels.get(i).copied().unwrap_or(0) };
+    // Warn if aux channels 9-16 have non-neutral values — they are silently dropped
+    if channels.len() > 8 {
+        let has_aux = channels[8..].iter().any(|&c| c != 0 && c != 1500);
+        if has_aux {
+            tracing::warn!(
+                "RC channels 9-16 present but RC_CHANNELS_OVERRIDE only supports 8 — aux channels ignored"
+            );
+        }
+    }
     MavMessage::RC_CHANNELS_OVERRIDE(mavlink::common::RC_CHANNELS_OVERRIDE_DATA {
         chan1_raw: ch(0),
         chan2_raw: ch(1),
@@ -242,32 +252,31 @@ fn write_mavlink(port: &mut dyn Write, header: &mut MavHeader, msg: &MavMessage)
 fn ardupilot_mode_name(custom_mode: u32) -> String {
     // ArduCopter modes (most common for FPV quad)
     match custom_mode {
-        0 => "STABILIZE",
-        1 => "ACRO",
-        2 => "ALT_HOLD",
-        3 => "AUTO",
-        4 => "GUIDED",
-        5 => "LOITER",
-        6 => "RTL",
-        7 => "CIRCLE",
-        9 => "LAND",
-        11 => "DRIFT",
-        13 => "SPORT",
-        14 => "FLIP",
-        15 => "AUTOTUNE",
-        16 => "POSHOLD",
-        17 => "BRAKE",
-        18 => "THROW",
-        19 => "AVOID_ADSB",
-        20 => "GUIDED_NOGPS",
-        21 => "SMART_RTL",
-        22 => "FLOWHOLD",
-        23 => "FOLLOW",
-        24 => "ZIGZAG",
-        25 => "SYSTEMID",
-        26 => "AUTOROTATE",
-        27 => "AUTO_RTL",
-        _ => return format!("MODE({})", custom_mode),
+        0 => String::from("STABILIZE"),
+        1 => String::from("ACRO"),
+        2 => String::from("ALT_HOLD"),
+        3 => String::from("AUTO"),
+        4 => String::from("GUIDED"),
+        5 => String::from("LOITER"),
+        6 => String::from("RTL"),
+        7 => String::from("CIRCLE"),
+        9 => String::from("LAND"),
+        11 => String::from("DRIFT"),
+        13 => String::from("SPORT"),
+        14 => String::from("FLIP"),
+        15 => String::from("AUTOTUNE"),
+        16 => String::from("POSHOLD"),
+        17 => String::from("BRAKE"),
+        18 => String::from("THROW"),
+        19 => String::from("AVOID_ADSB"),
+        20 => String::from("GUIDED_NOGPS"),
+        21 => String::from("SMART_RTL"),
+        22 => String::from("FLOWHOLD"),
+        23 => String::from("FOLLOW"),
+        24 => String::from("ZIGZAG"),
+        25 => String::from("SYSTEMID"),
+        26 => String::from("AUTOROTATE"),
+        27 => String::from("AUTO_RTL"),
+        _ => format!("MODE({})", custom_mode),
     }
-    .to_string()
 }

@@ -10,6 +10,14 @@ pub struct Config {
     pub fc_port: String,
     #[serde(default = "default_fc_baud")]
     pub fc_baud: u32,
+    #[serde(default = "default_video_width")]
+    pub video_width: u32,
+    #[serde(default = "default_video_height")]
+    pub video_height: u32,
+    #[serde(default = "default_framerate")]
+    pub framerate: u32,
+    #[serde(default = "default_bitrate")]
+    pub bitrate: u32,
 }
 
 fn default_interface() -> String {
@@ -28,6 +36,22 @@ fn default_fc_baud() -> u32 {
     115200
 }
 
+fn default_video_width() -> u32 {
+    960
+}
+
+fn default_video_height() -> u32 {
+    540
+}
+
+fn default_framerate() -> u32 {
+    30
+}
+
+fn default_bitrate() -> u32 {
+    3_000_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -35,6 +59,10 @@ impl Default for Config {
             drone_id: default_drone_id(),
             fc_port: default_fc_port(),
             fc_baud: default_fc_baud(),
+            video_width: default_video_width(),
+            video_height: default_video_height(),
+            framerate: default_framerate(),
+            bitrate: default_bitrate(),
         }
     }
 }

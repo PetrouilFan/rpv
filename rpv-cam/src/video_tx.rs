@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reed_solomon_erasure::ReedSolomon;
 
@@ -65,6 +65,9 @@ pub fn run(
     bitrate: u32,
     intra: u32,
     hp_rx: Option<crossbeam_channel::Receiver<Vec<u8>>>,
+    video_width: u32,
+    video_height: u32,
+    framerate: u32,
 ) {
     tracing::info!(
         "Video sender ready (FEC {}+{}, L2 broadcast)",
@@ -87,14 +90,17 @@ pub fn run(
 
         let bitrate_s = bitrate.to_string();
         let intra_s = intra.to_string();
+        let width_s = video_width.to_string();
+        let height_s = video_height.to_string();
+        let framerate_s = framerate.to_string();
         let child = Command::new("rpicam-vid")
             .args(&[
                 "--width",
-                "960",
+                &width_s,
                 "--height",
-                "540",
+                &height_s,
                 "--framerate",
-                "30",
+                &framerate_s,
                 "--codec",
                 "h264",
                 "--profile",
@@ -165,6 +171,10 @@ pub fn run(
         let mut video_payload_buf: Vec<u8> = Vec::with_capacity(VIDEO_HDR_LEN + MAX_SHARD_DATA);
         // Pre-allocated shard arena (zero-alloc padding)
         let mut arena = ShardArena::new();
+        // Pre-allocated FEC shard Vecs (reused across groups to avoid 6 heap allocs per group)
+        let mut fec_shards: Vec<Vec<u8>> = (0..TOTAL_SHARDS)
+            .map(|_| Vec::with_capacity(MAX_SHARD_DATA))
+            .collect();
 
         while running.load(Ordering::SeqCst) {
             match stdout.read(&mut read_buf) {
@@ -245,6 +255,7 @@ pub fn run(
                                         &mut send_buf,
                                         &mut video_payload_buf,
                                         &hp_rx,
+                                        &mut fec_shards,
                                     );
                                     // Reset arena state
                                     shards_in_group = 0;
@@ -271,6 +282,7 @@ pub fn run(
                             &mut send_buf,
                             &mut video_payload_buf,
                             &hp_rx,
+                            &mut fec_shards,
                         );
                     }
 
@@ -287,7 +299,7 @@ pub fn run(
 
                     if extracted_any {
                         nal_idle_cycles = 0;
-                    } else if nal_tail - nal_head >= nal_buf.len() {
+                    } else if nal_tail > nal_head && nal_tail - nal_head > nal_buf.len() / 2 {
                         nal_idle_cycles += 1;
                         if nal_idle_cycles >= NAL_IDLE_LIMIT {
                             tracing::warn!(
@@ -367,8 +379,6 @@ fn extract_next_nal_cursor(buf: &[u8], head: usize, tail: usize) -> Option<(&[u8
     None
 }
 
-const MIN_SEND_INTERVAL: Duration = Duration::from_micros(50);
-
 /// Send an FEC group from pre-allocated arena slots (zero-alloc padding).
 /// Drains high-priority channel (telemetry/RC/heartbeat) before each shard send.
 fn send_fec_group_arena(
@@ -376,7 +386,7 @@ fn send_fec_group_arena(
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
     arena: &ShardArena,
     slot_filled: &[usize; DATA_SHARDS],
-    slot_frag_lens: &[usize; DATA_SHARDS],
+    _slot_frag_lens: &[usize; DATA_SHARDS],
     drone_id: u8,
     fec_block_seq: &mut u32,
     l2_pkt_seq: &mut u32,
@@ -385,12 +395,13 @@ fn send_fec_group_arena(
     send_buf: &mut Vec<u8>,
     video_payload_buf: &mut Vec<u8>,
     hp_rx: &Option<crossbeam_channel::Receiver<Vec<u8>>>,
+    fec_shards: &mut Vec<Vec<u8>>,
 ) {
     // Determine max shard size for RS encoding
     let mut shard_lens = [0usize; DATA_SHARDS];
     let mut max_shard_size = 0usize;
     for i in 0..DATA_SHARDS {
-        shard_lens[i] = slot_filled[i].min(slot_frag_lens[i]);
+        shard_lens[i] = slot_filled[i];
         max_shard_size = max_shard_size.max(slot_filled[i]);
     }
 
@@ -398,28 +409,26 @@ fn send_fec_group_arena(
         return;
     }
 
-    // Build mutable shard Vecs for RS encode (needs Vec<Vec<u8>>)
-    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
+    // Reuse pre-allocated shard Vecs (resize + zero-fill instead of new allocs)
     for i in 0..DATA_SHARDS {
-        // Zero-pad to max_shard_size
-        let mut shard = vec![0u8; max_shard_size];
+        fec_shards[i].resize(max_shard_size, 0);
+        fec_shards[i].fill(0);
         let copy_len = slot_filled[i].min(max_shard_size);
-        shard[..copy_len].copy_from_slice(&arena.slots[i][..copy_len]);
-        shards.push(shard);
+        fec_shards[i][..copy_len].copy_from_slice(&arena.slots[i][..copy_len]);
     }
-    for _ in 0..PARITY_SHARDS {
-        shards.push(vec![0u8; max_shard_size]);
+    for i in DATA_SHARDS..TOTAL_SHARDS {
+        fec_shards[i].resize(max_shard_size, 0);
+        fec_shards[i].fill(0);
     }
 
-    if let Err(e) = rs.encode(&mut shards) {
+    if let Err(e) = rs.encode(&mut *fec_shards) {
         tracing::warn!("Reed-Solomon encode error: {:?}", e);
         return;
     }
 
     let mut group_ok = true;
-    let mut last_send = Instant::now();
 
-    for (i, shard) in shards.iter().enumerate() {
+    for (i, shard) in fec_shards.iter().enumerate() {
         // Drain high-priority packets (telemetry, RC, heartbeat) before this shard
         if let Some(ref hp) = hp_rx {
             while let Ok(hp_frame) = hp.try_recv() {
@@ -427,12 +436,7 @@ fn send_fec_group_arena(
             }
         }
 
-        let elapsed = last_send.elapsed();
-        if elapsed < MIN_SEND_INTERVAL {
-            thread::sleep(MIN_SEND_INTERVAL - elapsed);
-        }
-
-        // Data shards sent at original length, parity at full size
+        // Data shards sent at original length, parity trimmed to max_shard_size
         let send_data = if i < DATA_SHARDS {
             let orig_len = slot_filled[i];
             if orig_len > 0 && orig_len <= shard.len() {
@@ -441,7 +445,7 @@ fn send_fec_group_arena(
                 shard
             }
         } else {
-            shard
+            &shard[..max_shard_size.min(shard.len())]
         };
 
         // Build video header dynamically
@@ -467,7 +471,6 @@ fn send_fec_group_arena(
 
         match socket.send_with_buf(l2_frame_buf, send_buf) {
             Ok(_) => {
-                last_send = Instant::now();
                 *l2_pkt_seq = l2_pkt_seq.wrapping_add(1);
             }
             Err(e) => {

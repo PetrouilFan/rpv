@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -13,10 +14,11 @@ pub struct RCTx {
     drone_id: u8,
     channels: std::sync::Mutex<Vec<u16>>,
     l2_seq: u32,
+    running: Arc<AtomicBool>,
 }
 
 impl RCTx {
-    pub fn new(socket: Arc<RawSocket>, drone_id: u8) -> Self {
+    pub fn new(socket: Arc<RawSocket>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
         Self {
             socket,
             drone_id,
@@ -26,6 +28,7 @@ impl RCTx {
                 ch
             }),
             l2_seq: 0,
+            running,
         }
     }
 
@@ -38,7 +41,7 @@ impl RCTx {
         let mut max_jitter_us: u64 = 0;
         let mut jitter_samples: u64 = 0;
 
-        loop {
+        while self.running.load(Ordering::SeqCst) {
             // Deadline-based scheduling: sleep until the next target time
             let now = Instant::now();
             if now < next_send {

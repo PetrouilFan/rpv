@@ -83,10 +83,10 @@ impl LinkStateMachine {
     }
 
     /// Heartbeat restored -> Connected.
-    /// Overrides any state (Searching, SignalLost, NoCamera).
+    /// Overrides Searching and SignalLost, but NOT NoCamera.
     pub fn heartbeat_restored(&self) {
         let cur = self.state.load(Ordering::SeqCst);
-        if cur != CONNECTED {
+        if cur == SEARCHING || cur == SIGNAL_LOST {
             self.state.store(CONNECTED, Ordering::SeqCst);
             tracing::info!("Link: heartbeat restored -> Connected");
         }

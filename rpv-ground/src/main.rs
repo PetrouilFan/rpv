@@ -501,8 +501,9 @@ fn main() -> Result<(), eframe::Error> {
     // RC joystick thread
     let rc_socket = Arc::clone(&socket);
     let rc_drone_id = config.drone_id;
+    let rc_running = running.clone();
     let _rc_handle = std::thread::spawn(move || {
-        let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id);
+        let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
         rc.run();
     });
 
@@ -653,6 +654,9 @@ fn rx_dispatcher(
 fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
     tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
     let mut l2_seq: u32 = 0;
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(19);
+    let mut l2_buf: Vec<u8> = Vec::with_capacity(link::HEADER_LEN + 19);
+    let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::HEADER_LEN + 19);
 
     while running.load(Ordering::SeqCst) {
         let ts = std::time::SystemTime::now()
@@ -661,18 +665,18 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
             .as_millis() as u64;
 
         // Heartbeat payload: [7B "rpv-bea"][4B seq][8B timestamp]
-        let mut payload = Vec::with_capacity(19);
-        payload.extend_from_slice(b"rpv-bea");
-        payload.extend_from_slice(&l2_seq.to_le_bytes());
-        payload.extend_from_slice(&ts.to_le_bytes());
+        payload_buf.clear();
+        payload_buf.extend_from_slice(b"rpv-bea");
+        payload_buf.extend_from_slice(&l2_seq.to_le_bytes());
+        payload_buf.extend_from_slice(&ts.to_le_bytes());
 
         let header = link::L2Header {
             drone_id,
             payload_type: link::PAYLOAD_HEARTBEAT,
             seq: l2_seq,
         };
-        let frame = header.encode(&payload);
-        let _ = socket.send(&frame);
+        header.encode_into(&payload_buf, &mut l2_buf);
+        let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
 
         l2_seq = l2_seq.wrapping_add(1);
         std::thread::sleep(std::time::Duration::from_millis(100));

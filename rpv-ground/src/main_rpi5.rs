@@ -236,51 +236,64 @@ impl YuvGpuResources {
         let stride = stride as usize;
         let y_size = stride * h;
 
-        let y_data = &nv12_data[..y_size.min(nv12_data.len())];
-        for row in 0..h {
-            let src_start = row * stride;
-            let src_end = src_start + w;
-            if src_end > y_data.len() {
-                break;
-            }
+        if stride == w {
+            // Fast path: stride matches width, upload entire planes in single calls
+            let y_data = &nv12_data[..y_size.min(nv12_data.len())];
             self.queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.y_texture,
                     mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: row as u32,
-                        z: 0,
-                    },
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &y_data[src_start..src_end],
+                y_data,
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(w as u32),
-                    rows_per_image: Some(1),
+                    rows_per_image: Some(h as u32),
                 },
                 wgpu::Extent3d {
                     width: w as u32,
-                    height: 1,
+                    height: h as u32,
                     depth_or_array_layers: 1,
                 },
             );
-        }
 
-        let uv_h = h / 2;
-        let uv_w = w;
-        if y_size < nv12_data.len() {
-            let uv_data = &nv12_data[y_size..];
-            for row in 0..uv_h {
+            let uv_h = h / 2;
+            if y_size < nv12_data.len() {
+                let uv_data = &nv12_data[y_size..y_size + w * uv_h];
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.uv_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    uv_data,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w as u32),
+                        rows_per_image: Some(uv_h as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: w as u32,
+                        height: uv_h as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        } else {
+            // Slow path: stride != width, must copy row by row
+            let y_data = &nv12_data[..y_size.min(nv12_data.len())];
+            for row in 0..h {
                 let src_start = row * stride;
-                let src_end = src_start + uv_w;
-                if src_end > uv_data.len() {
+                let src_end = src_start + w;
+                if src_end > y_data.len() {
                     break;
                 }
                 self.queue.write_texture(
                     wgpu::ImageCopyTexture {
-                        texture: &self.uv_texture,
+                        texture: &self.y_texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d {
                             x: 0,
@@ -289,18 +302,53 @@ impl YuvGpuResources {
                         },
                         aspect: wgpu::TextureAspect::All,
                     },
-                    &uv_data[src_start..src_end],
+                    &y_data[src_start..src_end],
                     wgpu::ImageDataLayout {
                         offset: 0,
-                        bytes_per_row: Some(uv_w as u32),
+                        bytes_per_row: Some(w as u32),
                         rows_per_image: Some(1),
                     },
                     wgpu::Extent3d {
-                        width: uv_w as u32,
+                        width: w as u32,
                         height: 1,
                         depth_or_array_layers: 1,
                     },
                 );
+            }
+
+            let uv_h = h / 2;
+            if y_size < nv12_data.len() {
+                let uv_data = &nv12_data[y_size..];
+                for row in 0..uv_h {
+                    let src_start = row * stride;
+                    let src_end = src_start + w;
+                    if src_end > uv_data.len() {
+                        break;
+                    }
+                    self.queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &self.uv_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: row as u32,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &uv_data[src_start..src_end],
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(w as u32),
+                            rows_per_image: Some(1),
+                        },
+                        wgpu::Extent3d {
+                            width: w as u32,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
         }
     }
@@ -778,8 +826,9 @@ fn main() -> Result<(), eframe::Error> {
 
     let rc_socket = Arc::clone(&socket);
     let rc_drone_id = config.drone_id;
+    let rc_running = running.clone();
     let _rc_handle = std::thread::spawn(move || {
-        let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id);
+        let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
         rc.run();
     });
 
@@ -938,6 +987,9 @@ fn heartbeat_monitor(
 fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
     tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
     let mut l2_seq: u32 = 0;
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(19);
+    let mut l2_buf: Vec<u8> = Vec::with_capacity(link::HEADER_LEN + 19);
+    let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::HEADER_LEN + 19);
 
     while running.load(Ordering::SeqCst) {
         let ts = std::time::SystemTime::now()
@@ -945,18 +997,18 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut payload = Vec::with_capacity(19);
-        payload.extend_from_slice(b"rpv-bea");
-        payload.extend_from_slice(&l2_seq.to_le_bytes());
-        payload.extend_from_slice(&ts.to_le_bytes());
+        payload_buf.clear();
+        payload_buf.extend_from_slice(b"rpv-bea");
+        payload_buf.extend_from_slice(&l2_seq.to_le_bytes());
+        payload_buf.extend_from_slice(&ts.to_le_bytes());
 
         let header = link::L2Header {
             drone_id,
             payload_type: link::PAYLOAD_HEARTBEAT,
             seq: l2_seq,
         };
-        let frame = header.encode(&payload);
-        let _ = socket.send(&frame);
+        header.encode_into(&payload_buf, &mut l2_buf);
+        let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
 
         l2_seq = l2_seq.wrapping_add(1);
         std::thread::sleep(std::time::Duration::from_millis(100));
