@@ -41,6 +41,20 @@ impl RawSocket {
             ));
         }
 
+        // Set socket promiscuous mode
+        let mut mr: libc::packet_mreq = unsafe { std::mem::zeroed() };
+        mr.mr_ifindex = ifindex as i32;
+        mr.mr_type = libc::PACKET_MR_PROMISC;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_PACKET,
+                libc::PACKET_ADD_MEMBERSHIP,
+                &mr as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::packet_mreq>() as libc::socklen_t,
+            );
+        }
+
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_protocol = (libc::ETH_P_ALL.to_be()) as u16;
