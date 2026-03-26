@@ -1,4 +1,4 @@
-use evdev::{Device, DeviceState, AbsCode, KeyCode};
+use evdev::{Device, DeviceState, KeyCode};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -79,6 +79,7 @@ impl GamepadInput {
     }
 
     fn get_axis_value(state: &DeviceState, code: u16) -> Option<i32> {
+        let abs_vals = match state.abs_vals() {
         let abs_vals = state.abs_vals()?;
         if code as usize >= abs_vals.len() {
             return None;
@@ -86,15 +87,15 @@ impl GamepadInput {
         Some(abs_vals[code as usize].value)
     }
 
-    fn read_input(&self, channels: &mut [u16; 16]) {
-        self.device.fetch_events().ok();
+    fn read_input(&mut self, channels: &mut [u16; 16]) {
+        let _ = self.device.fetch_events();
 
         let state = self.device.cached_state();
         
-        let axis_x = Self::get_axis_value(state, 0x00);
-        let axis_y = Self::get_axis_value(state, 0x01);
-        let throttle = Self::get_axis_value(state, 0x02);
-        let axis_rz = Self::get_axis_value(state, 0x03);
+        let axis_x = Self::get_axis_value(&state, 0x00);
+        let axis_y = Self::get_axis_value(&state, 0x01);
+        let throttle = Self::get_axis_value(&state, 0x02);
+        let axis_rz = Self::get_axis_value(&state, 0x03);
 
         channels[0] = Self::axis_to_rc(axis_x, false, false);      
         channels[1] = Self::axis_to_rc(axis_y, true, false);      
@@ -216,7 +217,7 @@ impl RCTx {
 
             next_send = actual + RC_INTERVAL;
 
-            if let Some(ref gp) = self.gamepad {
+            if let Some(ref mut gp) = self.gamepad {
                 let mut channel_buf = [0u16; 16];
                 gp.read_input(&mut channel_buf);
                 
