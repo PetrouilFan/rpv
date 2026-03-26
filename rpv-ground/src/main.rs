@@ -1,4 +1,5 @@
 mod config;
+mod gamepad;
 mod link;
 mod link_state;
 mod rawsock;
@@ -7,9 +8,8 @@ mod video {
     pub mod decoder;
     pub mod receiver;
 }
-pub pub mod rc {
+mod rc {
     pub mod joystick;
-    pub mod gamepad;
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
