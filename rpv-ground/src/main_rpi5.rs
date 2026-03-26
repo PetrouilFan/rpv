@@ -940,32 +940,11 @@ fn rx_dispatcher(
     tracing::info!("RX dispatcher started (raw socket)");
     let mut buf = vec![0u8; 65536];
     let mut reject_count: u64 = 0;
-    let mut total_frames: u64 = 0;
-    let mut loop_count: u64 = 0;
 
-    tracing::info!("Entering RX dispatcher loop");
     while running.load(Ordering::SeqCst) {
-        loop_count += 1;
-        if loop_count == 1 {
-            tracing::info!("RX dispatcher first iteration");
-        }
-        if loop_count % 1000 == 0 {
-            tracing::info!("RX loop: {} iterations", loop_count);
-        }
         let len = match socket.recv(&mut buf) {
-            Ok(0) => {
-                if total_frames == 0 && reject_count == 0 {
-                    tracing::debug!("RX: recv returned 0 (timeout)");
-                }
-                continue;
-            }
-            Ok(n) => {
-                total_frames += 1;
-                if total_frames <= 3 {
-                    tracing::info!("RX: received frame ({}B), first 8 bytes: {:02x?}", n, &buf[..8.min(n)]);
-                }
-                n
-            }
+            Ok(0) => continue,
+            Ok(n) => n,
             Err(e) => {
                 tracing::warn!("RX recv error: {}", e);
                 continue;
@@ -973,12 +952,7 @@ fn rx_dispatcher(
         };
 
         let (payload, frame_rssi) = match rawsock::recv_extract(&buf[..len], reject_count < 10) {
-            Some(p) => {
-                if total_frames <= 3 {
-                    tracing::info!("RX: extracted payload ({}B), first 4 bytes: {:02x?}", p.0.len(), &p.0[..4.min(p.0.len())]);
-                }
-                p
-            },
+            Some(p) => p,
             None => {
                 reject_count += 1;
                 if reject_count <= 5 {
@@ -1028,7 +1002,6 @@ fn rx_dispatcher(
             }
             link::PAYLOAD_HEARTBEAT => {
                 *last_heartbeat.lock().unwrap() = Instant::now();
-                tracing::info!("RX: heartbeat detected");
             }
             _ => {}
         }
