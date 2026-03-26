@@ -252,11 +252,15 @@ impl RawSocket {
         let ret = unsafe { libc::poll(&mut pfd, 1, 100) }; // 100ms timeout
         
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            tracing::debug!("poll() error: {} (errno: {})", err, err.raw_os_error().unwrap_or(0));
+            return Err(err);
         }
         if ret == 0 {
             return Ok(0); // Timeout
         }
+        
+        tracing::debug!("poll() returned {}, revents={}", ret, pfd.revents);
         
         let ret =
             unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
