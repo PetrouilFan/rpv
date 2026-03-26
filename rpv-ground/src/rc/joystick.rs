@@ -79,7 +79,6 @@ impl GamepadInput {
     }
 
     fn get_axis_value(state: &DeviceState, code: u16) -> Option<i32> {
-        let abs_vals = match state.abs_vals() {
         let abs_vals = state.abs_vals()?;
         if code as usize >= abs_vals.len() {
             return None;
