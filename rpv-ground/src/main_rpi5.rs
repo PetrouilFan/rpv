@@ -395,6 +395,7 @@ pub struct RpvApp {
     needs_repaint: bool,
     has_ever_had_frame: bool,
     yuv_gpu: Option<Arc<Mutex<YuvGpuResources>>>,
+    update_logged: bool,
 }
 
 impl RpvApp {
@@ -425,6 +426,7 @@ impl RpvApp {
             needs_repaint: false,
             has_ever_had_frame: false,
             yuv_gpu: None,
+            update_logged: false,
         }
     }
 
@@ -537,6 +539,14 @@ impl eframe::App for RpvApp {
         if !self.state.running.load(Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+
+        if !self.update_logged {
+            tracing::info!(
+                "update() called, wgpu_render_state available: {}",
+                frame.wgpu_render_state().is_some()
+            );
+            self.update_logged = true;
         }
 
         self.ensure_gpu_resources(frame);
