@@ -65,27 +65,33 @@ impl GamepadInput {
             }
         };
 
+        let mut found_path: Option<PathBuf> = None;
+        
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name() {
                 let name_str = name.to_string_lossy();
-                info!("Checking device: {}", name_str);
                 if name_str.starts_with("event") {
                     if let Ok(device) = Device::open(&path) {
-                        info!("Opened device, checking capabilities...");
                         let has_abs = device.supported_absolute_axes().is_some();
                         let has_keys = device.supported_keys().is_some();
-                        info!("  has_abs={}, has_keys={}", has_abs, has_keys);
                         if has_abs && has_keys {
-                            info!("Found gamepad: {}", path.display());
-                            return Some(path);
+                            info!("Found gamepad: {} ({})", path.display(), device.name().unwrap_or_default());
+                            found_path = Some(path);
+                            break;
                         }
                     }
                 }
             }
         }
-        error!("No gamepad device found in /dev/input");
-        None
+
+        match found_path {
+            Some(p) => Some(p),
+            None => {
+                error!("No gamepad device found in /dev/input");
+                None
+            }
+        }
     }
 
     fn get_axis_value(state: &DeviceState, code: u16) -> Option<i32> {
