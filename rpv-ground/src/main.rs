@@ -1,5 +1,4 @@
 mod config;
-mod gamepad;
 mod link;
 mod link_state;
 mod rawsock;
