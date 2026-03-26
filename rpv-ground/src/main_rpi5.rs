@@ -445,13 +445,24 @@ impl RpvApp {
                 self.state.config.video_height,
                 rs.target_format,
             ))));
+        } else {
+            tracing::warn!("wgpu render state not available yet");
         }
     }
 
     fn process_frames(&mut self) -> bool {
         let mut latest = None;
+        let mut recv_count = 0usize;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
+            recv_count += 1;
+        }
+
+        if recv_count > 0 && self.yuv_gpu.is_none() {
+            tracing::warn!(
+                "Received {} frames but GPU resources not initialized",
+                recv_count
+            );
         }
 
         let mut had_frame = false;
