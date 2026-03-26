@@ -940,11 +940,23 @@ fn rx_dispatcher(
     tracing::info!("RX dispatcher started (raw socket)");
     let mut buf = vec![0u8; 65536];
     let mut reject_count: u64 = 0;
+    let mut total_frames: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
-            Ok(0) => continue,
-            Ok(n) => n,
+            Ok(0) => {
+                if total_frames == 0 && reject_count == 0 {
+                    tracing::debug!("RX: recv returned 0 (timeout)");
+                }
+                continue;
+            }
+            Ok(n) => {
+                total_frames += 1;
+                if total_frames <= 3 {
+                    tracing::info!("RX: received frame ({}B), first 8 bytes: {:02x?}", n, &buf[..8.min(n)]);
+                }
+                n
+            }
             Err(e) => {
                 tracing::warn!("RX recv error: {}", e);
                 continue;
