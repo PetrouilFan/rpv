@@ -89,14 +89,14 @@ impl GamepadInput {
         let mut axis_map = self.axes.lock().unwrap();
         let mut button_map = self.buttons.lock().unwrap();
         
-        let events_result = self.device.fetch_events();
-        let Ok(events) = events_result else {
+        let Ok(events) = self.device.fetch_events() else {
             return;
         };
 
-        for event in events.flatten() {
-            match event.destructure() {
-                EventSummary::Abs(_, code, value) => {
+        for event in events {
+            let Ok(evt) = event else { continue; };
+            match evt.destructure() {
+                EventSummary::AbsoluteAxis(_, code, value) => {
                     axis_map.insert(code, value);
                 }
                 EventSummary::Key(_, code, value) => {
