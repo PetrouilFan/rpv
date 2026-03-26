@@ -243,6 +243,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let telem = state.telemetry.lock().unwrap().clone();
 
     egui::Area::new(egui::Id::new("osd_top_left"))
+        .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(10.0, 10.0))
         .show(ui.ctx(), |ui| {
             ui.vertical(|ui| {
@@ -294,31 +295,31 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
 
                 // RSSI display
                 let rssi_val = state.rssi.lock().unwrap().clone();
-                if let Some(rssi_dbm) = rssi_val {
-                    let (rssi_text, rssi_color) = if rssi_dbm >= -50 {
-                        (
-                            format!("SIG: {} dBm (excellent)", rssi_dbm),
-                            egui::Color32::GREEN,
-                        )
-                    } else if rssi_dbm >= -70 {
-                        (
-                            format!("SIG: {} dBm (good)", rssi_dbm),
-                            egui::Color32::from_rgb(100, 255, 100),
-                        )
-                    } else if rssi_dbm >= -80 {
-                        (
-                            format!("SIG: {} dBm (weak)", rssi_dbm),
-                            egui::Color32::YELLOW,
-                        )
-                    } else {
-                        (format!("SIG: {} dBm (poor)", rssi_dbm), egui::Color32::RED)
-                    };
-                    ui.label(egui::RichText::new(rssi_text).size(12.0).color(rssi_color));
-                }
+                let (rssi_text, rssi_color) = match rssi_val {
+                    Some(rssi_dbm) if rssi_dbm >= -50 => (
+                        format!("SIG: {} dBm (excellent)", rssi_dbm),
+                        egui::Color32::GREEN,
+                    ),
+                    Some(rssi_dbm) if rssi_dbm >= -70 => (
+                        format!("SIG: {} dBm (good)", rssi_dbm),
+                        egui::Color32::from_rgb(100, 255, 100),
+                    ),
+                    Some(rssi_dbm) if rssi_dbm >= -80 => (
+                        format!("SIG: {} dBm (weak)", rssi_dbm),
+                        egui::Color32::YELLOW,
+                    ),
+                    Some(rssi_dbm) => (
+                        format!("SIG: {} dBm (poor)", rssi_dbm),
+                        egui::Color32::RED,
+                    ),
+                    None => ("SIG: ---".to_string(), egui::Color32::from_gray(100)),
+                };
+                ui.label(egui::RichText::new(rssi_text).size(12.0).color(rssi_color));
             });
         });
 
     egui::Area::new(egui::Id::new("osd_top_right"))
+        .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(screen.max.x - 170.0, 10.0))
         .show(ui.ctx(), |ui| {
             ui.vertical(|ui| {
@@ -363,6 +364,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         });
 
     egui::Area::new(egui::Id::new("osd_bottom_left"))
+        .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(10.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
             ui.vertical(|ui| {
@@ -380,6 +382,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         });
 
     egui::Area::new(egui::Id::new("osd_bottom_right"))
+        .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(screen.max.x - 210.0, screen.max.y - 70.0))
         .show(ui.ctx(), |ui| {
             ui.vertical(|ui| {
@@ -404,6 +407,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     // Joystick RC channels OSD (middle-bottom)
     let channels = state.channels.lock().unwrap().clone();
     egui::Area::new(egui::Id::new("osd_joystick"))
+        .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(screen.center().x - 150.0, screen.max.y - 90.0))
         .show(ui.ctx(), |ui| {
             ui.vertical(|ui| {
