@@ -1,5 +1,4 @@
-use evdev::{Device, EventSummary, EventType, AbsCode, KeyCode};
-use std::collections::HashMap;
+use evdev::Device;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,8 +16,6 @@ const RC_INTERVAL: Duration = Duration::from_millis(20);
 
 struct GamepadInput {
     device: Device,
-    axes: Arc<std::sync::Mutex<HashMap<AbsCode, i32>>>,
-    buttons: Arc<std::sync::Mutex<HashMap<KeyCode, bool>>>,
 }
 
 impl GamepadInput {
@@ -50,11 +47,7 @@ impl GamepadInput {
         };
 
         info!("Gamepad initialized successfully");
-        Some(Self {
-            device,
-            axes: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            buttons: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        })
+        Some(Self { device })
     }
 
     fn find_gamepad_path() -> Option<PathBuf> {
@@ -74,8 +67,8 @@ impl GamepadInput {
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("event") {
                     if let Ok(device) = Device::open(&path) {
-                        if device.supported_events().contains(EventType::ABS) 
-                            && device.supported_events().contains(EventType::KEY) {
+                        if device.supported_events().contains(evdev::EventType::ABS) 
+                            && device.supported_events().contains(evdev::EventType::KEY) {
                             return Some(path);
                         }
                     }
@@ -86,53 +79,36 @@ impl GamepadInput {
     }
 
     fn read_input(&self, channels: &mut [u16; 16]) {
-        let mut axis_map = self.axes.lock().unwrap();
-        let mut button_map = self.buttons.lock().unwrap();
+        self.device.fetch_events().ok();
+
+        let state = self.device.cached_state();
         
-        let Ok(events) = self.device.fetch_events() else {
-            return;
-        };
+        let axis_x = state.get_abs_value(&evdev::AbsCode(0x00));
+        let axis_y = state.get_abs_value(&evdev::AbsCode(0x01));
+        let throttle = state.get_abs_value(&evdev::AbsCode(0x02));
+        let axis_rz = state.get_abs_value(&evdev::AbsCode(0x03));
 
-        for event in events {
-            let Ok(evt) = event else { continue; };
-            match evt.destructure() {
-                EventSummary::AbsoluteAxis(_, code, value) => {
-                    axis_map.insert(code, value);
-                }
-                EventSummary::Key(_, code, value) => {
-                    button_map.insert(code, value != 0);
-                }
-                _ => {}
-            }
-        }
-
-        drop(axis_map);
-        drop(button_map);
-
-        let axis_map = self.axes.lock().unwrap();
-        let button_map = self.buttons.lock().unwrap();
-
-        channels[0] = Self::axis_to_rc(axis_map.get(&AbsCode(0x00)), false, false);      
-        channels[1] = Self::axis_to_rc(axis_map.get(&AbsCode(0x01)), true, false);      
-        channels[2] = Self::axis_to_rc(axis_map.get(&AbsCode(0x02)), false, true);      
-        channels[3] = Self::axis_to_rc(axis_map.get(&AbsCode(0x03)), false, false);     
+        channels[0] = Self::axis_to_rc(axis_x, false, false);      
+        channels[1] = Self::axis_to_rc(axis_y, true, false);      
+        channels[2] = Self::axis_to_rc(throttle, false, true);      
+        channels[3] = Self::axis_to_rc(axis_rz, false, false);     
         
-        channels[4] = Self::button_to_rc(button_map.get(&KeyCode(0x120)));
-        channels[5] = Self::button_to_rc(button_map.get(&KeyCode(0x121)));             
-        channels[6] = Self::button_to_rc(button_map.get(&KeyCode(0x122)));              
-        channels[7] = Self::button_to_rc(button_map.get(&KeyCode(0x123)));              
-        channels[8] = Self::button_to_rc(button_map.get(&KeyCode(0x124)));             
-        channels[9] = Self::button_to_rc(button_map.get(&KeyCode(0x125)));             
-        channels[10] = Self::button_to_rc(button_map.get(&KeyCode(0x126)));            
-        channels[11] = Self::button_to_rc(button_map.get(&KeyCode(0x127)));            
-        channels[12] = Self::button_to_rc(button_map.get(&KeyCode(0x128)));            
-        channels[13] = Self::button_to_rc(button_map.get(&KeyCode(0x129)));            
-        channels[14] = Self::button_to_rc(button_map.get(&KeyCode(0x12a)));            
-        channels[15] = Self::button_to_rc(button_map.get(&KeyCode(0x12b)));            
+        channels[4] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x120)));
+        channels[5] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x121)));             
+        channels[6] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x122)));              
+        channels[7] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x123)));              
+        channels[8] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x124)));             
+        channels[9] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x125)));             
+        channels[10] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x126)));            
+        channels[11] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x127)));            
+        channels[12] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x128)));            
+        channels[13] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x129)));            
+        channels[14] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x12a)));            
+        channels[15] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x12b)));            
     }
 
-    fn axis_to_rc(axis: Option<&i32>, invert: bool, throttle_mode: bool) -> u16 {
-        let &value = match axis {
+    fn axis_to_rc(axis: Option<i32>, invert: bool, throttle_mode: bool) -> u16 {
+        let value = match axis {
             Some(v) => v,
             None => return RC_MID,
         };
@@ -153,11 +129,8 @@ impl GamepadInput {
         }
     }
 
-    fn button_to_rc(button: Option<&bool>) -> u16 {
-        match button {
-            Some(true) => RC_MAX,
-            _ => RC_MIN,
-        }
+    fn button_to_rc(pressed: bool) -> u16 {
+        if pressed { RC_MAX } else { RC_MIN }
     }
 }
 
