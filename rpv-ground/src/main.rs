@@ -36,6 +36,7 @@ pub struct AppState {
     pub telemetry: Arc<Mutex<Telemetry>>,
     pub running: Arc<AtomicBool>,
     pub rssi: Arc<Mutex<Option<i8>>>,
+    pub channels: Arc<Mutex<Vec<u16>>>,
 }
 
 pub struct RpvApp {
@@ -54,6 +55,7 @@ impl RpvApp {
         running: Arc<AtomicBool>,
         link_state: LinkStateHandle,
         rssi: Arc<Mutex<Option<i8>>>,
+        channels: Arc<Mutex<Vec<u16>>>,
     ) -> Self {
         let w = config.video_width as usize;
         let h = config.video_height as usize;
@@ -70,6 +72,7 @@ impl RpvApp {
                 telemetry,
                 running,
                 rssi,
+                channels,
             },
             frame_rx,
             rgba_buf: vec![0u8; w * h * 4],
@@ -397,6 +400,41 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                 );
             });
         });
+
+    // Joystick RC channels OSD (middle-bottom)
+    let channels = state.channels.lock().unwrap().clone();
+    egui::Area::new(egui::Id::new("osd_joystick"))
+        .fixed_pos(egui::pos2(screen.center().x - 150.0, screen.max.y - 90.0))
+        .show(ui.ctx(), |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("RC").size(12.0).color(egui::Color32::YELLOW),
+                );
+                ui.horizontal(|ui| {
+                    for (i, ch) in channels.iter().enumerate().take(4) {
+                        let normalized = (*ch as f32 - 1000.0) / 1000.0;
+                        let bar_height = 30.0;
+                        let bar_width = 20.0;
+                        let rect = egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::vec2(bar_width, bar_height),
+                        );
+                        ui.advance_cursor_after_rect(egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.max.x + 4.0, rect.max.y),
+                        ));
+                        ui.painter()
+                            .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                        let fill_h = bar_height * normalized.clamp(0.0, 1.0);
+                        let fill_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.min.x, rect.max.y - fill_h),
+                            egui::vec2(bar_width, fill_h),
+                        );
+                        ui.painter().rect_filled(fill_rect, 2.0, egui::Color32::GREEN);
+                    }
+                });
+            });
+        });
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -502,8 +540,9 @@ fn main() -> Result<(), eframe::Error> {
     let rc_socket = Arc::clone(&socket);
     let rc_drone_id = config.drone_id;
     let rc_running = running.clone();
+    let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
+    let channels_shared = rc.channels();
     let _rc_handle = std::thread::spawn(move || {
-        let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
         rc.run();
     });
 
@@ -561,6 +600,7 @@ fn main() -> Result<(), eframe::Error> {
                 app_running,
                 link_state,
                 rssi_shared,
+                channels_shared,
             )))
         }),
     )

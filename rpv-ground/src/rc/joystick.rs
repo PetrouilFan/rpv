@@ -156,7 +156,7 @@ impl GamepadInput {
 pub struct RCTx {
     socket: Arc<RawSocket>,
     drone_id: u8,
-    channels: std::sync::Mutex<Vec<u16>>,
+    channels: Arc<std::sync::Mutex<Vec<u16>>>,
     gamepad: Option<GamepadInput>,
     l2_seq: u32,
     running: Arc<AtomicBool>,
@@ -175,15 +175,19 @@ impl RCTx {
         Self {
             socket,
             drone_id,
-            channels: std::sync::Mutex::new({
+            channels: Arc::new(std::sync::Mutex::new({
                 let mut ch = vec![1500u16; 16];
                 ch[2] = 1000;
                 ch
-            }),
+            })),
             gamepad,
             l2_seq: 0,
             running,
         }
+    }
+
+    pub fn channels(&self) -> Arc<std::sync::Mutex<Vec<u16>>> {
+        Arc::clone(&self.channels)
     }
 
     pub fn run(&mut self) {
