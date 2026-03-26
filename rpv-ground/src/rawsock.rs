@@ -242,15 +242,26 @@ impl RawSocket {
 
     /// Receive a raw frame. Returns bytes read or 0 on timeout.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Use poll to check if data is available
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        
+        let ret = unsafe { libc::poll(&mut pfd, 1, 100) }; // 100ms timeout
+        
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Ok(0); // Timeout
+        }
+        
         let ret =
             unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
-                Ok(0)
-            } else {
-                Err(err)
-            }
+            Err(io::Error::last_os_error())
         } else {
             Ok(ret as usize)
         }
