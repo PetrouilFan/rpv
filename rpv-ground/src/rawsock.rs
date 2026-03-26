@@ -44,7 +44,7 @@ impl RawSocket {
         // Set socket promiscuous mode
         let mut mr: libc::packet_mreq = unsafe { std::mem::zeroed() };
         mr.mr_ifindex = ifindex as i32;
-        mr.mr_type = libc::PACKET_MR_PROMISC;
+        mr.mr_type = libc::PACKET_MR_PROMISC as u16;
         unsafe {
             libc::setsockopt(
                 fd,
