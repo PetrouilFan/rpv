@@ -7,9 +7,9 @@ mod video {
     pub mod decoder;
     pub mod receiver;
 }
-mod gamepad;
-mod rc {
+pub pub mod rc {
     pub mod joystick;
+    pub mod gamepad;
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};

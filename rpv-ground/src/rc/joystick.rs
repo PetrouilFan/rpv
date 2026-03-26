@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-use crate::gamepad::GamepadInput;
+use super::gamepad::GamepadInput;
 use crate::link;
 use crate::rawsock::RawSocket;
 
