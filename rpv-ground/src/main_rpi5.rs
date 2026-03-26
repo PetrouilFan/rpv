@@ -458,6 +458,43 @@ impl RpvApp {
             recv_count += 1;
         }
 
+        if recv_count > 0 {
+            if self.yuv_gpu.is_some() {
+                tracing::info!("process_frames: received {} frames, GPU ready", recv_count);
+            } else {
+                tracing::warn!("process_frames: received {} frames but GPU resources NOT initialized (yuv_gpu=None)", recv_count);
+            }
+        }
+
+        let mut had_frame = false;
+        if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
+            let h = frame.height as usize;
+            let stride = frame.stride as usize;
+            let y_size = stride * h;
+            let uv_size = stride * h / 2;
+
+            if frame.nv12_data.len() >= y_size + uv_size {
+                let res = gpu.lock().unwrap();
+                res.upload(&frame.nv12_data, frame.stride);
+                drop(res);
+
+                self.state.frame_count += 1;
+                self.state.last_frame_time = Instant::now();
+
+                if self.state.frame_count == 30 {
+                    self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
+                    self.state.frame_count = 0;
+                    self.state.fps_timer = Instant::now();
+                }
+
+                self.state.link_state.video_frame_decoded();
+                self.has_ever_had_frame = true;
+                had_frame = true;
+            }
+        }
+        had_frame
+    }
+
         if recv_count > 0 && self.yuv_gpu.is_none() {
             tracing::warn!(
                 "Received {} frames but GPU resources not initialized",
