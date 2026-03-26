@@ -7,6 +7,7 @@ mod video {
     pub mod decoder;
     pub mod receiver;
 }
+mod gamepad;
 mod rc {
     pub mod joystick;
 }

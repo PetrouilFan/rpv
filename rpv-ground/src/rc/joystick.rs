@@ -3,30 +3,40 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+use crate::gamepad::GamepadInput;
 use crate::link;
 use crate::rawsock::RawSocket;
 
-/// Target RC transmission interval (50Hz = 20ms).
 const RC_INTERVAL: Duration = Duration::from_millis(20);
 
 pub struct RCTx {
     socket: Arc<RawSocket>,
     drone_id: u8,
     channels: std::sync::Mutex<Vec<u16>>,
+    gamepad: Option<GamepadInput>,
     l2_seq: u32,
     running: Arc<AtomicBool>,
 }
 
 impl RCTx {
     pub fn new(socket: Arc<RawSocket>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
+        let gamepad = GamepadInput::auto_detect();
+        
+        if gamepad.is_some() {
+            info!("Gamepad input enabled");
+        } else {
+            info!("No gamepad detected, using safe defaults");
+        }
+
         Self {
             socket,
             drone_id,
             channels: std::sync::Mutex::new({
                 let mut ch = vec![1500u16; 16];
-                ch[2] = 1000; // throttle low on init (safety critical)
+                ch[2] = 1000;
                 ch
             }),
+            gamepad,
             l2_seq: 0,
             running,
         }
@@ -42,13 +52,11 @@ impl RCTx {
         let mut jitter_samples: u64 = 0;
 
         while self.running.load(Ordering::SeqCst) {
-            // Deadline-based scheduling: sleep until the next target time
             let now = Instant::now();
             if now < next_send {
                 std::thread::sleep(next_send - now);
             }
 
-            // Track scheduling jitter
             let actual = Instant::now();
             let slip = actual.duration_since(next_send);
             if slip.as_micros() > 0 {
@@ -67,8 +75,19 @@ impl RCTx {
                 }
             }
 
-            // Schedule next send based on absolute deadline, not relative sleep
             next_send = actual + RC_INTERVAL;
+
+            if let Some(ref gp) = self.gamepad {
+                let mut channel_buf = [0u16; 16];
+                gp.read_input(&mut channel_buf);
+                
+                let mut channels = self.channels.lock().unwrap();
+                for (i, ch) in channel_buf.iter().enumerate() {
+                    if i < channels.len() {
+                        channels[i] = *ch;
+                    }
+                }
+            }
 
             let channels = {
                 let locked = self.channels.lock().unwrap();
