@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::link;
 use crate::rawsock::RawSocket;
@@ -53,29 +53,38 @@ impl GamepadInput {
     fn find_gamepad_path() -> Option<PathBuf> {
         let dev_path = PathBuf::from("/dev/input");
         if !dev_path.exists() {
+            error!("/dev/input doesn't exist");
             return None;
         }
 
         let entries = match std::fs::read_dir(dev_path) {
             Ok(e) => e,
-            Err(_) => return None,
+            Err(e) => {
+                error!("Failed to read /dev/input: {}", e);
+                return None;
+            }
         };
 
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name() {
                 let name_str = name.to_string_lossy();
+                info!("Checking device: {}", name_str);
                 if name_str.starts_with("event") {
                     if let Ok(device) = Device::open(&path) {
+                        info!("Opened device, checking capabilities...");
                         let has_abs = device.supported_absolute_axes().is_some();
                         let has_keys = device.supported_keys().is_some();
+                        info!("  has_abs={}, has_keys={}", has_abs, has_keys);
                         if has_abs && has_keys {
+                            info!("Found gamepad: {}", path.display());
                             return Some(path);
                         }
                     }
                 }
             }
         }
+        error!("No gamepad device found in /dev/input");
         None
     }
 
