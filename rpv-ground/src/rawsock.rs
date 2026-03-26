@@ -7,7 +7,6 @@
 use std::io;
 
 const IEEE80211_HDR_LEN: usize = 24;
-const L2_MAGIC: [u8; 2] = [0x52, 0x50]; // "RP" magic bytes
 
 pub struct RawSocket {
     fd: i32,
@@ -26,8 +25,8 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // Attach BPF filter to reject non-data frames early (reduces CPU load)
-        Self::attach_bpf_filter(fd)?;
+        // Attach BPF filter to accept all packets (kernel filtering infrastructure kept for future use)
+        let _ = Self::try_attach_bpf_filter(fd);
 
         let iface_c = std::ffi::CString::new(iface)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface name"))?;
@@ -100,7 +99,7 @@ impl RawSocket {
         Ok(Self { fd })
     }
 
-    fn attach_bpf_filter(fd: i32) -> io::Result<()> {
+    fn try_attach_bpf_filter(fd: i32) -> io::Result<()> {
         // BPF filter to accept only 802.11 data frames with our magic bytes
         // This runs in kernel space, dramatically reducing userspace CPU load
         //
