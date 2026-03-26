@@ -551,21 +551,14 @@ impl eframe::App for RpvApp {
                     );
 
                     // GPU YUV→RGB via egui PaintCallback
-                    // Draw video in a background layer so OSD is always on top
+                    // Draw directly in the CentralPanel (no Area wrapper) so the
+                    // video renders in the correct sequence relative to the OSD.
                     if let Some(ref gpu) = self.yuv_gpu {
                         let callback = YuvRenderCallback {
                             resources: gpu.clone(),
                         };
                         let paint_cb = egui_wgpu::Callback::new_paint_callback(rect, callback);
-                        // Use egui::Area with Background order to ensure video is drawn first
-                        egui::Area::new(egui::Id::new("video_layer"))
-                            .order(egui::Order::Background)
-                            .interactable(false)
-                            .fixed_pos(rect.min)
-                            .show(ui.ctx(), |ui| {
-                                ui.set_min_size(rect.size());
-                                ui.painter().add(paint_cb);
-                            });
+                        ui.painter().add(paint_cb);
                     }
                 } else {
                     ui.painter().rect_filled(
@@ -596,203 +589,195 @@ impl eframe::App for RpvApp {
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
     let telem = state.telemetry.lock().unwrap().clone();
+    let p = ui.painter();
 
-    egui::Area::new(egui::Id::new("osd_top_left"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(10.0, 10.0))
-        .show(ui.ctx(), |ui| {
-            ui.vertical(|ui| {
-                let (label, color, show_dot) = match state.link_status {
-                    LinkStatus::Connected => ("LINK OK", egui::Color32::GREEN, true),
-                    LinkStatus::Searching => ("SEARCHING", egui::Color32::YELLOW, false),
-                    LinkStatus::SignalLost => ("SIGNAL LOST", egui::Color32::RED, false),
-                    LinkStatus::NoCamera => {
-                        ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false)
-                    }
-                };
+    // ── Top-left: link status, FPS, RSSI ──
+    let mut y = 10.0;
 
-                ui.horizontal(|ui| {
-                    if show_dot {
-                        let dot_size = 10.0;
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(dot_size, dot_size),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter()
-                            .circle_filled(rect.center(), dot_size / 2.0, color);
-                    } else {
-                        let t = ui.ctx().input(|i| i.time);
-                        let blink = (t * 2.0) as u64 % 2 == 0;
-                        if blink {
-                            let dot_size = 10.0;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(dot_size, dot_size),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter()
-                                .circle_filled(rect.center(), dot_size / 2.0, color);
-                        } else {
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        }
-                    }
-                    ui.label(egui::RichText::new(label).size(14.0).color(color));
-                });
+    let (label, color, show_dot) = match state.link_status {
+        LinkStatus::Connected => ("LINK OK", egui::Color32::GREEN, true),
+        LinkStatus::Searching => ("SEARCHING", egui::Color32::YELLOW, false),
+        LinkStatus::SignalLost => ("SIGNAL LOST", egui::Color32::RED, false),
+        LinkStatus::NoCamera => ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false),
+    };
 
-                let fps_color = match state.link_status {
-                    LinkStatus::Connected => egui::Color32::from_gray(200),
-                    _ => egui::Color32::from_gray(100),
-                };
-                ui.label(
-                    egui::RichText::new(format!("FPS: {:.1}", state.fps))
-                        .size(12.0)
-                        .color(fps_color),
-                );
+    // Blinking dot
+    let dot_visible = if show_dot {
+        true
+    } else {
+        let t = ui.ctx().input(|i| i.time);
+        (t * 2.0) as u64 % 2 == 0
+    };
+    if dot_visible {
+        p.circle_filled(egui::pos2(15.0, y + 7.0), 5.0, color);
+    }
 
-                let rssi_val = state.rssi.lock().unwrap().clone();
-                let (rssi_text, rssi_color) = match rssi_val {
-                    Some(rssi_dbm) if rssi_dbm >= -50 => (
-                        format!("SIG: {} dBm (excellent)", rssi_dbm),
-                        egui::Color32::GREEN,
-                    ),
-                    Some(rssi_dbm) if rssi_dbm >= -70 => (
-                        format!("SIG: {} dBm (good)", rssi_dbm),
-                        egui::Color32::from_rgb(100, 255, 100),
-                    ),
-                    Some(rssi_dbm) if rssi_dbm >= -80 => (
-                        format!("SIG: {} dBm (weak)", rssi_dbm),
-                        egui::Color32::YELLOW,
-                    ),
-                    Some(rssi_dbm) => (
-                        format!("SIG: {} dBm (poor)", rssi_dbm),
-                        egui::Color32::RED,
-                    ),
-                    None => ("SIG: ---".to_string(), egui::Color32::from_gray(100)),
-                };
-                ui.label(egui::RichText::new(rssi_text).size(12.0).color(rssi_color));
-            });
-        });
+    p.text(
+        egui::pos2(26.0, y),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(14.0),
+        color,
+    );
+    y += 20.0;
 
-    egui::Area::new(egui::Id::new("osd_top_right"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(screen.max.x - 170.0, 10.0))
-        .show(ui.ctx(), |ui| {
-            ui.vertical(|ui| {
-                let pct = telem.battery_pct as f32;
-                let bar_color = if pct > 30.0 {
-                    egui::Color32::from_rgb(0, 200, 0)
-                } else if pct > 15.0 {
-                    egui::Color32::YELLOW
-                } else {
-                    egui::Color32::RED
-                };
+    let fps_color = match state.link_status {
+        LinkStatus::Connected => egui::Color32::from_gray(200),
+        _ => egui::Color32::from_gray(100),
+    };
+    p.text(
+        egui::pos2(10.0, y),
+        egui::Align2::LEFT_TOP,
+        format!("FPS: {:.1}", state.fps),
+        egui::FontId::proportional(12.0),
+        fps_color,
+    );
+    y += 16.0;
 
-                let bar_width = 120.0;
-                let bar_height = 14.0;
-                let rect =
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(bar_width, bar_height));
-                ui.advance_cursor_after_rect(rect);
+    let rssi_val = state.rssi.lock().unwrap().clone();
+    let (rssi_text, rssi_color) = match rssi_val {
+        Some(dbm) if dbm >= -50 => (
+            format!("SIG: {} dBm (excellent)", dbm),
+            egui::Color32::GREEN,
+        ),
+        Some(dbm) if dbm >= -70 => (
+            format!("SIG: {} dBm (good)", dbm),
+            egui::Color32::from_rgb(100, 255, 100),
+        ),
+        Some(dbm) if dbm >= -80 => (format!("SIG: {} dBm (weak)", dbm), egui::Color32::YELLOW),
+        Some(dbm) => (format!("SIG: {} dBm (poor)", dbm), egui::Color32::RED),
+        None => ("SIG: ---".to_string(), egui::Color32::from_gray(100)),
+    };
+    p.text(
+        egui::pos2(10.0, y),
+        egui::Align2::LEFT_TOP,
+        rssi_text,
+        egui::FontId::proportional(12.0),
+        rssi_color,
+    );
 
-                ui.painter()
-                    .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
-                let fill_width = (bar_width * pct / 100.0).max(0.0);
-                let fill_rect =
-                    egui::Rect::from_min_size(rect.min, egui::vec2(fill_width, bar_height));
-                ui.painter().rect_filled(fill_rect, 2.0, bar_color);
+    // ── Top-right: battery bar + voltage + mode ──
+    let right_x = screen.max.x - 10.0;
+    let mut y = 10.0;
 
-                ui.label(
-                    egui::RichText::new(format!("{:.1}V  {}%", telem.battery_v, telem.battery_pct))
-                        .size(12.0)
-                        .color(egui::Color32::WHITE),
-                );
+    let pct = telem.battery_pct as f32;
+    let bar_color = if pct > 30.0 {
+        egui::Color32::from_rgb(0, 200, 0)
+    } else if pct > 15.0 {
+        egui::Color32::YELLOW
+    } else {
+        egui::Color32::RED
+    };
 
-                ui.label(
-                    egui::RichText::new(format!("MODE: {}", telem.mode))
-                        .size(12.0)
-                        .color(if telem.armed {
-                            egui::Color32::from_rgb(255, 100, 100)
-                        } else {
-                            egui::Color32::from_rgb(100, 255, 100)
-                        }),
-                );
-            });
-        });
+    let bar_width = 120.0;
+    let bar_height = 14.0;
+    let bar_rect = egui::Rect::from_min_size(
+        egui::pos2(right_x - bar_width, y),
+        egui::vec2(bar_width, bar_height),
+    );
+    p.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(40));
+    let fill_width = (bar_width * pct / 100.0).max(0.0);
+    let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_width, bar_height));
+    p.rect_filled(fill_rect, 2.0, bar_color);
+    y += bar_height + 4.0;
 
-    egui::Area::new(egui::Id::new("osd_bottom_left"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(10.0, screen.max.y - 70.0))
-        .show(ui.ctx(), |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("SPD: {:.1} m/s", telem.speed))
-                        .size(16.0)
-                        .color(egui::Color32::WHITE),
-                );
-                ui.label(
-                    egui::RichText::new(format!("ALT: {:.1} m", telem.alt))
-                        .size(16.0)
-                        .color(egui::Color32::WHITE),
-                );
-            });
-        });
+    p.text(
+        egui::pos2(right_x, y),
+        egui::Align2::RIGHT_TOP,
+        format!("{:.1}V  {}%", telem.battery_v, telem.battery_pct),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+    y += 16.0;
 
-    egui::Area::new(egui::Id::new("osd_bottom_right"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(screen.max.x - 210.0, screen.max.y - 70.0))
-        .show(ui.ctx(), |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("HDG: {:.0}deg", telem.heading))
-                        .size(16.0)
-                        .color(egui::Color32::WHITE),
-                );
-                ui.label(
-                    egui::RichText::new(format!("SAT: {}", telem.satellites))
-                        .size(14.0)
-                        .color(egui::Color32::WHITE),
-                );
-                ui.label(
-                    egui::RichText::new(format!("{:.6}, {:.6}", telem.lat, telem.lon))
-                        .size(11.0)
-                        .color(egui::Color32::from_gray(180)),
-                );
-            });
-        });
+    let mode_color = if telem.armed {
+        egui::Color32::from_rgb(255, 100, 100)
+    } else {
+        egui::Color32::from_rgb(100, 255, 100)
+    };
+    p.text(
+        egui::pos2(right_x, y),
+        egui::Align2::RIGHT_TOP,
+        format!("MODE: {}", telem.mode),
+        egui::FontId::proportional(12.0),
+        mode_color,
+    );
 
-    // Joystick RC channels OSD (middle-bottom)
+    // ── Bottom-left: speed + altitude ──
+    let mut y = screen.max.y - 70.0;
+    p.text(
+        egui::pos2(10.0, y),
+        egui::Align2::LEFT_TOP,
+        format!("SPD: {:.1} m/s", telem.speed),
+        egui::FontId::proportional(16.0),
+        egui::Color32::WHITE,
+    );
+    y += 22.0;
+    p.text(
+        egui::pos2(10.0, y),
+        egui::Align2::LEFT_TOP,
+        format!("ALT: {:.1} m", telem.alt),
+        egui::FontId::proportional(16.0),
+        egui::Color32::WHITE,
+    );
+
+    // ── Bottom-right: heading, satellites, GPS ──
+    let right_x = screen.max.x - 10.0;
+    let mut y = screen.max.y - 70.0;
+    p.text(
+        egui::pos2(right_x, y),
+        egui::Align2::RIGHT_TOP,
+        format!("HDG: {:.0}deg", telem.heading),
+        egui::FontId::proportional(16.0),
+        egui::Color32::WHITE,
+    );
+    y += 22.0;
+    p.text(
+        egui::pos2(right_x, y),
+        egui::Align2::RIGHT_TOP,
+        format!("SAT: {}", telem.satellites),
+        egui::FontId::proportional(14.0),
+        egui::Color32::WHITE,
+    );
+    y += 18.0;
+    p.text(
+        egui::pos2(right_x, y),
+        egui::Align2::RIGHT_TOP,
+        format!("{:.6}, {:.6}", telem.lat, telem.lon),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_gray(180),
+    );
+
+    // ── Center-bottom: RC channel bars ──
     let channels = state.channels.lock().unwrap().clone();
-    egui::Area::new(egui::Id::new("osd_joystick"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(screen.center().x - 150.0, screen.max.y - 90.0))
-        .show(ui.ctx(), |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("RC").size(12.0).color(egui::Color32::YELLOW),
-                );
-                ui.horizontal(|ui| {
-                    for (_i, ch) in channels.iter().enumerate().take(4) {
-                        let normalized = (*ch as f32 - 1000.0) / 1000.0;
-                        let bar_height = 30.0;
-                        let bar_width = 20.0;
-                        let rect = egui::Rect::from_min_size(
-                            ui.cursor().min,
-                            egui::vec2(bar_width, bar_height),
-                        );
-                        ui.advance_cursor_after_rect(egui::Rect::from_min_max(
-                            rect.min,
-                            egui::pos2(rect.max.x + 4.0, rect.max.y),
-                        ));
-                        ui.painter()
-                            .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
-                        let fill_h = bar_height * normalized.clamp(0.0, 1.0);
-                        let fill_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.min.x, rect.max.y - fill_h),
-                            egui::vec2(bar_width, fill_h),
-                        );
-                        ui.painter().rect_filled(fill_rect, 2.0, egui::Color32::GREEN);
-                    }
-                });
-            });
-        });
+    let bar_width = 20.0;
+    let bar_height = 30.0;
+    let bar_gap = 4.0;
+    let total_width = 4.0 * bar_width + 3.0 * bar_gap;
+    let start_x = screen.center().x - total_width / 2.0;
+    let bars_y = screen.max.y - 90.0;
+
+    p.text(
+        egui::pos2(screen.center().x, bars_y - 14.0),
+        egui::Align2::CENTER_TOP,
+        "RC",
+        egui::FontId::proportional(12.0),
+        egui::Color32::YELLOW,
+    );
+
+    for (i, ch) in channels.iter().enumerate().take(4) {
+        let normalized = (*ch as f32 - 1000.0) / 1000.0;
+        let x = start_x + i as f32 * (bar_width + bar_gap);
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(x, bars_y), egui::vec2(bar_width, bar_height));
+        p.rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+        let fill_h = bar_height * normalized.clamp(0.0, 1.0);
+        let fill_rect = egui::Rect::from_min_size(
+            egui::pos2(x, bars_y + bar_height - fill_h),
+            egui::vec2(bar_width, fill_h),
+        );
+        p.rect_filled(fill_rect, 2.0, egui::Color32::GREEN);
+    }
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -903,7 +888,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Fifo,
             device_descriptor: std::sync::Arc::new(|_adapter| {
                 let limits = wgpu::Limits {
                     max_texture_dimension_1d: 4096,
