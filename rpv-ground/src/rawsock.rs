@@ -26,7 +26,7 @@ impl RawSocket {
         }
 
         // Attach BPF filter to accept all packets (kernel filtering infrastructure kept for future use)
-        let _ = Self::try_attach_bpf_filter(fd);
+        // let _ = Self::try_attach_bpf_filter(fd);
 
         let iface_c = std::ffi::CString::new(iface)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface name"))?;
