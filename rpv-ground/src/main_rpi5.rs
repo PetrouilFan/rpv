@@ -778,7 +778,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let link_state = LinkStateHandle::new();
 
-    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
     let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
 
@@ -951,10 +951,14 @@ fn rx_dispatcher(
 
         match header.payload_type {
             link::PAYLOAD_VIDEO => {
-                let _ = video_tx.try_send(data.to_vec());
+                if video_tx.try_send(data.to_vec()).is_err() {
+                    tracing::warn!("Video queue dropped (backpressure)");
+                }
             }
             link::PAYLOAD_TELEMETRY => {
-                let _ = telem_tx.try_send(data.to_vec());
+                if telem_tx.try_send(data.to_vec()).is_err() {
+                    tracing::warn!("Telemetry queue dropped");
+                }
             }
             link::PAYLOAD_HEARTBEAT => {
                 *last_heartbeat.lock().unwrap() = Instant::now();
@@ -972,13 +976,18 @@ fn heartbeat_monitor(
     tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
     std::thread::sleep(std::time::Duration::from_secs(1));
 
+    let mut ever_connected = false;
+
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let elapsed = last_heartbeat.lock().unwrap().elapsed();
         if elapsed > std::time::Duration::from_millis(500) {
-            link_state.heartbeat_lost();
+            if ever_connected {
+                link_state.heartbeat_lost();
+            }
         } else {
+            ever_connected = true;
             link_state.heartbeat_restored();
         }
     }

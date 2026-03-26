@@ -369,7 +369,7 @@ fn extract_next_nal_cursor(buf: &[u8], head: usize, tail: usize) -> Option<(&[u8
             let is_sc4 = data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1;
             let is_sc3 = data[i + 2] == 1;
             if is_sc4 || is_sc3 {
-                let nal = &data[nal_start..i];
+                let nal = &data[sc1..i];
                 let consumed = i;
                 return Some((nal, consumed));
             }
