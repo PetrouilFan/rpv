@@ -1,4 +1,4 @@
-use evdev::Device;
+use evdev::{Device, DeviceState, AbsCode, KeyCode};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -83,28 +83,31 @@ impl GamepadInput {
 
         let state = self.device.cached_state();
         
-        let axis_x = state.get_abs_value(&evdev::AbsCode(0x00));
-        let axis_y = state.get_abs_value(&evdev::AbsCode(0x01));
-        let throttle = state.get_abs_value(&evdev::AbsCode(0x02));
-        let axis_rz = state.get_abs_value(&evdev::AbsCode(0x03));
+        let axis_x = state.abs_vals().get(&AbsCode(0x00)).copied();
+        let axis_y = state.abs_vals().get(&AbsCode(0x01)).copied();
+        let throttle = state.abs_vals().get(&AbsCode(0x02)).copied();
+        let axis_rz = state.abs_vals().get(&AbsCode(0x03)).copied();
 
         channels[0] = Self::axis_to_rc(axis_x, false, false);      
         channels[1] = Self::axis_to_rc(axis_y, true, false);      
         channels[2] = Self::axis_to_rc(throttle, false, true);      
         channels[3] = Self::axis_to_rc(axis_rz, false, false);     
         
-        channels[4] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x120)));
-        channels[5] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x121)));             
-        channels[6] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x122)));              
-        channels[7] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x123)));              
-        channels[8] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x124)));             
-        channels[9] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x125)));             
-        channels[10] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x126)));            
-        channels[11] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x127)));            
-        channels[12] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x128)));            
-        channels[13] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x129)));            
-        channels[14] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x12a)));            
-        channels[15] = Self::button_to_rc(state.get_key_value(&evdev::KeyCode(0x12b)));            
+        let keys = state.key_vals();
+        let keys = keys.as_ref().unwrap();
+        
+        channels[4] = Self::button_to_rc(keys.contains(KeyCode(0x120)));
+        channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));             
+        channels[6] = Self::button_to_rc(keys.contains(KeyCode(0x122)));              
+        channels[7] = Self::button_to_rc(keys.contains(KeyCode(0x123)));              
+        channels[8] = Self::button_to_rc(keys.contains(KeyCode(0x124)));             
+        channels[9] = Self::button_to_rc(keys.contains(KeyCode(0x125)));             
+        channels[10] = Self::button_to_rc(keys.contains(KeyCode(0x126)));            
+        channels[11] = Self::button_to_rc(keys.contains(KeyCode(0x127)));            
+        channels[12] = Self::button_to_rc(keys.contains(KeyCode(0x128)));            
+        channels[13] = Self::button_to_rc(keys.contains(KeyCode(0x129)));            
+        channels[14] = Self::button_to_rc(keys.contains(KeyCode(0x12a)));            
+        channels[15] = Self::button_to_rc(keys.contains(KeyCode(0x12b)));            
     }
 
     fn axis_to_rc(axis: Option<i32>, invert: bool, throttle_mode: bool) -> u16 {
