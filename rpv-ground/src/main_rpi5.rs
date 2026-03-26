@@ -557,10 +557,10 @@ impl eframe::App for RpvApp {
                         };
                         let paint_cb = egui_wgpu::Callback::new_paint_callback(rect, callback);
                         // Use background layer so video is always behind UI
-                        ui.painter().with_layer_id(
-                            egui::LayerId::new(egui::Order::Background, egui::Id::new("video_yuv")),
-                            |p| { p.add(paint_cb); }
-                        );
+                        let bg_layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("video_yuv"));
+                        let mut painter = ui.painter().clone();
+                        painter.set_layer_id(bg_layer);
+                        painter.add(paint_cb);
                     }
                 } else {
                     ui.painter().rect_filled(
