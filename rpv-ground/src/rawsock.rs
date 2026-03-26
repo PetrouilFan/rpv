@@ -314,6 +314,7 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
     let hdr_len = ieee80211_hdr_len(after_radiotap)?;
     let after_80211 = &after_radiotap[hdr_len..];
 
+    // Standard LLC/SNAP: DSAP=0xAA, SSAP=0xAA, Control=0x03
     if after_80211.len() >= 8
         && after_80211[0] == 0xAA
         && after_80211[1] == 0xAA
@@ -326,6 +327,20 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
         return Some((payload, rssi));
     }
 
+    // Custom LLC: DSAP=0x52, SSAP=0x50, Control=0x03 (our magic "RP" in LLC)
+    if after_80211.len() >= 4
+        && after_80211[0] == 0x52
+        && after_80211[1] == 0x50
+        && after_80211[2] == 0x03
+    {
+        let payload = &after_80211[3..];
+        if payload.is_empty() {
+            return None;
+        }
+        return Some((payload, rssi));
+    }
+
+    // No LLC - payload starts immediately after 802.11 header
     if after_80211.is_empty() {
         None
     } else {
