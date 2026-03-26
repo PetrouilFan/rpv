@@ -78,15 +78,23 @@ impl GamepadInput {
         None
     }
 
+    fn get_axis_value(state: &DeviceState, code: u16) -> Option<i32> {
+        let abs_vals = state.abs_vals()?;
+        if code as usize >= abs_vals.len() {
+            return None;
+        }
+        Some(abs_vals[code as usize].value)
+    }
+
     fn read_input(&self, channels: &mut [u16; 16]) {
         self.device.fetch_events().ok();
 
         let state = self.device.cached_state();
         
-        let axis_x = state.abs_vals().get(&AbsCode(0x00)).copied();
-        let axis_y = state.abs_vals().get(&AbsCode(0x01)).copied();
-        let throttle = state.abs_vals().get(&AbsCode(0x02)).copied();
-        let axis_rz = state.abs_vals().get(&AbsCode(0x03)).copied();
+        let axis_x = Self::get_axis_value(state, 0x00);
+        let axis_y = Self::get_axis_value(state, 0x01);
+        let throttle = Self::get_axis_value(state, 0x02);
+        let axis_rz = Self::get_axis_value(state, 0x03);
 
         channels[0] = Self::axis_to_rc(axis_x, false, false);      
         channels[1] = Self::axis_to_rc(axis_y, true, false);      
@@ -94,7 +102,10 @@ impl GamepadInput {
         channels[3] = Self::axis_to_rc(axis_rz, false, false);     
         
         let keys = state.key_vals();
-        let keys = keys.as_ref().unwrap();
+        let keys = match keys {
+            Some(k) => k,
+            None => return,
+        };
         
         channels[4] = Self::button_to_rc(keys.contains(KeyCode(0x120)));
         channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));             
