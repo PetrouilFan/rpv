@@ -45,6 +45,7 @@ pub struct RpvApp {
     rgba_buf: Vec<u8>,
     needs_repaint: bool,
     has_ever_had_frame: bool,
+    frame_debug_logged: bool,
 }
 
 impl RpvApp {
@@ -78,6 +79,7 @@ impl RpvApp {
             rgba_buf: vec![0u8; w * h * 4],
             needs_repaint: false,
             has_ever_had_frame: false,
+            frame_debug_logged: false,
         }
     }
 
@@ -88,6 +90,14 @@ impl RpvApp {
             latest = Some(frame);
             recv_count += 1;
         }
+
+        if recv_count > 0 && !self.frame_debug_logged {
+            tracing::info!("update_texture: first batch received {} frames", recv_count);
+            self.frame_debug_logged = true;
+        } else if recv_count > 0 {
+            tracing::debug!("update_texture: received {} frames", recv_count);
+        }
+
         if recv_count > 1 {
             tracing::debug!("UI frame queue drain: {} frames dropped", recv_count - 1);
         }
