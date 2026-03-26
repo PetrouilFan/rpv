@@ -30,133 +30,6 @@ impl GamepadInput {
         
         info!("Gamepad found at {}", gamepad_path.display());
         
-        let device = match Device::open(&gamepad_path) {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to open gamepad: {}", e);
-                return None;
-            }
-        };
-
-        let device = match device.grab() {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to grab gamepad: {}", e);
-                return None;
-            }
-        };
-
-        info!("Gamepad initialized successfully");
-        Some(Self { device })
-    }
-
-    fn find_gamepad_path() -> Option<PathBuf> {
-        let dev_path = PathBuf::from("/dev/input");
-        if !dev_path.exists() {
-            return None;
-        }
-
-        let entries = match std::fs::read_dir(dev_path) {
-            Ok(e) => e,
-            Err(_) => return None,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("event") {
-                    if let Ok(device) = Device::open(&path) {
-                        if device.supported_keys().is_some() {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn get_axis_value(device: &Device, code: u16) -> Option<i32> {
-        let state = device.cached_state();
-        let abs_vals = state.abs_vals()?;
-        if code as usize >= abs_vals.len() {
-            return None;
-        }
-        Some(abs_vals[code as usize].value)
-    }
-
-    fn read_input(&mut self, channels: &mut [u16; 16]) {
-        let _ = self.device.fetch_events();
-
-        let axis_x = Self::get_axis_value(&self.device, 0x00);
-        let axis_y = Self::get_axis_value(&self.device, 0x01);
-        let throttle = Self::get_axis_value(&self.device, 0x02);
-        let axis_rz = Self::get_axis_value(&self.device, 0x03);
-
-        channels[0] = Self::axis_to_rc(axis_x, false, false);      
-        channels[1] = Self::axis_to_rc(axis_y, true, false);      
-        channels[2] = Self::axis_to_rc(throttle, false, true);      
-        channels[3] = Self::axis_to_rc(axis_rz, false, false);     
-        
-        let keys = match self.device.cached_state().key_vals() {
-            Some(k) => k,
-            None => return,
-        };
-        
-        channels[4] = Self::button_to_rc(keys.contains(KeyCode(0x120)));
-        channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));             
-        channels[6] = Self::button_to_rc(keys.contains(KeyCode(0x122)));              
-        channels[7] = Self::button_to_rc(keys.contains(KeyCode(0x123)));              
-        channels[8] = Self::button_to_rc(keys.contains(KeyCode(0x124)));             
-        channels[9] = Self::button_to_rc(keys.contains(KeyCode(0x125)));             
-        channels[10] = Self::button_to_rc(keys.contains(KeyCode(0x126)));            
-        channels[11] = Self::button_to_rc(keys.contains(KeyCode(0x127)));            
-        channels[12] = Self::button_to_rc(keys.contains(KeyCode(0x128)));            
-        channels[13] = Self::button_to_rc(keys.contains(KeyCode(0x129)));            
-        channels[14] = Self::button_to_rc(keys.contains(KeyCode(0x12a)));            
-        channels[15] = Self::button_to_rc(keys.contains(KeyCode(0x12b)));            
-    }
-
-    fn axis_to_rc(axis: Option<i32>, invert: bool, throttle_mode: bool) -> u16 {
-        let value = match axis {
-            Some(v) => v,
-            None => return RC_MID,
-        };
-
-        let value = if invert { -value } else { value };
-
-        if throttle_mode {
-            let normalized = ((value + 32767) as f64 / 65534.0).clamp(0.0, 1.0);
-            (RC_MIN as f64 + normalized * (RC_MAX as f64 - RC_MIN as f64)) as u16
-        } else {
-            let with_deadzone = if value.abs() < DEADZONE {
-                0
-            } else {
-                value - value.signum() * DEADZONE
-            };
-            let normalized = (with_deadzone as f64 / (32767 - DEADZONE) as f64).clamp(-1.0, 1.0);
-            (RC_MID as f64 + normalized * (RC_MID as f64 - RC_MIN as f64)) as u16
-        }
-    }
-
-    fn button_to_rc(pressed: bool) -> u16 {
-        if pressed { RC_MAX } else { RC_MIN }
-    }
-}
-
-impl GamepadInput {
-    fn auto_detect() -> Option<Self> {
-        let gamepad_path = match Self::find_gamepad_path() {
-            Some(p) => p,
-            None => {
-                error!("No gamepad found in /dev/input");
-                return None;
-            }
-        };
-        
-        info!("Gamepad found at {}", gamepad_path.display());
-        
         let mut device = match Device::open(&gamepad_path) {
             Ok(d) => d,
             Err(e) => {
@@ -192,8 +65,6 @@ impl GamepadInput {
             }
         };
 
-        let mut found_path: Option<PathBuf> = None;
-        
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name() {
@@ -204,24 +75,18 @@ impl GamepadInput {
                         let has_keys = device.supported_keys().is_some();
                         if has_abs && has_keys {
                             info!("Found gamepad: {} ({})", path.display(), device.name().unwrap_or_default());
-                            found_path = Some(path);
-                            break;
+                            return Some(path);
                         }
                     }
                 }
             }
         }
-
-        match found_path {
-            Some(p) => Some(p),
-            None => {
-                error!("No gamepad device found in /dev/input");
-                None
-            }
-        }
+        error!("No gamepad device found in /dev/input");
+        None
     }
 
-    fn get_axis_value(state: &DeviceState, code: u16) -> Option<i32> {
+    fn get_axis_value(device: &Device, code: u16) -> Option<i32> {
+        let state = device.cached_state();
         let abs_vals = state.abs_vals()?;
         if code as usize >= abs_vals.len() {
             return None;
@@ -232,20 +97,17 @@ impl GamepadInput {
     fn read_input(&mut self, channels: &mut [u16; 16]) {
         let _ = self.device.fetch_events();
 
-        let state = self.device.cached_state();
-        
-        let axis_x = Self::get_axis_value(&state, 0x00);
-        let axis_y = Self::get_axis_value(&state, 0x01);
-        let throttle = Self::get_axis_value(&state, 0x02);
-        let axis_rz = Self::get_axis_value(&state, 0x03);
+        let axis_x = Self::get_axis_value(&self.device, 0x00);
+        let axis_y = Self::get_axis_value(&self.device, 0x01);
+        let throttle = Self::get_axis_value(&self.device, 0x02);
+        let axis_rz = Self::get_axis_value(&self.device, 0x03);
 
         channels[0] = Self::axis_to_rc(axis_x, false, false);      
         channels[1] = Self::axis_to_rc(axis_y, true, false);      
         channels[2] = Self::axis_to_rc(throttle, false, true);      
         channels[3] = Self::axis_to_rc(axis_rz, false, false);     
         
-        let keys = state.key_vals();
-        let keys = match keys {
+        let keys = match self.device.cached_state().key_vals() {
             Some(k) => k,
             None => return,
         };
