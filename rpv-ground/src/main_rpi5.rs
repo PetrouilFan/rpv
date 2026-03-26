@@ -973,7 +973,12 @@ fn rx_dispatcher(
         };
 
         let (payload, frame_rssi) = match rawsock::recv_extract(&buf[..len], reject_count < 10) {
-            Some(p) => p,
+            Some(p) => {
+                if total_frames <= 3 {
+                    tracing::info!("RX: extracted payload ({}B), first 4 bytes: {:02x?}", p.0.len(), &p.0[..4.min(p.0.len())]);
+                }
+                p
+            },
             None => {
                 reject_count += 1;
                 if reject_count <= 5 {
