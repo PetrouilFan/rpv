@@ -551,16 +551,21 @@ impl eframe::App for RpvApp {
                     );
 
                     // GPU YUV→RGB via egui PaintCallback
+                    // Draw video in a background layer so OSD is always on top
                     if let Some(ref gpu) = self.yuv_gpu {
                         let callback = YuvRenderCallback {
                             resources: gpu.clone(),
                         };
                         let paint_cb = egui_wgpu::Callback::new_paint_callback(rect, callback);
-                        // Use background layer so video is always behind UI
-                        let bg_layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("video_yuv"));
-                        let mut painter = ui.painter().clone();
-                        painter.set_layer_id(bg_layer);
-                        painter.add(paint_cb);
+                        // Use egui::Area with Background order to ensure video is drawn first
+                        egui::Area::new(egui::Id::new("video_layer"))
+                            .order(egui::Order::Background)
+                            .interactable(false)
+                            .fixed_pos(rect.min)
+                            .show(ui.ctx(), |ui| {
+                                ui.set_min_size(rect.size());
+                                ui.painter().add(paint_cb);
+                            });
                     }
                 } else {
                     ui.painter().rect_filled(
