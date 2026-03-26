@@ -756,7 +756,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
                     egui::RichText::new("RC").size(12.0).color(egui::Color32::YELLOW),
                 );
                 ui.horizontal(|ui| {
-                    for (i, ch) in channels.iter().enumerate().take(4) {
+                    for (_i, ch) in channels.iter().enumerate().take(4) {
                         let normalized = (*ch as f32 - 1000.0) / 1000.0;
                         let bar_height = 30.0;
                         let bar_width = 20.0;
