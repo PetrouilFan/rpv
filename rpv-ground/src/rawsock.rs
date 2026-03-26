@@ -18,16 +18,14 @@ impl RawSocket {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW,
-                libc::ETH_P_ALL.to_be() as i32,
+                (libc::ETH_P_ALL as u16).to_be() as i32,
             )
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Attach BPF filter to accept all packets (kernel filtering infrastructure kept for future use)
-        // let _ = Self::try_attach_bpf_filter(fd);
-
+        // Get interface index
         let iface_c = std::ffi::CString::new(iface)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface name"))?;
         let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
@@ -41,23 +39,10 @@ impl RawSocket {
             ));
         }
 
-        // Set socket promiscuous mode
-        let mut mr: libc::packet_mreq = unsafe { std::mem::zeroed() };
-        mr.mr_ifindex = ifindex as i32;
-        mr.mr_type = libc::PACKET_MR_PROMISC as u16;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_PACKET,
-                libc::PACKET_ADD_MEMBERSHIP,
-                &mr as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::packet_mreq>() as libc::socklen_t,
-            );
-        }
-
+        // Bind to specific interface
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         addr.sll_family = libc::AF_PACKET as u16;
-        addr.sll_protocol = (libc::ETH_P_ALL.to_be()) as u16;
+        addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
         addr.sll_ifindex = ifindex as i32;
 
         let ret = unsafe {
@@ -74,10 +59,10 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // 100ms receive timeout for responsive shutdown (was 500ms)
+        // Set receive timeout
         let tv = libc::timeval {
             tv_sec: 0,
-            tv_usec: 100_000,
+            tv_usec: 100_000, // 100ms
         };
         unsafe {
             libc::setsockopt(
@@ -89,6 +74,7 @@ impl RawSocket {
             );
         }
 
+        // Set buffer sizes
         let sndbuf: libc::c_int = 8 * 1024 * 1024;
         unsafe {
             libc::setsockopt(
