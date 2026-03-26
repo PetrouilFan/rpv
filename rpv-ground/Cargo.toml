@@ -29,4 +29,4 @@ ctrlc         = "3"
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 libc          = "0.2"
 crossbeam-channel = "0.5"
-evdev = "0.5"
+evdev = "0.13"
