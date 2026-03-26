@@ -943,8 +943,12 @@ fn rx_dispatcher(
     let mut total_frames: u64 = 0;
     let mut loop_count: u64 = 0;
 
+    tracing::info!("Entering RX dispatcher loop");
     while running.load(Ordering::SeqCst) {
         loop_count += 1;
+        if loop_count == 1 {
+            tracing::info!("RX dispatcher first iteration");
+        }
         if loop_count % 1000 == 0 {
             tracing::info!("RX loop: {} iterations", loop_count);
         }
