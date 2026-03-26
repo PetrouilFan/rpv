@@ -941,8 +941,13 @@ fn rx_dispatcher(
     let mut buf = vec![0u8; 65536];
     let mut reject_count: u64 = 0;
     let mut total_frames: u64 = 0;
+    let mut loop_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
+        loop_count += 1;
+        if loop_count % 1000 == 0 {
+            tracing::info!("RX loop: {} iterations", loop_count);
+        }
         let len = match socket.recv(&mut buf) {
             Ok(0) => {
                 if total_frames == 0 && reject_count == 0 {
