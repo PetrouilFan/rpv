@@ -30,7 +30,7 @@ impl GamepadInput {
         
         info!("Gamepad found at {}", gamepad_path.display());
         
-        let device = match Device::open(&gamepad_path) {
+        let mut device = match Device::open(&gamepad_path) {
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to open gamepad: {}", e);
@@ -38,8 +38,8 @@ impl GamepadInput {
             }
         };
 
-        let device = match device.grab() {
-            Ok(d) => d,
+        match device.grab() {
+            Ok(()) => {}
             Err(e) => {
                 error!("Failed to grab gamepad: {}", e);
                 return None;
@@ -67,8 +67,9 @@ impl GamepadInput {
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("event") {
                     if let Ok(device) = Device::open(&path) {
-                        if device.supported_events().contains(evdev::EventType::ABS) 
-                            && device.supported_events().contains(evdev::EventType::KEY) {
+                        let has_abs = device.supported_absolute_axes().is_some();
+                        let has_keys = device.supported_keys().is_some();
+                        if has_abs && has_keys {
                             return Some(path);
                         }
                     }
