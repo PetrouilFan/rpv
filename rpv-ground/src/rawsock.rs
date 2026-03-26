@@ -110,7 +110,7 @@ impl RawSocket {
         // 4. Load first 2 bytes of payload (after 802.11 header + LLC)
         // 5. Compare with our magic "RP" (0x52, 0x50)
         
-        let bpf_prog = [
+        let _bpf_prog = [
             // Load radiotap length (2 bytes at offset 2)
             0x20, 0x02, 0x00, 0x00, // ld [2] - load 4 bytes but we only need lower 16 bits
             0x15, 0x00, 0x00, 0x08, // jle #8, jt 0, jf skip - skip if too short
