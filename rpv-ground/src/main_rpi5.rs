@@ -1028,6 +1028,7 @@ fn rx_dispatcher(
             }
             link::PAYLOAD_HEARTBEAT => {
                 *last_heartbeat.lock().unwrap() = Instant::now();
+                tracing::info!("RX: heartbeat detected");
             }
             _ => {}
         }
