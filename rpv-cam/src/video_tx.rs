@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -139,26 +138,43 @@ pub fn run(
         let stderr = child.stderr.take();
         thread::spawn(move || {
             if let Some(mut stderr) = stderr {
-                let mut buf = Vec::new();
-                let _ = stderr.read_to_end(&mut buf);
-                if !buf.is_empty() {
-                    let stderr_str = String::from_utf8_lossy(&buf);
-                    if stderr_str.contains("ERROR") || stderr_str.contains("failed") {
-                        tracing::error!("rpicam-vid stderr: {}", stderr_str);
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(&mut stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) if !line.is_empty() => {
+                            if line.contains("ERROR")
+                                || line.contains("failed")
+                                || line.contains("error")
+                            {
+                                tracing::error!("rpicam-vid: {}", line);
+                            } else {
+                                tracing::info!("rpicam-vid: {}", line);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("rpicam-vid stderr read error: {}", e);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
             }
         });
 
         tracing::info!(
-            "rpicam-vid started, streaming H.264 with FEC {}+{} over raw L2...",
+            "rpicam-vid started (pid {}), streaming H.264 with FEC {}+{} over raw L2...",
+            child.id(),
             DATA_SHARDS,
             PARITY_SHARDS
         );
 
         let mut read_buf = vec![0u8; 65536];
         let mut total_bytes = u64::default();
+        let mut total_nals: u64 = 0;
+        let mut total_groups: u64 = 0;
         let mut fail_count: u8 = 0;
+        let mut last_stats = std::time::Instant::now();
         // Cursor-based NAL buffer
         let mut nal_buf: Vec<u8> = vec![0u8; MAX_NAL_BUF];
         let mut nal_head: usize = 0;
@@ -214,6 +230,18 @@ pub fn run(
                     {
                         nal_head += consumed;
                         extracted_any = true;
+                        total_nals += 1;
+
+                        if last_stats.elapsed().as_secs() >= 5 {
+                            tracing::info!(
+                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s",
+                                total_bytes as f64 / 1_048_576.0,
+                                total_nals,
+                                total_groups,
+                                last_stats.elapsed().as_secs()
+                            );
+                            last_stats = std::time::Instant::now();
+                        }
 
                         let mut off = 0;
                         let mut frag_idx: u16 = 0;
@@ -257,6 +285,7 @@ pub fn run(
                                         &hp_rx,
                                         &mut fec_shards,
                                     );
+                                    total_groups += 1;
                                     // Reset arena state
                                     shards_in_group = 0;
                                     slot_filled = [0; DATA_SHARDS];
