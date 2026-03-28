@@ -10,7 +10,7 @@ use reed_solomon_erasure::ReedSolomon;
 use crate::link;
 use crate::rawsock::RawSocket;
 
-const DATA_SHARDS: usize = 2;
+const DATA_SHARDS: usize = 1;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
@@ -489,6 +489,16 @@ fn send_fec_group_arena(
         } else {
             &shard[..max_shard_size.min(shard.len())]
         };
+
+        // Debug: log first few shards
+        if *fec_block_seq < 5 {
+            tracing::info!(
+                "SEND shard[{}]: {} bytes, first16={:02x?}",
+                i,
+                send_data.len(),
+                &send_data[..16.min(send_data.len())]
+            );
+        }
 
         // Build video header dynamically
         video_payload_buf.clear();

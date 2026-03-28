@@ -4,7 +4,7 @@ use tracing::{info, warn};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-const DATA_SHARDS: usize = 2;
+const DATA_SHARDS: usize = 1;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
@@ -15,7 +15,7 @@ const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
 /// If no FEC block completes within this window, drop the stalled block.
-const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+const STALL_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct RsBlock {
     shards: Vec<Option<Vec<u8>>>,
@@ -60,14 +60,23 @@ impl VideoReceiver {
                         cur, block.received, DATA_SHARDS
                     );
                 } else {
-                    warn!("RS: block {} stalled (no shards received), dropping", cur);
+                    // Only log occasionally to avoid spam during large gaps
+                    if cur % 100 == 0 {
+                        warn!("RS: block {} stalled (no shards received), dropping", cur);
+                    }
                 }
                 if *nal_started {
                     nal_buf.clear();
                     *nal_started = false;
                 }
                 blocks.remove(&cur);
-                *next_block = Some(cur.wrapping_add(1));
+                // Jump to nearest available block in HashMap instead of +1
+                let next_seq = blocks
+                    .keys()
+                    .filter(|&&k| k.wrapping_sub(cur) < 0x8000_0000) // ahead of cur
+                    .min_by_key(|&&k| k.wrapping_sub(cur))
+                    .copied();
+                *next_block = next_seq.or(Some(cur.wrapping_add(1)));
                 *last_decode_time = Instant::now();
                 return true;
             }
@@ -137,27 +146,13 @@ impl VideoReceiver {
             let total_shards = payload[5] as usize;
             let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
 
-            let block_seq = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let shard_index = payload[4] as usize;
-            let total_shards = payload[5] as usize;
-            let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
-
-            if payload_count <= 3 {
-                info!(
-                    "VideoReceiver: block_seq={} shard_idx={} total={} data={} len={}",
-                    block_seq,
-                    shard_index,
-                    total_shards,
-                    actual_data_shards,
-                    payload.len()
-                );
-            }
-
-            // Parse [u16; DATA_SHARDS] shard length array
-            let mut shard_lens = [0usize; DATA_SHARDS];
+            // Parse [u16; DATA_SHARDS] shard length array from this shard's header.
+            // Every shard (data + parity) carries the full shard_lens array.
+            let mut parsed_shard_lens = [0usize; DATA_SHARDS];
             for i in 0..DATA_SHARDS {
                 let off = VIDEO_HDR_FIXED + i * 2;
-                shard_lens[i] = u16::from_le_bytes([payload[off], payload[off + 1]]) as usize;
+                parsed_shard_lens[i] =
+                    u16::from_le_bytes([payload[off], payload[off + 1]]) as usize;
             }
 
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
@@ -177,12 +172,12 @@ impl VideoReceiver {
                 next_block = Some(block_seq);
             }
 
-            // Prune blocks that are too old (more than 64 behind the latest received)
+            // Prune blocks that are too old (more than 256 behind the latest received)
             if !blocks.is_empty() {
                 let max_seq = blocks.keys().max().copied().unwrap_or(0);
                 blocks.retain(|&k, _| {
                     let age = max_seq.wrapping_sub(k);
-                    age < 64
+                    age < 256
                 });
             }
 
@@ -191,8 +186,13 @@ impl VideoReceiver {
                 shard_sizes: vec![0; TOTAL_SHARDS],
                 received: 0,
                 actual_data_shards,
-                shard_lens,
+                shard_lens: parsed_shard_lens,
             });
+
+            // Always update shard_lens from any received shard (sender puts
+            // the full array in every shard header). This ensures that even if
+            // shard i was lost and reconstructed, we still have its original length.
+            block.shard_lens = parsed_shard_lens;
 
             if block.shards[shard_index].is_none() {
                 block.received += 1;
@@ -212,7 +212,7 @@ impl VideoReceiver {
                 let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
                 if let Some(data_shards) = reconstructed {
                     fec_recovered += 1;
-                    if fec_recovered % 120 == 0 {
+                    if fec_recovered % 10 == 0 {
                         info!(
                             "RS: recovered={} dropped={} blocks",
                             fec_recovered, fec_dropped
@@ -229,28 +229,30 @@ impl VideoReceiver {
                         } else {
                             shard_data
                         };
-                        if trimmed.is_empty() {
-                            continue;
-                        }
                         if trimmed.len() < 2 {
                             continue;
                         }
-                        let frag_index = u16::from_le_bytes([trimmed[0], trimmed[1]]);
-                        let frag_payload = &trimmed[2..];
 
-                        if frag_index == 0 {
-                            if nal_started && !nal_buf.is_empty() {
-                                let nal_data = std::mem::take(&mut nal_buf);
-                                if let Err(e) = self.tx.send(nal_data) {
-                                    warn!("Video frame channel closed: {}", e);
-                                }
-                            }
-                            nal_buf.clear();
-                            nal_buf.extend_from_slice(&[0, 0, 0, 1]);
-                            nal_buf.extend_from_slice(frag_payload);
-                            nal_started = true;
-                        } else if nal_started {
-                            nal_buf.extend_from_slice(frag_payload);
+                        // Skip the 2-byte frag_index header, send the NAL data directly
+                        let frag_payload = &trimmed[2..];
+                        if frag_payload.is_empty() {
+                            continue;
+                        }
+
+                        // Log first NALs to debug corruption
+                        if fec_recovered <= 5 {
+                            info!(
+                                "NAL #{}: {} bytes, first16={:02x?}",
+                                fec_recovered,
+                                frag_payload.len(),
+                                &frag_payload[..16.min(frag_payload.len())]
+                            );
+                        }
+
+                        // The shard data already contains the NAL start code
+                        // (00 00 00 01 or 00 00 01). Send as-is.
+                        if let Err(e) = self.tx.send(frag_payload.to_vec()) {
+                            warn!("Video frame channel closed: {}", e);
                         }
                     }
                     _block_count += 1;

@@ -276,7 +276,7 @@ impl YuvGpuResources {
                         rows_per_image: Some(uv_h as u32),
                     },
                     wgpu::Extent3d {
-                        width: w as u32,
+                        width: w as u32 / 2,
                         height: uv_h as u32,
                         depth_or_array_layers: 1,
                     },
@@ -343,7 +343,7 @@ impl YuvGpuResources {
                             rows_per_image: Some(1),
                         },
                         wgpu::Extent3d {
-                            width: w as u32,
+                            width: w as u32 / 2,
                             height: 1,
                             depth_or_array_layers: 1,
                         },

@@ -350,6 +350,12 @@ fn decode_loop_libavcodec(
                             continue;
                         }
 
+                        // Skip frames with unexpected dimensions (corrupt decode)
+                        if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2
+                        {
+                            continue;
+                        }
+
                         let mut nv12 = vec![0u8; total_size];
 
                         // Copy Y plane (row by row for stride mismatch)
