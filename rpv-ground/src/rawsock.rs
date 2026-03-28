@@ -183,9 +183,9 @@ impl RawSocket {
     /// Send a raw 802.11 frame with Radiotap + broadcast data header + payload.
     #[allow(dead_code)]
     pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        let radiotap: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mut frame = Vec::with_capacity(radiotap.len() + IEEE80211_HDR_LEN + payload.len());
-        frame.extend_from_slice(&radiotap);
+        static RADIOTAP: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut frame = Vec::with_capacity(RADIOTAP.len() + IEEE80211_HDR_LEN + payload.len());
+        frame.extend_from_slice(&RADIOTAP);
         frame.extend_from_slice(&build_data_frame_header());
         frame.extend_from_slice(payload);
 

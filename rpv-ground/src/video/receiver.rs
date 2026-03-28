@@ -7,6 +7,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 const DATA_SHARDS: usize = 1;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+/// Only need 1 shard (data shard) since parity is not sent
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
 ///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
 ///   [2B * DATA_SHARDS shard_len_array]
@@ -89,6 +90,7 @@ impl VideoReceiver {
             .expect("Failed to create Reed-Solomon decoder");
 
         let mut blocks: HashMap<u32, RsBlock> = HashMap::new();
+        let mut processed: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
         let mut _block_count: u64 = 0;
@@ -167,6 +169,11 @@ impl VideoReceiver {
                 continue;
             }
             let shard_data = payload[DATA_START..].to_vec();
+
+            // Skip already-processed blocks (prevents duplicate NALs from FEC 1+1)
+            if processed.contains(&block_seq) {
+                continue;
+            }
 
             if next_block.is_none() {
                 next_block = Some(block_seq);
@@ -256,6 +263,7 @@ impl VideoReceiver {
                         }
                     }
                     _block_count += 1;
+                    processed.insert(seq);
                     // Advance next_block past this recovered block
                     if let Some(nb) = next_block {
                         if seq >= nb {
@@ -265,6 +273,7 @@ impl VideoReceiver {
                     last_decode_time = Instant::now();
                 } else {
                     fec_dropped += 1;
+                    processed.insert(seq);
                     if nal_started {
                         nal_buf.clear();
                         nal_started = false;
@@ -284,6 +293,13 @@ impl VideoReceiver {
                 &mut nal_buf,
                 &mut nal_started,
             );
+
+            // Periodic cleanup of processed set to prevent memory leak
+            if processed.len() > 1000 {
+                if let Some(nb) = next_block {
+                    processed.retain(|&s| nb.wrapping_sub(s) < 500);
+                }
+            }
         }
     }
 }
