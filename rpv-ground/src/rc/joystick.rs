@@ -27,9 +27,9 @@ impl GamepadInput {
                 return None;
             }
         };
-        
+
         info!("Gamepad found at {}", gamepad_path.display());
-        
+
         let mut device = match Device::open(&gamepad_path) {
             Ok(d) => d,
             Err(e) => {
@@ -74,7 +74,11 @@ impl GamepadInput {
                         let has_abs = device.supported_absolute_axes().is_some();
                         let has_keys = device.supported_keys().is_some();
                         if has_abs && has_keys {
-                            info!("Found gamepad: {} ({})", path.display(), device.name().unwrap_or_default());
+                            info!(
+                                "Found gamepad: {} ({})",
+                                path.display(),
+                                device.name().unwrap_or_default()
+                            );
                             return Some(path);
                         }
                     }
@@ -102,28 +106,28 @@ impl GamepadInput {
         let throttle = Self::get_axis_value(&self.device, 0x02);
         let axis_rz = Self::get_axis_value(&self.device, 0x03);
 
-        channels[0] = Self::axis_to_rc(axis_x, false, false);      
-        channels[1] = Self::axis_to_rc(axis_y, true, false);      
-        channels[2] = Self::axis_to_rc(throttle, false, true);      
-        channels[3] = Self::axis_to_rc(axis_rz, false, false);     
-        
+        channels[0] = Self::axis_to_rc(axis_x, false, false);
+        channels[1] = Self::axis_to_rc(axis_y, true, false);
+        channels[2] = Self::axis_to_rc(throttle, false, true);
+        channels[3] = Self::axis_to_rc(axis_rz, false, false);
+
         let keys = match self.device.cached_state().key_vals() {
             Some(k) => k,
             None => return,
         };
-        
+
         channels[4] = Self::button_to_rc(keys.contains(KeyCode(0x120)));
-        channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));             
-        channels[6] = Self::button_to_rc(keys.contains(KeyCode(0x122)));              
-        channels[7] = Self::button_to_rc(keys.contains(KeyCode(0x123)));              
-        channels[8] = Self::button_to_rc(keys.contains(KeyCode(0x124)));             
-        channels[9] = Self::button_to_rc(keys.contains(KeyCode(0x125)));             
-        channels[10] = Self::button_to_rc(keys.contains(KeyCode(0x126)));            
-        channels[11] = Self::button_to_rc(keys.contains(KeyCode(0x127)));            
-        channels[12] = Self::button_to_rc(keys.contains(KeyCode(0x128)));            
-        channels[13] = Self::button_to_rc(keys.contains(KeyCode(0x129)));            
-        channels[14] = Self::button_to_rc(keys.contains(KeyCode(0x12a)));            
-        channels[15] = Self::button_to_rc(keys.contains(KeyCode(0x12b)));            
+        channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));
+        channels[6] = Self::button_to_rc(keys.contains(KeyCode(0x122)));
+        channels[7] = Self::button_to_rc(keys.contains(KeyCode(0x123)));
+        channels[8] = Self::button_to_rc(keys.contains(KeyCode(0x124)));
+        channels[9] = Self::button_to_rc(keys.contains(KeyCode(0x125)));
+        channels[10] = Self::button_to_rc(keys.contains(KeyCode(0x126)));
+        channels[11] = Self::button_to_rc(keys.contains(KeyCode(0x127)));
+        channels[12] = Self::button_to_rc(keys.contains(KeyCode(0x128)));
+        channels[13] = Self::button_to_rc(keys.contains(KeyCode(0x129)));
+        channels[14] = Self::button_to_rc(keys.contains(KeyCode(0x12a)));
+        channels[15] = Self::button_to_rc(keys.contains(KeyCode(0x12b)));
     }
 
     fn axis_to_rc(axis: Option<i32>, invert: bool, throttle_mode: bool) -> u16 {
@@ -149,7 +153,11 @@ impl GamepadInput {
     }
 
     fn button_to_rc(pressed: bool) -> u16 {
-        if pressed { RC_MAX } else { RC_MIN }
+        if pressed {
+            RC_MAX
+        } else {
+            RC_MIN
+        }
     }
 }
 
@@ -165,7 +173,7 @@ pub struct RCTx {
 impl RCTx {
     pub fn new(socket: Arc<RawSocket>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
         let gamepad = GamepadInput::auto_detect();
-        
+
         if gamepad.is_some() {
             info!("Gamepad input enabled");
         } else {
@@ -228,7 +236,7 @@ impl RCTx {
             if let Some(ref mut gp) = self.gamepad {
                 let mut channel_buf = [0u16; 16];
                 gp.read_input(&mut channel_buf);
-                
+
                 let mut channels = self.channels.lock().unwrap();
                 for (i, ch) in channel_buf.iter().enumerate() {
                     if i < channels.len() {

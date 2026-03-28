@@ -496,42 +496,6 @@ impl RpvApp {
         }
         had_frame
     }
-
-        if recv_count > 0 && self.yuv_gpu.is_none() {
-            tracing::warn!(
-                "Received {} frames but GPU resources not initialized",
-                recv_count
-            );
-        }
-
-        let mut had_frame = false;
-        if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
-            let h = frame.height as usize;
-            let stride = frame.stride as usize;
-            let y_size = stride * h;
-            let uv_size = stride * h / 2;
-
-            if frame.nv12_data.len() >= y_size + uv_size {
-                let res = gpu.lock().unwrap();
-                res.upload(&frame.nv12_data, frame.stride);
-                drop(res);
-
-                self.state.frame_count += 1;
-                self.state.last_frame_time = Instant::now();
-
-                if self.state.frame_count == 30 {
-                    self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
-                    self.state.frame_count = 0;
-                    self.state.fps_timer = Instant::now();
-                }
-
-                self.state.link_state.video_frame_decoded();
-                self.has_ever_had_frame = true;
-                had_frame = true;
-            }
-        }
-        had_frame
-    }
 }
 
 impl eframe::App for RpvApp {
@@ -876,6 +840,13 @@ fn main() -> Result<(), eframe::Error> {
     let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
 
+    // Test the video channel works
+    let test_data = vec![0x52, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+    video_payload_tx
+        .try_send(test_data)
+        .expect("video channel test failed");
+    tracing::info!("Video channel test OK");
+
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
     let ui_frame_rx = decoder.get_rx();
     decoder.spawn(video_frame_rx_decoder);
@@ -996,6 +967,10 @@ fn rx_dispatcher(
     tracing::info!("RX dispatcher started (raw socket)");
     let mut buf = vec![0u8; 65536];
     let mut reject_count: u64 = 0;
+    let mut video_count: u64 = 0;
+    let mut telemetry_count: u64 = 0;
+    let mut heartbeat_count: u64 = 0;
+    let mut total_frames: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
@@ -1011,11 +986,12 @@ fn rx_dispatcher(
             Some(p) => p,
             None => {
                 reject_count += 1;
-                if reject_count <= 5 {
-                    tracing::debug!(
-                        "RX: rejected frame ({}B), first 8 bytes: {:02x?}",
+                if reject_count <= 10 || reject_count % 500 == 0 {
+                    tracing::warn!(
+                        "RX: rejected frame #{} ({}B), first 16 bytes: {:02x?}",
+                        reject_count,
                         len,
-                        &buf[..8.min(len)]
+                        &buf[..16.min(len)]
                     );
                 }
                 continue;
@@ -1028,10 +1004,11 @@ fn rx_dispatcher(
 
         if !link::L2Header::matches_magic(payload) {
             reject_count += 1;
-            if reject_count <= 5 {
-                tracing::debug!(
-                    "RX: magic mismatch, payload first 8 bytes: {:02x?}",
-                    &payload[..8.min(payload.len())]
+            if reject_count <= 10 || reject_count % 500 == 0 {
+                tracing::warn!(
+                    "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
+                    reject_count,
+                    &payload[..16.min(payload.len())]
                 );
             }
             continue;
@@ -1045,21 +1022,38 @@ fn rx_dispatcher(
             continue;
         }
 
+        total_frames += 1;
+        if total_frames % 500 == 0 {
+            tracing::info!(
+                "RX stats: total={} video={} telem={} hb={} rejected={}",
+                total_frames,
+                video_count,
+                telemetry_count,
+                heartbeat_count,
+                reject_count
+            );
+        }
+
         match header.payload_type {
             link::PAYLOAD_VIDEO => {
+                video_count += 1;
                 if video_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Video queue dropped (backpressure)");
                 }
             }
             link::PAYLOAD_TELEMETRY => {
+                telemetry_count += 1;
                 if telem_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Telemetry queue dropped");
                 }
             }
             link::PAYLOAD_HEARTBEAT => {
+                heartbeat_count += 1;
                 *last_heartbeat.lock().unwrap() = Instant::now();
             }
-            _ => {}
+            _ => {
+                tracing::debug!("RX: unknown payload type 0x{:02x}", header.payload_type);
+            }
         }
     }
 }

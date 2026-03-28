@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,8 +10,8 @@ use reed_solomon_erasure::ReedSolomon;
 use crate::link;
 use crate::rawsock::RawSocket;
 
-const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 2;
+const DATA_SHARDS: usize = 2;
+const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
 
@@ -102,10 +103,8 @@ pub fn run(
                 &framerate_s,
                 "--codec",
                 "h264",
-                "--profile",
-                "baseline",
-                "--level",
-                "4.1",
+                "--libav-format",
+                "h264",
                 "--bitrate",
                 &bitrate_s,
                 "--low-latency",
