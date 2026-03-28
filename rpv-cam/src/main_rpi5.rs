@@ -87,6 +87,7 @@ fn main() {
     let video_height = config.video_height;
     let video_framerate = config.framerate;
     let video_bitrate = config.bitrate;
+    let video_device = config.video_device.clone();
     let video_handle = thread::spawn(move || {
         video_tx::run(
             video_running,
@@ -98,6 +99,7 @@ fn main() {
             video_width,
             video_height,
             video_framerate,
+            video_device,
         );
     });
 

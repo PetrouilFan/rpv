@@ -6,6 +6,8 @@ pub struct Config {
     pub interface: String,
     #[serde(default = "default_drone_id")]
     pub drone_id: u8,
+    #[serde(default = "default_video_device")]
+    pub video_device: String,
     #[serde(default = "default_fc_port")]
     pub fc_port: String,
     #[serde(default = "default_fc_baud")]
@@ -26,6 +28,10 @@ fn default_interface() -> String {
 
 fn default_drone_id() -> u8 {
     0
+}
+
+fn default_video_device() -> String {
+    "/dev/video0".to_string()
 }
 
 fn default_fc_port() -> String {
@@ -57,6 +63,7 @@ impl Default for Config {
         Self {
             interface: default_interface(),
             drone_id: default_drone_id(),
+            video_device: default_video_device(),
             fc_port: default_fc_port(),
             fc_baud: default_fc_baud(),
             video_width: default_video_width(),

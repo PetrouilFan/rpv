@@ -123,9 +123,9 @@ impl VideoReceiver {
                 continue;
             }
             payload_count += 1;
-            if payload_count % 500 == 0 {
+            if payload_count % 1000 == 0 {
                 info!(
-                    "VideoReceiver: received {} payloads, blocks={}, next={:?}",
+                    "VideoReceiver: {} payloads, blocks={}, next={:?}",
                     payload_count,
                     blocks.len(),
                     next_block
@@ -136,6 +136,22 @@ impl VideoReceiver {
             let shard_index = payload[4] as usize;
             let total_shards = payload[5] as usize;
             let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
+
+            let block_seq = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let shard_index = payload[4] as usize;
+            let total_shards = payload[5] as usize;
+            let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
+
+            if payload_count <= 3 {
+                info!(
+                    "VideoReceiver: block_seq={} shard_idx={} total={} data={} len={}",
+                    block_seq,
+                    shard_index,
+                    total_shards,
+                    actual_data_shards,
+                    payload.len()
+                );
+            }
 
             // Parse [u16; DATA_SHARDS] shard length array
             let mut shard_lens = [0usize; DATA_SHARDS];
@@ -161,13 +177,12 @@ impl VideoReceiver {
                 next_block = Some(block_seq);
             }
 
-            // Prune old blocks: only keep blocks within a small window ahead of expected
-            if let Some(current) = next_block {
+            // Prune blocks that are too old (more than 64 behind the latest received)
+            if !blocks.is_empty() {
+                let max_seq = blocks.keys().max().copied().unwrap_or(0);
                 blocks.retain(|&k, _| {
-                    let age = current.wrapping_sub(k);
-                    let ahead = k.wrapping_sub(current);
-                    // Keep: current block, blocks slightly behind, or blocks within 16 ahead
-                    age == 0 || age < 100 || ahead < 16
+                    let age = max_seq.wrapping_sub(k);
+                    age < 64
                 });
             }
 
@@ -185,79 +200,79 @@ impl VideoReceiver {
             }
             block.shards[shard_index] = Some(shard_data);
 
-            if let Some(current_seq) = next_block {
-                // Process current block and any consecutive completed blocks
-                // Need at least DATA_SHARDS total shards (data + parity) for RS recovery
-                let mut seq = current_seq;
-                loop {
-                    let should_process = blocks
-                        .get(&seq)
-                        .map_or(false, |b| b.received >= DATA_SHARDS);
-                    if !should_process {
-                        break;
-                    }
-                    let block = blocks.remove(&seq).unwrap();
-                    let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
-                    if let Some(data_shards) = reconstructed {
-                        fec_recovered += 1;
-                        if fec_recovered % 120 == 0 {
-                            info!(
-                                "RS: recovered={} dropped={} blocks",
-                                fec_recovered, fec_dropped
-                            );
-                        }
-                        for (idx, shard_data) in data_shards
-                            .iter()
-                            .take(block.actual_data_shards)
-                            .enumerate()
-                        {
-                            let orig_len = block.shard_lens.get(idx).copied().unwrap_or(0);
-                            let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
-                                &shard_data[..orig_len]
-                            } else {
-                                shard_data
-                            };
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-                            if trimmed.len() < 2 {
-                                continue;
-                            }
-                            let frag_index = u16::from_le_bytes([trimmed[0], trimmed[1]]);
-                            let frag_payload = &trimmed[2..];
-
-                            if frag_index == 0 {
-                                if nal_started && !nal_buf.is_empty() {
-                                    let nal_data = std::mem::take(&mut nal_buf);
-                                    if let Err(e) = self.tx.send(nal_data) {
-                                        warn!("Video frame channel closed: {}", e);
-                                    }
-                                }
-                                nal_buf.clear();
-                                nal_buf.extend_from_slice(&[0, 0, 0, 1]);
-                                nal_buf.extend_from_slice(frag_payload);
-                                nal_started = true;
-                            } else if nal_started {
-                                nal_buf.extend_from_slice(frag_payload);
-                            }
-                        }
-                        _block_count += 1;
-                    } else {
-                        fec_dropped += 1;
-                        warn!(
-                            "RS: block {} unrecoverable (had {} shards), dropping",
-                            seq, block.received
+            // Scan ALL blocks and process any that have enough shards
+            // This handles out-of-order delivery and gaps gracefully
+            let ready: Vec<u32> = blocks
+                .iter()
+                .filter(|(_, b)| b.received >= DATA_SHARDS)
+                .map(|(&k, _)| k)
+                .collect();
+            for seq in ready {
+                let block = blocks.remove(&seq).unwrap();
+                let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
+                if let Some(data_shards) = reconstructed {
+                    fec_recovered += 1;
+                    if fec_recovered % 120 == 0 {
+                        info!(
+                            "RS: recovered={} dropped={} blocks",
+                            fec_recovered, fec_dropped
                         );
-                        if nal_started {
+                    }
+                    for (idx, shard_data) in data_shards
+                        .iter()
+                        .take(block.actual_data_shards)
+                        .enumerate()
+                    {
+                        let orig_len = block.shard_lens.get(idx).copied().unwrap_or(0);
+                        let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
+                            &shard_data[..orig_len]
+                        } else {
+                            shard_data
+                        };
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed.len() < 2 {
+                            continue;
+                        }
+                        let frag_index = u16::from_le_bytes([trimmed[0], trimmed[1]]);
+                        let frag_payload = &trimmed[2..];
+
+                        if frag_index == 0 {
+                            if nal_started && !nal_buf.is_empty() {
+                                let nal_data = std::mem::take(&mut nal_buf);
+                                if let Err(e) = self.tx.send(nal_data) {
+                                    warn!("Video frame channel closed: {}", e);
+                                }
+                            }
                             nal_buf.clear();
-                            nal_started = false;
+                            nal_buf.extend_from_slice(&[0, 0, 0, 1]);
+                            nal_buf.extend_from_slice(frag_payload);
+                            nal_started = true;
+                        } else if nal_started {
+                            nal_buf.extend_from_slice(frag_payload);
                         }
                     }
-
-                    seq = seq.wrapping_add(1);
+                    _block_count += 1;
+                    // Advance next_block past this recovered block
+                    if let Some(nb) = next_block {
+                        if seq >= nb {
+                            next_block = Some(seq.wrapping_add(1));
+                        }
+                    }
                     last_decode_time = Instant::now();
+                } else {
+                    fec_dropped += 1;
+                    if nal_started {
+                        nal_buf.clear();
+                        nal_started = false;
+                    }
+                    if let Some(nb) = next_block {
+                        if seq >= nb {
+                            next_block = Some(seq.wrapping_add(1));
+                        }
+                    }
                 }
-                next_block = Some(seq);
             }
 
             Self::check_stall(

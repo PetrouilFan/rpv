@@ -68,11 +68,13 @@ pub fn run(
     video_width: u32,
     video_height: u32,
     framerate: u32,
+    video_device: String,
 ) {
     tracing::info!(
-        "Video sender ready (FEC {}+{}, L2 broadcast)",
+        "Video sender ready (FEC {}+{}, L2 broadcast, device={})",
         DATA_SHARDS,
-        PARITY_SHARDS
+        PARITY_SHARDS,
+        video_device,
     );
 
     let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
@@ -83,40 +85,52 @@ pub fn run(
 
     while running.load(Ordering::SeqCst) {
         tracing::info!(
-            "Starting rpicam-vid (bitrate={}, intra={})...",
+            "Starting ffmpeg (bitrate={}, intra={}, device={})...",
             bitrate,
-            intra
+            intra,
+            video_device,
         );
 
-        let bitrate_s = bitrate.to_string();
-        let intra_s = intra.to_string();
+        let bitrate_s = format!("{}k", bitrate / 1000);
         let width_s = video_width.to_string();
         let height_s = video_height.to_string();
         let framerate_s = framerate.to_string();
-        let child = Command::new("rpicam-vid")
+        let gop_s = (framerate * 2).to_string(); // keyframe every 2 seconds
+        let bufsize_s = format!("{}k", bitrate / 500); // 2x bitrate for VBV buffer
+        let child = Command::new("ffmpeg")
             .args(&[
-                "--width",
-                &width_s,
-                "--height",
-                &height_s,
-                "--framerate",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "v4l2",
+                "-input_format",
+                "mjpeg",
+                "-video_size",
+                &format!("{}x{}", width_s, height_s),
+                "-framerate",
                 &framerate_s,
-                "--codec",
-                "h264",
-                "--libav-format",
-                "h264",
-                "--bitrate",
+                "-i",
+                &video_device,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-crf",
+                "28",
+                "-maxrate",
                 &bitrate_s,
-                "--low-latency",
-                "--flush",
-                "--inline",
-                "--intra",
-                &intra_s,
-                "--nopreview",
-                "-t",
-                "0",
-                "-o",
-                "-",
+                "-bufsize",
+                &bufsize_s,
+                "-g",
+                &gop_s,
+                "-f",
+                "h264",
+                "-an",
+                "-y",
+                "pipe:1",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -125,7 +139,7 @@ pub fn run(
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("Failed to start rpicam-vid: {}", e);
+                tracing::error!("Failed to start ffmpeg: {}", e);
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -146,13 +160,13 @@ pub fn run(
                                 || line.contains("failed")
                                 || line.contains("error")
                             {
-                                tracing::error!("rpicam-vid: {}", line);
+                                tracing::error!("ffmpeg: {}", line);
                             } else {
-                                tracing::info!("rpicam-vid: {}", line);
+                                tracing::info!("ffmpeg: {}", line);
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("rpicam-vid stderr read error: {}", e);
+                            tracing::warn!("ffmpeg stderr read error: {}", e);
                             break;
                         }
                         _ => {}
@@ -162,7 +176,7 @@ pub fn run(
         });
 
         tracing::info!(
-            "rpicam-vid started (pid {}), streaming H.264 with FEC {}+{} over raw L2...",
+            "ffmpeg started (pid {}), streaming H.264 with FEC {}+{} over raw L2...",
             child.id(),
             DATA_SHARDS,
             PARITY_SHARDS
@@ -194,7 +208,7 @@ pub fn run(
         while running.load(Ordering::SeqCst) {
             match stdout.read(&mut read_buf) {
                 Ok(0) => {
-                    tracing::info!("rpicam-vid stdout closed");
+                    tracing::info!("ffmpeg stdout closed");
                     break;
                 }
                 Ok(n) => {
@@ -352,7 +366,7 @@ pub fn run(
         let _ = child.wait();
 
         tracing::info!(
-            "rpicam-vid stopped, sent {:.1} MB total",
+            "ffmpeg stopped, sent {:.1} MB total",
             total_bytes as f64 / 1_048_576.0
         );
 
