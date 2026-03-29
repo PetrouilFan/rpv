@@ -208,14 +208,17 @@ pub fn run(
         let mut read_buf = vec![0u8; 65536];
         let mut total_bytes = u64::default();
         let mut total_nals: u64 = 0;
-        let mut last_nal_time = std::time::Instant::now();
         let mut total_groups: u64 = 0;
         let mut fail_count: u8 = 0;
         let mut last_stats = std::time::Instant::now();
         // #9: BytesMut ring buffer — O(1) advance instead of copy_within memory shifts
         let mut nal_buf = BytesMut::with_capacity(MAX_NAL_BUF);
         let mut nal_idle_cycles: u32 = 0;
-        const NAL_IDLE_LIMIT: u32 = 200;
+        // #7: Lower threshold — 20 cycles instead of 200 (stuck encoder detection)
+        const NAL_IDLE_LIMIT: u32 = 20;
+        // #4: NAL watchdog — if no NALs within 2x frame interval, mark unhealthy
+        let nal_watchdog_interval = Duration::from_millis(2 * (1000 / framerate.max(1)) as u64);
+        let mut last_nal_time = std::time::Instant::now();
         // Reusable buffers for send path
         let mut l2_frame_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
         let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
@@ -241,14 +244,22 @@ pub fn run(
                     let mut slot_filled = [0usize; DATA_SHARDS];
                     let mut slot_frag_lens: [usize; DATA_SHARDS] = [0; DATA_SHARDS];
 
-                    // #9: Append new data — BytesMut grows automatically, no manual tail tracking
+                    // #9: Append new data
                     if nal_buf.len() + n > MAX_NAL_BUF {
-                        // Buffer full — compact by discarding old unparseable data
-                        if nal_buf.len() > MAX_NAL_BUF / 2 {
-                            nal_buf.advance(nal_buf.len() / 2);
+                        // #27: Scan to next start code instead of blindly discarding half
+                        // This prevents splitting a NAL in the middle
+                        if let Some(next_sc) = find_start_code(&nal_buf, nal_buf.len() / 4) {
+                            nal_buf.advance(next_sc);
+                        } else {
+                            nal_buf.clear();
                         }
                     }
                     nal_buf.extend_from_slice(&read_buf[..n]);
+
+                    // #4: Check NAL watchdog — encoder deadlock detection
+                    if last_nal_time.elapsed() > nal_watchdog_interval {
+                        VIDEO_HEALTHY.store(false, Ordering::Relaxed);
+                    }
 
                     // Track NAL extraction
                     let mut extracted_any = false;
@@ -393,12 +404,28 @@ pub fn run(
     }
 }
 
+/// #20: Shared helper — find the next start code position in a byte slice.
+/// Returns the byte offset of the start code (00 00 01 or 00 00 00 01).
+fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
+    let mut pos = from;
+    while pos < data.len().saturating_sub(2) {
+        let zero = match memchr::memchr(0x00, &data[pos..]) {
+            Some(p) => pos + p,
+            None => return None,
+        };
+        if zero + 2 < data.len() && data[zero + 1] == 0 && data[zero + 2] == 1 {
+            return Some(zero);
+        }
+        pos = zero + 1;
+    }
+    None
+}
+
 fn extract_next_nal_cursor(data: &[u8]) -> Option<(&[u8], usize)> {
     if data.len() < 4 {
         return None;
     }
 
-    // #8: Use memchr for SIMD-accelerated search for 0x00 bytes
     let mut search_from = 0;
     while search_from < data.len().saturating_sub(3) {
         let zero_pos = match memchr::memchr(0x00, &data[search_from..]) {
@@ -406,66 +433,26 @@ fn extract_next_nal_cursor(data: &[u8]) -> Option<(&[u8], usize)> {
             None => return None,
         };
 
-        // Check if this is a start code: 00 00 01 (3-byte) or 00 00 00 01 (4-byte)
-        if zero_pos + 3 < data.len()
+        // Detect 3-byte (00 00 01) or 4-byte (00 00 00 01) start code
+        let sc_len = if zero_pos + 3 < data.len()
             && data[zero_pos + 1] == 0
             && data[zero_pos + 2] == 0
             && data[zero_pos + 3] == 1
         {
-            // 4-byte start code: 00 00 00 01
-            let nal_start = zero_pos + 4;
-            let mut inner_search = nal_start;
-            while inner_search < data.len().saturating_sub(3) {
-                let next_zero = match memchr::memchr(0x00, &data[inner_search..]) {
-                    Some(p) => inner_search + p,
-                    None => return None,
-                };
-                if next_zero + 3 < data.len()
-                    && data[next_zero + 1] == 0
-                    && data[next_zero + 2] == 0
-                    && data[next_zero + 3] == 1
-                {
-                    return Some((&data[zero_pos..next_zero], next_zero));
-                }
-                if next_zero + 2 < data.len()
-                    && data[next_zero + 1] == 0
-                    && data[next_zero + 2] == 1
-                {
-                    return Some((&data[zero_pos..next_zero], next_zero));
-                }
-                inner_search = next_zero + 1;
-            }
-            return None;
-        }
+            4
+        } else if zero_pos + 2 < data.len() && data[zero_pos + 1] == 0 && data[zero_pos + 2] == 1 {
+            3
+        } else {
+            search_from = zero_pos + 1;
+            continue;
+        };
 
-        if zero_pos + 2 < data.len() && data[zero_pos + 1] == 0 && data[zero_pos + 2] == 1 {
-            // 3-byte start code: 00 00 01
-            let nal_start = zero_pos + 3;
-            let mut inner_search = nal_start;
-            while inner_search < data.len().saturating_sub(3) {
-                let next_zero = match memchr::memchr(0x00, &data[inner_search..]) {
-                    Some(p) => inner_search + p,
-                    None => return None,
-                };
-                if next_zero + 3 < data.len()
-                    && data[next_zero + 1] == 0
-                    && data[next_zero + 2] == 0
-                    && data[next_zero + 3] == 1
-                {
-                    return Some((&data[zero_pos..next_zero], next_zero));
-                }
-                if next_zero + 2 < data.len()
-                    && data[next_zero + 1] == 0
-                    && data[next_zero + 2] == 1
-                {
-                    return Some((&data[zero_pos..next_zero], next_zero));
-                }
-                inner_search = next_zero + 1;
-            }
-            return None;
+        // #20: Use shared helper for inner search (eliminates duplicate loop)
+        let nal_start = zero_pos + sc_len;
+        match find_start_code(data, nal_start) {
+            Some(next_sc) => return Some((&data[zero_pos..next_sc], next_sc)),
+            None => return None,
         }
-
-        search_from = zero_pos + 1;
     }
     None
 }

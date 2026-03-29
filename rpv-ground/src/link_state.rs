@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Link states encoded as u8 for atomic access.
@@ -39,25 +39,19 @@ impl LinkStatus {
 
 /// Unified link-state machine shared across heartbeat, telemetry, video, and UI.
 ///
-/// Precedence model:
-/// - Heartbeat is the primary liveness source.
-///   When heartbeat times out -> SignalLost (highest priority transition).
-///   When heartbeat restores -> Connected.
-/// - Telemetry activity enriches state but cannot override SignalLost back to Connected.
-///   Only heartbeat recovery can do that.
-/// - Video decoded frames confirm Connected but cannot override SignalLost.
-/// - NoCamera is set from telemetry camera_ok=false, cleared when camera_ok=true.
-///
-/// This prevents the race where telemetry or video sets Connected right after
-/// heartbeat declares SignalLost.
+/// #5: camera_ok tracked as a separate AtomicBool so heartbeat_restored
+/// can check it on every transition, preventing NoCamera from being lost
+/// after SignalLost -> Connected.
 pub struct LinkStateMachine {
     state: AtomicU8,
+    camera_ok: AtomicBool,
 }
 
 impl LinkStateMachine {
     pub fn new() -> Self {
         Self {
             state: AtomicU8::new(SEARCHING),
+            camera_ok: AtomicBool::new(true),
         }
     }
 
@@ -82,13 +76,18 @@ impl LinkStateMachine {
         }
     }
 
-    /// Heartbeat restored -> Connected.
-    /// Overrides Searching and SignalLost, but NOT NoCamera.
+    /// Heartbeat restored -> Connected (or NoCamera if camera unavailable).
+    /// #5: Checks camera_ok flag on every transition so NoCamera isn't lost.
     pub fn heartbeat_restored(&self) {
         let cur = self.state.load(Ordering::SeqCst);
         if cur == SEARCHING || cur == SIGNAL_LOST {
-            self.state.store(CONNECTED, Ordering::SeqCst);
-            tracing::info!("Link: heartbeat restored -> Connected");
+            if self.camera_ok.load(Ordering::SeqCst) {
+                self.state.store(CONNECTED, Ordering::SeqCst);
+                tracing::info!("Link: heartbeat restored -> Connected");
+            } else {
+                self.state.store(NO_CAMERA, Ordering::SeqCst);
+                tracing::info!("Link: heartbeat restored but camera unavailable -> NoCamera");
+            }
         }
     }
 
@@ -113,7 +112,9 @@ impl LinkStateMachine {
     }
 
     /// Camera not available -> NoCamera.
+    /// #5: Sets camera_ok flag so heartbeat_restored can check it.
     pub fn camera_unavailable(&self) {
+        self.camera_ok.store(false, Ordering::SeqCst);
         let cur = self.state.load(Ordering::SeqCst);
         if cur != NO_CAMERA {
             self.state.store(NO_CAMERA, Ordering::SeqCst);
@@ -122,7 +123,9 @@ impl LinkStateMachine {
     }
 
     /// Camera available again -> Searching (let heartbeat/telemetry confirm Connected).
+    /// #5: Clears camera_ok flag.
     pub fn camera_available(&self) {
+        self.camera_ok.store(true, Ordering::SeqCst);
         let cur = self.state.load(Ordering::SeqCst);
         if cur == NO_CAMERA {
             self.state.store(SEARCHING, Ordering::SeqCst);

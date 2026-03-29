@@ -165,8 +165,9 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
                         .position(|&b| b == 0xFE || b == 0xFD)
                         .map(|p| p + 1)
                         .unwrap_or(acc.len());
-                    // #23: O(1) advance instead of O(n) drain
-                    acc.advance(skip);
+                    // #2: Keep last 3 bytes — they could be the start of a valid magic sequence
+                    let safe_skip = skip.min(acc.len().saturating_sub(3));
+                    acc.advance(safe_skip);
                     continue;
                 }
                 // #23: O(1) advance instead of O(n) drain
@@ -256,10 +257,12 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
 /// "release back to RC radio" per the MAVLink spec (used for missing channels).
 fn channels_to_override(channels: &[u16], target_system: u8) -> MavMessage {
     let ch = |i: usize| -> u16 { channels.get(i).copied().unwrap_or(0) };
-    // Warn if aux channels 9-16 have non-neutral values — they are silently dropped
+    // #24: Warn aux channels only once (not every 50Hz packet)
+    // Use a static to track if warning was already emitted
+    static AUX_WARNED: AtomicBool = AtomicBool::new(false);
     if channels.len() > 8 {
         let has_aux = channels[8..].iter().any(|&c| c != 0 && c != 1500);
-        if has_aux {
+        if has_aux && !AUX_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "RC channels 9-16 present but RC_CHANNELS_OVERRIDE only supports 8 — aux channels ignored"
             );

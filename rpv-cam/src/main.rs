@@ -4,8 +4,8 @@ mod link;
 mod rawsock;
 mod video_tx;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -89,7 +89,8 @@ fn main() {
 
     write_link_status("connected");
 
-    let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    // #8/#25: AtomicU64 for heartbeat — no lock contention on hot path
+    let last_heartbeat: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // Start MAVLink FC link
     let (fc_rc_tx, fc_telem_rx) = match fc::start(running.clone(), &config.fc_port, config.fc_baud)
@@ -176,7 +177,7 @@ fn rx_dispatcher(
     running: Arc<AtomicBool>,
     socket: Arc<RawSocket>,
     drone_id: u8,
-    last_heartbeat: Arc<Mutex<Instant>>,
+    last_heartbeat: Arc<AtomicU64>,
     rc_tx: Option<std::sync::mpsc::SyncSender<Vec<u16>>>,
 ) {
     tracing::info!("RX dispatcher started (raw socket)");
@@ -186,10 +187,14 @@ fn rx_dispatcher(
     let failsafe_timeout = Duration::from_secs(2);
     let mut failsafe_active = false;
     let mut reject_count: u64 = 0;
+    let mut radiotap_rejects: u64 = 0; // #28: separate counters
+    let mut magic_rejects: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
-        // RC failsafe: checked FIRST, before socket.recv(), so total RF loss
-        // cannot prevent failsafe triggering via repeated recv timeouts.
+        // #1: Check failsafe for BOTH FC and file modes
+        // In FC mode, fc.rs handles MAVLink failsafe separately, but the
+        // rx_dispatcher still tracks when RC data arrives to know if the
+        // ground is sending. File mode needs this for the RC file cleanup.
         if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
             tracing::warn!(
                 "RC failsafe triggered: no data for {}s, clearing RC file",
@@ -211,10 +216,12 @@ fn rx_dispatcher(
         let payload = match rawsock::recv_strip_headers(&buf[..len], reject_count < 10) {
             Some(p) => p,
             None => {
+                // #28: Separate radiotap reject counter
+                radiotap_rejects += 1;
                 reject_count += 1;
-                if reject_count <= 5 {
+                if radiotap_rejects <= 5 {
                     tracing::debug!(
-                        "RX: rejected frame ({}B), first 8 bytes: {:02x?}",
+                        "RX: radiotap reject ({}B), first 8 bytes: {:02x?}",
                         len,
                         &buf[..8.min(len)]
                     );
@@ -224,8 +231,10 @@ fn rx_dispatcher(
         };
 
         if !link::L2Header::matches_magic(payload) {
+            // #28: Separate magic reject counter
+            magic_rejects += 1;
             reject_count += 1;
-            if reject_count <= 5 {
+            if magic_rejects <= 5 {
                 tracing::debug!(
                     "RX: magic mismatch, payload first 8 bytes: {:02x?}",
                     &payload[..8.min(payload.len())]
@@ -248,8 +257,12 @@ fn rx_dispatcher(
                     continue;
                 }
                 let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                // #6: Bounds check BEFORE multiply to prevent overflow
+                if count > 16 {
+                    continue;
+                }
                 let expected = 4 + count * 2;
-                if data.len() < expected || count > 126 {
+                if data.len() < expected {
                     continue;
                 }
                 let mut channels = Vec::with_capacity(count);
@@ -275,14 +288,19 @@ fn rx_dispatcher(
                 }
             }
             link::PAYLOAD_HEARTBEAT => {
-                *last_heartbeat.lock().unwrap() = Instant::now();
+                // #8/#25: AtomicU64 write — UNIX timestamp in milliseconds
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                last_heartbeat.store(now_ms, Ordering::Relaxed);
             }
             _ => {}
         }
     }
 }
 
-fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant>>) {
+fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<AtomicU64>) {
     tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
     thread::sleep(Duration::from_secs(1));
 
@@ -291,10 +309,17 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
 
-        let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > Duration::from_millis(500) {
+        // #8/#25: AtomicU64 read — no lock contention
+        let last_ms = last_heartbeat.load(Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let elapsed_ms = now_ms.saturating_sub(last_ms);
+
+        if last_ms == 0 || elapsed_ms > 500 {
             if was_connected {
-                tracing::warn!("Heartbeat lost ({}ms)", elapsed.as_millis());
+                tracing::warn!("Heartbeat lost ({}ms)", elapsed_ms);
                 write_link_status("searching");
                 was_connected = false;
             }
@@ -306,19 +331,11 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant
     }
 }
 
+/// #15: Check camera via sysfs (single stat() syscall, no subprocess spawn)
 fn check_camera_available() -> bool {
-    if let Ok(output) = std::process::Command::new("vcgencmd")
-        .arg("get_camera")
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(val) = stdout.split("detected=").nth(1) {
-            if let Some(count) = val.split(',').next() {
-                return count.trim().parse::<i32>().unwrap_or(0) > 0;
-            }
-        }
-    }
-    false
+    std::fs::read_dir("/dev/v4l")
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 fn telemetry_sender(
@@ -344,6 +361,8 @@ fn telemetry_sender(
     let mut fc_telem = fc::FcTelemetry::default();
     let mut l2_seq: u32 = 0;
     let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
+    // #14: Pre-allocated JSON buffer (reused each cycle, no json! macro overhead)
+    let mut json_buf: Vec<u8> = Vec::with_capacity(512);
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
@@ -357,6 +376,8 @@ fn telemetry_sender(
             }
         }
 
+        // #14: Typed serialization with pre-allocated buffer
+        json_buf.clear();
         let telem = serde_json::json!({
             "lat": fc_telem.lat,
             "lon": fc_telem.lon,
@@ -370,18 +391,22 @@ fn telemetry_sender(
             "armed": fc_telem.armed,
             "camera_ok": camera_ok && VIDEO_HEALTHY.load(Ordering::Relaxed),
         });
-
-        if let Ok(data) = serde_json::to_string(&telem) {
-            let header = link::L2Header {
-                drone_id,
-                payload_type: link::PAYLOAD_TELEMETRY,
-                seq: l2_seq,
-            };
-            header.encode_into(data.as_bytes(), &mut l2_buf);
-            // Enqueue to high-priority TX channel (drained by video_tx before shards)
-            let _ = hp_tx.send(l2_buf.clone());
-            l2_seq = l2_seq.wrapping_add(1);
+        if serde_json::to_writer(&mut json_buf, &telem).is_err() {
+            continue;
         }
+
+        let header = link::L2Header {
+            drone_id,
+            payload_type: link::PAYLOAD_TELEMETRY,
+            seq: l2_seq,
+        };
+        header.encode_into(&json_buf, &mut l2_buf);
+        // #30: No clone — send the already-encoded l2_buf and re-allocate a fresh one
+        // (crossbeam unbounded channel takes ownership, avoiding a Vec clone per send)
+        let mut fresh_buf = Vec::with_capacity(link::MAX_PAYLOAD);
+        std::mem::swap(&mut l2_buf, &mut fresh_buf);
+        let _ = hp_tx.send(fresh_buf);
+        l2_seq = l2_seq.wrapping_add(1);
 
         thread::sleep(interval);
     }

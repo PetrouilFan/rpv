@@ -252,7 +252,8 @@ impl YuvGpuResources {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // #17: REPLACE instead of ALPHA_BLENDING (H.264 has no alpha channel)
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -454,7 +455,7 @@ impl RpvApp {
 
         if recv_count > 0 {
             if self.yuv_gpu.is_some() {
-                tracing::info!("process_frames: received {} frames, GPU ready", recv_count);
+                tracing::trace!("process_frames: received {} frames, GPU ready", recv_count);
             } else {
                 tracing::warn!("process_frames: received {} frames but GPU resources NOT initialized (yuv_gpu=None)", recv_count);
             }
@@ -462,6 +463,24 @@ impl RpvApp {
 
         let mut had_frame = false;
         if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
+            // #21: Check if resolution changed — reinit GPU textures if needed
+            {
+                let res = gpu.lock().unwrap();
+                if res.video_width != frame.width || res.video_height != frame.height {
+                    tracing::warn!(
+                        "Resolution change detected ({}x{} -> {}x{}), reinitializing GPU",
+                        res.video_width,
+                        res.video_height,
+                        frame.width,
+                        frame.height
+                    );
+                    drop(res);
+                    self.yuv_gpu = None;
+                    self.has_ever_had_frame = false;
+                    self.needs_repaint = true;
+                    return false;
+                }
+            }
             if let Some(recv_time) = frame.recv_time {
                 let latency_ms = recv_time.elapsed().as_millis();
                 if self.state.frame_count % 60 == 0 {
