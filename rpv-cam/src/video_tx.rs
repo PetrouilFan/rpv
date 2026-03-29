@@ -120,7 +120,7 @@ pub fn run(
                 "-f",
                 "v4l2",
                 "-input_format",
-                "mjpeg", // mjpeg for less USB bandwidth; change to yuyv422 to skip MJPEG decode
+                "mjpeg",
                 "-video_size",
                 &format!("{}x{}", width_s, height_s),
                 "-framerate",
