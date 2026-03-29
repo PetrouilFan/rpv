@@ -124,6 +124,8 @@ fn main() {
     let video_framerate = config.framerate;
     let video_bitrate = config.bitrate;
     let video_device = config.video_device.clone();
+    let camera_type = config.camera_type.clone();
+    let rpicam_options = config.rpicam_options.clone();
     let video_handle = thread::spawn(move || {
         pin_thread_to_core(1, Some(50));
         video_tx::run(
@@ -137,6 +139,8 @@ fn main() {
             video_height,
             video_framerate,
             video_device,
+            &camera_type,
+            &rpicam_options,
         );
     });
 

@@ -8,6 +8,10 @@ pub struct Config {
     pub drone_id: u8,
     #[serde(default = "default_video_device")]
     pub video_device: String,
+    #[serde(default = "default_camera_type")]
+    pub camera_type: String,
+    #[serde(default = "default_rpicam_options")]
+    pub rpicam_options: String,
     #[serde(default = "default_fc_port")]
     pub fc_port: String,
     #[serde(default = "default_fc_baud")]
@@ -32,6 +36,14 @@ fn default_drone_id() -> u8 {
 
 fn default_video_device() -> String {
     "/dev/video0".to_string()
+}
+
+fn default_camera_type() -> String {
+    "usb".to_string()
+}
+
+fn default_rpicam_options() -> String {
+    String::new()
 }
 
 fn default_fc_port() -> String {
@@ -64,6 +76,8 @@ impl Default for Config {
             interface: default_interface(),
             drone_id: default_drone_id(),
             video_device: default_video_device(),
+            camera_type: default_camera_type(),
+            rpicam_options: default_rpicam_options(),
             fc_port: default_fc_port(),
             fc_baud: default_fc_baud(),
             video_width: default_video_width(),

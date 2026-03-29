@@ -74,12 +74,20 @@ pub fn run(
     video_height: u32,
     framerate: u32,
     video_device: String,
+    camera_type: &str,
+    rpicam_options: &str,
 ) {
+    let is_csi = camera_type == "csi";
     tracing::info!(
-        "Video sender ready (FEC {}+{}, L2 broadcast, device={})",
+        "Video sender ready (FEC {}+{}, L2 broadcast, device={}, type={})",
         DATA_SHARDS,
         PARITY_SHARDS,
         video_device,
+        if is_csi {
+            "csi (rpicam-vid)"
+        } else {
+            "usb (ffmpeg)"
+        },
     );
 
     let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
@@ -90,8 +98,10 @@ pub fn run(
     let mut use_hw_encoder = true; // false after h264_v4l2m2m fails
 
     while running.load(Ordering::SeqCst) {
+        let proc_name = if is_csi { "rpicam-vid" } else { "ffmpeg" };
         tracing::info!(
-            "Starting ffmpeg (bitrate={}, intra={}, device={})...",
+            "Starting {} (bitrate={}, intra={}, device={})...",
+            proc_name,
             bitrate,
             intra,
             video_device,
@@ -104,63 +114,90 @@ pub fn run(
         let gop_s = intra.to_string();
         let bufsize_s = format!("{}k", (bitrate / framerate).max(1) / 1000);
 
-        // Encoder: h264_v4l2m2m (Pi 5 VPU) or libx264 (software fallback)
-        let encoder_codec = if use_hw_encoder {
-            "h264_v4l2m2m"
-        } else {
-            "libx264"
-        };
-        let mut child = Command::new("ffmpeg");
-        child.args(&[
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-avioflags",
-            "direct",
-            "-probesize",
-            "32768",
-            "-analyzeduration",
-            "0",
-            "-thread_queue_size",
-            "1",
-            "-rtbufsize",
-            "1M",
-            "-f",
-            "v4l2",
-            "-input_format",
-            "mjpeg",
-            "-video_size",
-            &video_size_s,
-            "-framerate",
-            &framerate_s,
-            "-i",
-            &video_device,
-            "-c:v",
-            encoder_codec,
-            "-b:v",
-            &bitrate_s,
-            "-bufsize",
-            &bufsize_s,
-            "-g",
-            &gop_s,
-        ]);
-        // Add libx264-specific options when using software encoder
-        if !use_hw_encoder {
-            child.args(&[
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-crf",
-                "28",
-                "-x264-params",
-                "rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
+        let mut child = if is_csi {
+            let mut cmd = Command::new("rpicam-vid");
+            cmd.args(&[
+                "-t",
+                "0",
+                "--inline",
+                "-o",
+                "pipe:1",
+                "--width",
+                &video_width.to_string(),
+                "--height",
+                &video_height.to_string(),
+                "--framerate",
+                &framerate_s,
+                "--bitrate",
+                &bitrate_s,
             ]);
-        }
-        child.args(&["-f", "h264", "-an", "-y", "pipe:1"]);
-        child.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if !rpicam_options.is_empty() {
+                for opt in rpicam_options.split_whitespace() {
+                    cmd.arg(opt);
+                }
+            }
+            cmd.args(&["--tune", "low-latency"]);
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd
+        } else {
+            // Encoder: h264_v4l2m2m (Pi 5 VPU) or libx264 (software fallback)
+            let encoder_codec = if use_hw_encoder {
+                "h264_v4l2m2m"
+            } else {
+                "libx264"
+            };
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(&[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "nobuffer",
+                "-avioflags",
+                "direct",
+                "-probesize",
+                "32768",
+                "-analyzeduration",
+                "0",
+                "-thread_queue_size",
+                "1",
+                "-rtbufsize",
+                "1M",
+                "-f",
+                "v4l2",
+                "-input_format",
+                "mjpeg",
+                "-video_size",
+                &video_size_s,
+                "-framerate",
+                &framerate_s,
+                "-i",
+                &video_device,
+                "-c:v",
+                encoder_codec,
+                "-b:v",
+                &bitrate_s,
+                "-bufsize",
+                &bufsize_s,
+                "-g",
+                &gop_s,
+            ]);
+            if !use_hw_encoder {
+                cmd.args(&[
+                    "-preset",
+                    "veryfast",
+                    "-tune",
+                    "zerolatency",
+                    "-crf",
+                    "28",
+                    "-x264-params",
+                    "rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
+                ]);
+            }
+            cmd.args(&["-f", "h264", "-an", "-y", "pipe:1"]);
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd
+        };
 
         // #32: If rpv-cam dies, kernel kills ffmpeg automatically (no orphaned zombie)
         unsafe {
@@ -409,14 +446,16 @@ pub fn run(
         // #30: ffmpeg died — signal video health as unhealthy
         VIDEO_HEALTHY.store(false, Ordering::Relaxed);
 
-        // Fallback: if h264_v4l2m2m produced 0 bytes, switch to libx264
-        if total_bytes == 0 && use_hw_encoder {
+        // Fallback: if h264_v4l2m2m produced 0 bytes, switch to libx264 (USB only)
+        if !is_csi && total_bytes == 0 && use_hw_encoder {
             tracing::warn!("h264_v4l2m2m encoder failed, falling back to libx264 (software)");
             use_hw_encoder = false;
         }
 
+        let proc_name = if is_csi { "rpicam-vid" } else { "ffmpeg" };
         tracing::info!(
-            "ffmpeg stopped, sent {:.1} MB total",
+            "{} stopped, sent {:.1} MB total",
+            proc_name,
             total_bytes as f64 / 1_048_576.0
         );
 
