@@ -7,10 +7,6 @@ edition = "2021"
 name = "rpv-ground"
 path = "src/main.rs"
 
-[[bin]]
-name = "rpv-ground-rpi5"
-path = "src/main_rpi5.rs"
-
 [build-dependencies]
 pkg-config = "0.3"
 
@@ -30,3 +26,4 @@ reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 libc          = "0.2"
 crossbeam-channel = "0.5"
 evdev = "0.13"
+arc-swap = "1"

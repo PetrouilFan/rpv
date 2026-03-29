@@ -1,5 +1,6 @@
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
@@ -44,7 +45,7 @@ impl Default for Telemetry {
 }
 
 pub struct TelemetryReceiver {
-    state: Arc<Mutex<Telemetry>>,
+    state: Arc<ArcSwap<Telemetry>>,
     link_state: LinkStateHandle,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
 }
@@ -52,13 +53,13 @@ pub struct TelemetryReceiver {
 impl TelemetryReceiver {
     pub fn new(link_state: LinkStateHandle, rx: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(Telemetry::default())),
+            state: Arc::new(ArcSwap::from_pointee(Telemetry::default())),
             link_state,
             rx,
         }
     }
 
-    pub fn get_state(&self) -> Arc<Mutex<Telemetry>> {
+    pub fn get_state(&self) -> Arc<ArcSwap<Telemetry>> {
         Arc::clone(&self.state)
     }
 
@@ -73,19 +74,14 @@ impl TelemetryReceiver {
                 Ok(payload) => {
                     if let Ok(json_str) = std::str::from_utf8(&payload) {
                         if let Ok(telem) = serde_json::from_str::<Telemetry>(json_str) {
-                            let mut state = self.state.lock().unwrap();
-                            *state = telem;
+                            // #18: Atomic swap — no lock contention on the UI read path
+                            self.state.store(Arc::new(telem));
                             last_telem_time = Instant::now();
-
-                            // Telemetry activity can transition Searching -> Connected,
-                            // but cannot override SignalLost (heartbeat has priority).
                             self.link_state.telemetry_activity();
                         }
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Telemetry timeout is informational only — heartbeat handles
-                    // the actual SignalLost transition to avoid multi-writer races.
                     if last_telem_time.elapsed() > timeout {
                         // No action needed; heartbeat_monitor is the authority.
                     }

@@ -1,9 +1,14 @@
+use bytes::{Buf, BytesMut};
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+// #30: Import video health flag from main
+use crate::VIDEO_HEALTHY;
 
 use reed_solomon_erasure::ReedSolomon;
 
@@ -95,15 +100,18 @@ pub fn run(
         let width_s = video_width.to_string();
         let height_s = video_height.to_string();
         let framerate_s = framerate.to_string();
-        let gop_s = framerate.to_string(); // keyframe every second (min latency)
-                                           // VBV buffer = bitrate / framerate (one frame worth, minimum latency)
+        // #7: Use GOP = intra frames (keyframe interval), not framerate
+        let gop_s = intra.to_string();
         let bufsize_s = format!("{}k", (bitrate / framerate).max(1) / 1000);
-        let child = Command::new("ffmpeg")
+
+        // #7: Use hardware encoder (h264_v4l2m2m) for Pi 5 VPU offload
+        let encoder_codec = "h264_v4l2m2m";
+        let mut child = Command::new("ffmpeg");
+        child
             .args(&[
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                // Global low-latency flags
                 "-fflags",
                 "nobuffer",
                 "-avioflags",
@@ -112,7 +120,6 @@ pub fn run(
                 "32",
                 "-analyzeduration",
                 "0",
-                // Input: V4L2 with minimal kernel buffering
                 "-thread_queue_size",
                 "1",
                 "-rtbufsize",
@@ -127,23 +134,14 @@ pub fn run(
                 &framerate_s,
                 "-i",
                 &video_device,
-                // Output: H.264 with absolute minimum latency
                 "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-crf",
-                "28",
-                "-maxrate",
+                encoder_codec,
+                "-b:v",
                 &bitrate_s,
                 "-bufsize",
                 &bufsize_s,
                 "-g",
                 &gop_s,
-                "-x264-params",
-                "rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
                 "-f",
                 "h264",
                 "-an",
@@ -151,10 +149,17 @@ pub fn run(
                 "pipe:1",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
 
-        let mut child = match child {
+        // #32: If rpv-cam dies, kernel kills ffmpeg automatically (no orphaned zombie)
+        unsafe {
+            child.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+
+        let mut child = match child.spawn() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to start ffmpeg: {}", e);
@@ -207,10 +212,8 @@ pub fn run(
         let mut total_groups: u64 = 0;
         let mut fail_count: u8 = 0;
         let mut last_stats = std::time::Instant::now();
-        // Cursor-based NAL buffer
-        let mut nal_buf: Vec<u8> = vec![0u8; MAX_NAL_BUF];
-        let mut nal_head: usize = 0;
-        let mut nal_tail: usize = 0;
+        // #9: BytesMut ring buffer — O(1) advance instead of copy_within memory shifts
+        let mut nal_buf = BytesMut::with_capacity(MAX_NAL_BUF);
         let mut nal_idle_cycles: u32 = 0;
         const NAL_IDLE_LIMIT: u32 = 200;
         // Reusable buffers for send path
@@ -238,31 +241,28 @@ pub fn run(
                     let mut slot_filled = [0usize; DATA_SHARDS];
                     let mut slot_frag_lens: [usize; DATA_SHARDS] = [0; DATA_SHARDS];
 
-                    let copy_len = n.min(nal_buf.len().saturating_sub(nal_tail));
-                    if copy_len == 0 {
-                        if nal_head > 0 {
-                            let remaining = nal_tail - nal_head;
-                            nal_buf.copy_within(nal_head..nal_tail, 0);
-                            nal_head = 0;
-                            nal_tail = remaining;
-                            let retry = n.min(nal_buf.len().saturating_sub(nal_tail));
-                            nal_buf[nal_tail..nal_tail + retry].copy_from_slice(&read_buf[..retry]);
-                            nal_tail += retry;
+                    // #9: Append new data — BytesMut grows automatically, no manual tail tracking
+                    if nal_buf.len() + n > MAX_NAL_BUF {
+                        // Buffer full — compact by discarding old unparseable data
+                        if nal_buf.len() > MAX_NAL_BUF / 2 {
+                            nal_buf.advance(nal_buf.len() / 2);
                         }
-                    } else {
-                        nal_buf[nal_tail..nal_tail + copy_len]
-                            .copy_from_slice(&read_buf[..copy_len]);
-                        nal_tail += copy_len;
                     }
+                    nal_buf.extend_from_slice(&read_buf[..n]);
 
                     // Track NAL extraction
                     let mut extracted_any = false;
-                    while let Some((nal, consumed)) =
-                        extract_next_nal_cursor(&nal_buf, nal_head, nal_tail)
-                    {
-                        nal_head += consumed;
+                    loop {
+                        let (nal_data, consumed) = match extract_next_nal_cursor(&nal_buf) {
+                            Some((nal, consumed)) => (nal.to_vec(), consumed),
+                            None => break,
+                        };
+                        // #9: O(1) advance — just bumps the read pointer, no memcpy
+                        nal_buf.advance(consumed);
                         extracted_any = true;
                         total_nals += 1;
+                        // #30: Signal video health to telemetry
+                        VIDEO_HEALTHY.store(true, Ordering::Relaxed);
                         let inter_nal_ms = last_nal_time.elapsed().as_millis();
                         last_nal_time = std::time::Instant::now();
 
@@ -280,7 +280,7 @@ pub fn run(
 
                         let mut off = 0;
                         let mut frag_idx: u16 = 0;
-                        while off < nal.len() {
+                        while off < nal_data.len() {
                             let slot = shards_in_group % DATA_SHARDS;
                             let arena_offset = slot_filled[slot];
 
@@ -293,14 +293,15 @@ pub fn run(
                             }
 
                             // Write as much NAL data as fits in this slot
-                            let nal_chunk = &nal[off..nal.len().min(off + MAX_SHARD_DATA)];
+                            let nal_chunk =
+                                &nal_data[off..nal_data.len().min(off + MAX_SHARD_DATA)];
                             let written = arena.write_frag(slot, slot_filled[slot], nal_chunk);
                             slot_filled[slot] += written;
                             off += written;
                             frag_idx += 1;
 
                             // If slot is full or NAL is done, advance
-                            if slot_filled[slot] >= MAX_SHARD_DATA || off >= nal.len() {
+                            if slot_filled[slot] >= MAX_SHARD_DATA || off >= nal_data.len() {
                                 shards_in_group += 1;
 
                                 if shards_in_group == DATA_SHARDS {
@@ -350,29 +351,20 @@ pub fn run(
                         );
                     }
 
-                    if nal_head > 0 && nal_head == nal_tail {
-                        nal_head = 0;
-                        nal_tail = 0;
+                    // #9: No manual compaction needed — BytesMut::advance() handles it
+                    if nal_buf.is_empty() {
                         nal_idle_cycles = 0;
-                    } else if nal_head > 0 && nal_head > nal_buf.len() / 2 {
-                        let remaining = nal_tail - nal_head;
-                        nal_buf.copy_within(nal_head..nal_tail, 0);
-                        nal_head = 0;
-                        nal_tail = remaining;
-                    }
-
-                    if extracted_any {
+                    } else if extracted_any {
                         nal_idle_cycles = 0;
-                    } else if nal_tail > nal_head && nal_tail - nal_head > nal_buf.len() / 2 {
+                    } else if nal_buf.len() > MAX_NAL_BUF / 2 {
                         nal_idle_cycles += 1;
                         if nal_idle_cycles >= NAL_IDLE_LIMIT {
                             tracing::warn!(
                                 "NAL buffer idle reset ({} cycles, {}B unparseable)",
                                 nal_idle_cycles,
-                                nal_tail - nal_head
+                                nal_buf.len()
                             );
-                            nal_head = 0;
-                            nal_tail = 0;
+                            nal_buf.clear();
                             nal_idle_cycles = 0;
                         }
                     }
@@ -386,6 +378,8 @@ pub fn run(
 
         let _ = child.kill();
         let _ = child.wait();
+        // #30: ffmpeg died — signal video health as unhealthy
+        VIDEO_HEALTHY.store(false, Ordering::Relaxed);
 
         tracing::info!(
             "ffmpeg stopped, sent {:.1} MB total",
@@ -399,47 +393,80 @@ pub fn run(
     }
 }
 
-fn extract_next_nal_cursor(buf: &[u8], head: usize, tail: usize) -> Option<(&[u8], usize)> {
-    let data = &buf[head..tail];
+fn extract_next_nal_cursor(data: &[u8]) -> Option<(&[u8], usize)> {
     if data.len() < 4 {
         return None;
     }
 
-    let mut sc1_offset = None;
-    for i in 0..data.len().saturating_sub(3) {
-        if data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1 {
-                sc1_offset = Some(i);
-                break;
+    // #8: Use memchr for SIMD-accelerated search for 0x00 bytes
+    let mut search_from = 0;
+    while search_from < data.len().saturating_sub(3) {
+        let zero_pos = match memchr::memchr(0x00, &data[search_from..]) {
+            Some(p) => search_from + p,
+            None => return None,
+        };
+
+        // Check if this is a start code: 00 00 01 (3-byte) or 00 00 00 01 (4-byte)
+        if zero_pos + 3 < data.len()
+            && data[zero_pos + 1] == 0
+            && data[zero_pos + 2] == 0
+            && data[zero_pos + 3] == 1
+        {
+            // 4-byte start code: 00 00 00 01
+            let nal_start = zero_pos + 4;
+            let mut inner_search = nal_start;
+            while inner_search < data.len().saturating_sub(3) {
+                let next_zero = match memchr::memchr(0x00, &data[inner_search..]) {
+                    Some(p) => inner_search + p,
+                    None => return None,
+                };
+                if next_zero + 3 < data.len()
+                    && data[next_zero + 1] == 0
+                    && data[next_zero + 2] == 0
+                    && data[next_zero + 3] == 1
+                {
+                    return Some((&data[zero_pos..next_zero], next_zero));
+                }
+                if next_zero + 2 < data.len()
+                    && data[next_zero + 1] == 0
+                    && data[next_zero + 2] == 1
+                {
+                    return Some((&data[zero_pos..next_zero], next_zero));
+                }
+                inner_search = next_zero + 1;
             }
-            if data[i + 2] == 1 {
-                sc1_offset = Some(i);
-                break;
-            }
+            return None;
         }
-    }
-    let sc1 = sc1_offset?;
 
-    let sc1_len = if sc1 + 3 < data.len() && data[sc1 + 2] == 0 && data[sc1 + 3] == 1 {
-        4
-    } else {
-        3
-    };
-
-    let nal_start = sc1 + sc1_len;
-
-    for i in nal_start..data.len().saturating_sub(3) {
-        if data[i] == 0 && data[i + 1] == 0 {
-            let is_sc4 = data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1;
-            let is_sc3 = data[i + 2] == 1;
-            if is_sc4 || is_sc3 {
-                let nal = &data[sc1..i];
-                let consumed = i;
-                return Some((nal, consumed));
+        if zero_pos + 2 < data.len() && data[zero_pos + 1] == 0 && data[zero_pos + 2] == 1 {
+            // 3-byte start code: 00 00 01
+            let nal_start = zero_pos + 3;
+            let mut inner_search = nal_start;
+            while inner_search < data.len().saturating_sub(3) {
+                let next_zero = match memchr::memchr(0x00, &data[inner_search..]) {
+                    Some(p) => inner_search + p,
+                    None => return None,
+                };
+                if next_zero + 3 < data.len()
+                    && data[next_zero + 1] == 0
+                    && data[next_zero + 2] == 0
+                    && data[next_zero + 3] == 1
+                {
+                    return Some((&data[zero_pos..next_zero], next_zero));
+                }
+                if next_zero + 2 < data.len()
+                    && data[next_zero + 1] == 0
+                    && data[next_zero + 2] == 1
+                {
+                    return Some((&data[zero_pos..next_zero], next_zero));
+                }
+                inner_search = next_zero + 1;
             }
+            return None;
         }
-    }
 
+        search_from = zero_pos + 1;
+    }
     None
 }
 

@@ -136,10 +136,12 @@ const AVERROR_EAGAIN: i32 = -11;
 
 #[derive(Clone)]
 pub struct DecodedFrame {
-    pub nv12_data: Vec<u8>,
+    /// #11: Separate Y/U/V planes — no CPU interleaving, GPU does conversion
+    pub y_data: Vec<u8>,
+    pub u_data: Vec<u8>,
+    pub v_data: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub stride: u32,
     pub send_ts_us: Option<u64>,
     pub recv_time: Option<std::time::Instant>,
 }
@@ -171,55 +173,134 @@ impl VideoDecoder {
         let width = self.width;
         let height = self.height;
         std::thread::spawn(move || {
+            // #24: Pin decoder to core 2 for consistent decode latency
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_ZERO(&mut set);
+                libc::CPU_SET(2, &mut set);
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
             decode_loop_libavcodec(frame_tx, rx, width, height);
         });
     }
 }
 
-// ── NV12 → RGBA (CPU fallback, kept for main.rs compat) ────────────
+// ── In-process libavcodec decode loop ──────────────────────────────
 
-#[allow(dead_code)]
-pub fn nv12_to_rgba(
-    y_plane: &[u8],
-    uv_plane: &[u8],
-    stride: usize,
-    width: usize,
-    height: usize,
-    rgba: &mut [u8],
+/// Process a decoded AVFrame into separate Y/U/V planes and send it.
+/// #11: No CPU interleaving — output planar YUV for direct GPU upload.
+fn process_decoded_frame(
+    frame: *mut AvFrame,
+    frame_tx: crossbeam_channel::Sender<DecodedFrame>,
+    width: u32,
+    height: u32,
+    frame_count: &mut u64,
 ) {
-    let mut i = 0;
-    for row in 0..height {
-        let uv_row = row / 2;
-        for col in 0..width {
-            let y_idx = row * stride + col;
-            if y_idx >= y_plane.len() {
-                break;
+    let linesize0 = unsafe { (*frame).linesize[0] } as usize;
+    let linesize1 = unsafe { (*frame).linesize[1] } as usize;
+    let linesize2 = unsafe { (*frame).linesize[2] } as usize;
+    let data0 = unsafe { (*frame).data[0] };
+    let data1 = unsafe { (*frame).data[1] };
+    let data2 = unsafe { (*frame).data[2] };
+    let fw = unsafe { (*frame).width } as usize;
+    let fh = unsafe { (*frame).height } as usize;
+    let pix_fmt = unsafe { (*frame).format };
+
+    if data0.is_null() || data1.is_null() {
+        return;
+    }
+
+    if *frame_count == 0 {
+        info!(
+            "Decoded frame: {}x{}, format={}, linesize=[{},{},{}], data2_null={}",
+            fw,
+            fh,
+            pix_fmt,
+            linesize0,
+            linesize1,
+            linesize2,
+            data2.is_null()
+        );
+    }
+
+    if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2 {
+        return;
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+
+    // Copy Y plane — row by row if linesize != width
+    let mut y_data = vec![0u8; w * h];
+    let copy_w = fw.min(w).min(linesize0);
+    let copy_h = fh.min(h);
+    for row in 0..copy_h {
+        let src = unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), copy_w) };
+        y_data[row * w..row * w + copy_w].copy_from_slice(src);
+    }
+
+    // Copy U and V planes — separate planes, no interleaving
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let uv_src_h = if pix_fmt == 1 || pix_fmt == 13 {
+        fh
+    } else {
+        fh / 2
+    };
+    let uv_copy_h = uv_src_h.min(uv_h);
+    let uv_copy_w = (fw / 2).min(uv_w).min(linesize1);
+    let step = if uv_src_h > uv_h { 2 } else { 1 };
+
+    let mut u_data = vec![0u8; uv_w * uv_h];
+    let mut v_data = vec![0u8; uv_w * uv_h];
+
+    if pix_fmt == 23 {
+        // NV12 input: UV is interleaved (U,V,U,V...) — deinterleave into separate planes
+        let uv_interleaved_w = fw.min(linesize1);
+        for row in 0..uv_copy_h {
+            let src =
+                unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_interleaved_w) };
+            for col in 0..uv_copy_w.min(uv_interleaved_w / 2) {
+                u_data[row * uv_w + col] = src[col * 2];
+                v_data[row * uv_w + col] = src[col * 2 + 1];
             }
-            let y_val = y_plane[y_idx] as i32;
-
-            let uv_idx = uv_row * stride + (col & !1);
-            if uv_idx + 1 >= uv_plane.len() {
-                i += 4;
-                continue;
+        }
+    } else {
+        // YUV420P/YUV422P: U and V are in separate planes
+        for out_row in 0..uv_copy_h {
+            let src_row = out_row * step;
+            if src_row * linesize1 < fw * fh {
+                let u_src = unsafe {
+                    std::slice::from_raw_parts(data1.add(src_row * linesize1), uv_copy_w)
+                };
+                u_data[out_row * uv_w..out_row * uv_w + uv_copy_w].copy_from_slice(u_src);
             }
-            let u_val = uv_plane[uv_idx] as i32 - 128;
-            let v_val = uv_plane[uv_idx + 1] as i32 - 128;
-
-            let c = y_val - 16;
-            let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 517 * u_val + 128) >> 8).clamp(0, 255) as u8;
-
-            rgba[i] = r;
-            rgba[i + 1] = g;
-            rgba[i + 2] = b;
-            rgba[i + 3] = 255;
-            i += 4;
+            if !data2.is_null() && src_row * linesize2 < fw * fh {
+                let v_src = unsafe {
+                    std::slice::from_raw_parts(data2.add(src_row * linesize2), uv_copy_w)
+                };
+                v_data[out_row * uv_w..out_row * uv_w + uv_copy_w].copy_from_slice(v_src);
+            }
         }
     }
-}
 
-// ── In-process libavcodec decode loop ──────────────────────────────
+    let decoded = DecodedFrame {
+        y_data,
+        u_data,
+        v_data,
+        width,
+        height,
+        send_ts_us: None,
+        recv_time: Some(std::time::Instant::now()),
+    };
+
+    if frame_tx.try_send(decoded).is_err() {}
+
+    *frame_count += 1;
+    if *frame_count % 30 == 0 {
+        info!("Decoded {} frames (planar YUV, libavcodec)", *frame_count);
+    }
+}
 
 fn decode_loop_libavcodec(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
@@ -227,14 +308,9 @@ fn decode_loop_libavcodec(
     width: u32,
     height: u32,
 ) {
-    let stride = ((width + 31) / 32) * 32;
-    let y_size = (stride * height) as usize;
-    let uv_size = (stride * height / 2) as usize;
-    let total_size = y_size + uv_size;
-
     info!(
-        "libavcodec H.264 decoder initialized: {}x{} stride={} NV12",
-        width, height, stride
+        "libavcodec H.264 decoder initialized: {}x{} planar YUV",
+        width, height
     );
 
     loop {
@@ -269,19 +345,29 @@ fn decode_loop_libavcodec(
         let frame = unsafe { av_frame_alloc() };
 
         info!(
-            "libavcodec H.264 decoder started: {}x{} NV12 (stride={})",
-            width, height, stride
+            "libavcodec H.264 decoder started: {}x{} planar YUV",
+            width, height
         );
 
         let mut frame_count: u64 = 0;
         let mut _decode_err_count: u32 = 0;
 
         'decode_loop: loop {
-            let nal_data = match rx.recv() {
-                Ok(d) => d,
-                Err(_) => {
-                    info!("Decoder input channel closed");
-                    break 'decode_loop;
+            // #12: Drain stale NALs before decoding — only process the latest data
+            // This prevents the decoder from working on outdated video data when behind
+            let nal_data = loop {
+                match rx.recv() {
+                    Ok(d) => {
+                        // Try to drain any remaining pending NALs (keep only the latest)
+                        match rx.try_recv() {
+                            Ok(latest) => break latest,
+                            Err(_) => break d,
+                        }
+                    }
+                    Err(_) => {
+                        info!("Decoder input channel closed");
+                        break 'decode_loop;
+                    }
                 }
             };
 
@@ -318,11 +404,42 @@ fn decode_loop_libavcodec(
 
                     let send_ret = unsafe { avcodec_send_packet(codec_ctx, pkt) };
                     if send_ret < 0 {
-                        _decode_err_count += 1;
-                        if _decode_err_count <= 5 {
-                            warn!("libavcodec: send_packet error {}", send_ret);
+                        // #16: EAGAIN means decoder buffer is full — drain frames, then retry
+                        if send_ret == AVERROR_EAGAIN {
+                            // Drain all available frames before retrying
+                            loop {
+                                let recv_ret = unsafe { avcodec_receive_frame(codec_ctx, frame) };
+                                if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
+                                    break;
+                                }
+                                if recv_ret < 0 {
+                                    break;
+                                }
+                                // Process the drained frame (same as below)
+                                process_decoded_frame(
+                                    frame,
+                                    frame_tx.clone(),
+                                    width,
+                                    height,
+                                    &mut frame_count,
+                                );
+                            }
+                            // Retry sending the same packet now that buffer is drained
+                            let retry_ret = unsafe { avcodec_send_packet(codec_ctx, pkt) };
+                            if retry_ret < 0 {
+                                _decode_err_count += 1;
+                                if _decode_err_count <= 5 {
+                                    warn!("libavcodec: send_packet retry error {}", retry_ret);
+                                }
+                                continue;
+                            }
+                        } else {
+                            _decode_err_count += 1;
+                            if _decode_err_count <= 5 {
+                                warn!("libavcodec: send_packet error {}", send_ret);
+                            }
+                            continue;
                         }
-                        continue;
                     }
 
                     // Drain all available frames
@@ -339,117 +456,13 @@ fn decode_loop_libavcodec(
                             break;
                         }
 
-                        let linesize0 = unsafe { (*frame).linesize[0] } as usize;
-                        let linesize1 = unsafe { (*frame).linesize[1] } as usize;
-                        let data0 = unsafe { (*frame).data[0] };
-                        let data1 = unsafe { (*frame).data[1] };
-                        let data2 = unsafe { (*frame).data[2] };
-                        let fw = unsafe { (*frame).width } as usize;
-                        let fh = unsafe { (*frame).height } as usize;
-                        let pix_fmt = unsafe { (*frame).format };
-
-                        if data0.is_null() || data1.is_null() {
-                            continue;
-                        }
-
-                        // Log pixel format once
-                        if frame_count == 0 {
-                            info!("Decoded frame: {}x{}, format={}, linesize=[{},{},{}], data2_null={}",
-                                fw, fh, pix_fmt, linesize0, linesize1,
-                                unsafe { (*frame).linesize[2] },
-                                data2.is_null());
-                        }
-
-                        // Skip frames with unexpected dimensions (corrupt decode)
-                        if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2
-                        {
-                            continue;
-                        }
-
-                        let mut nv12 = vec![0u8; total_size];
-
-                        // Copy Y plane (row by row for stride mismatch)
-                        // Cap at configured dimensions to prevent buffer overflow
-                        let copy_w = fw.min(stride as usize).min(linesize0);
-                        let copy_h = fh.min(height as usize);
-                        for row in 0..copy_h {
-                            let src = unsafe {
-                                std::slice::from_raw_parts(data0.add(row * linesize0), copy_w)
-                            };
-                            let dst_start = row * stride as usize;
-                            nv12[dst_start..dst_start + copy_w].copy_from_slice(src);
-                        }
-
-                        // Copy UV plane — handle different pixel formats
-                        // YUV420P (format 0/12): UV height = h/2
-                        // YUV422P (format 1/13): UV height = h (full height)
-                        // NV12 (format 23): UV is interleaved, height = h/2
-                        let is_nv12 = pix_fmt == 23;
-                        let uv_src_h = if pix_fmt == 1 || pix_fmt == 13 {
-                            fh // YUV422P: full height UV
-                        } else {
-                            fh / 2 // YUV420P or NV12: half height UV
-                        };
-                        let uv_copy_h = uv_src_h.min(height as usize / 2);
-                        let uv_half_w = (copy_w / 2).min(linesize1);
-
-                        if is_nv12 {
-                            // NV12: copy interleaved UV directly
-                            let uv_copy_w = copy_w.min(linesize1);
-                            for row in 0..uv_copy_h {
-                                let src = unsafe {
-                                    std::slice::from_raw_parts(
-                                        data1.add(row * linesize1),
-                                        uv_copy_w,
-                                    )
-                                };
-                                let dst_start = y_size + row * stride as usize;
-                                nv12[dst_start..dst_start + uv_copy_w].copy_from_slice(src);
-                            }
-                        } else {
-                            // YUV420P or YUV422P: interleave U and V from separate planes
-                            let linesize2 = unsafe { (*frame).linesize[2] } as usize;
-                            // For YUV422P, subsample vertically (take every other row)
-                            let step = if uv_src_h > height as usize / 2 { 2 } else { 1 };
-                            for out_row in 0..uv_copy_h {
-                                let src_row = out_row * step;
-                                let u_row = unsafe {
-                                    std::slice::from_raw_parts(
-                                        data1.add(src_row * linesize1),
-                                        uv_half_w,
-                                    )
-                                };
-                                let v_row = unsafe {
-                                    std::slice::from_raw_parts(
-                                        data2.add(src_row * linesize2),
-                                        uv_half_w,
-                                    )
-                                };
-                                let dst_start = y_size + out_row * stride as usize;
-                                for col in 0..uv_half_w {
-                                    nv12[dst_start + col * 2] = u_row[col];
-                                    nv12[dst_start + col * 2 + 1] = v_row[col];
-                                }
-                            }
-                        }
-
-                        let decoded = DecodedFrame {
-                            nv12_data: nv12,
-                            width: width,
-                            height: height,
-                            stride,
-                            send_ts_us: None,
-                            recv_time: Some(std::time::Instant::now()),
-                        };
-
-                        if frame_tx.try_send(decoded).is_err() {
-                            // Queue full, drop frame for low latency
-                        }
-
-                        frame_count += 1;
-                        if frame_count % 30 == 0 {
-                            info!("Decoded {} frames (NV12, libavcodec)", frame_count);
-                        }
+                        process_decoded_frame(
+                            frame,
+                            frame_tx.clone(),
+                            width,
+                            height,
+                            &mut frame_count,
+                        );
                     }
 
                     unsafe {

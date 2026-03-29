@@ -7,15 +7,16 @@ mod video {
     pub mod decoder;
     pub mod receiver;
 }
-pub mod rc {
+mod rc {
     pub mod joystick;
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use egui::{ColorImage, TextureHandle, Vec2};
+use arc_swap::ArcSwap;
+use egui::Vec2;
 
 use crate::config::Config;
 use crate::link_state::{LinkStateHandle, LinkStatus};
@@ -24,8 +25,349 @@ use crate::telemetry::{Telemetry, TelemetryReceiver};
 use crate::video::decoder::{DecodedFrame as DecodedYUV, VideoDecoder};
 use crate::video::receiver::VideoReceiver;
 
+/// #24: Pin current thread to core + optional SCHED_FIFO
+fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core_id, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if let Some(prio) = fifo_priority {
+            let param = libc::sched_param {
+                sched_priority: prio,
+            };
+            libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+        }
+    }
+}
+
+// ── GPU YUV→RGB conversion via egui PaintCallback ───────────────────
+
+const YUV_SHADER: &str = "
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let x = f32((idx & 1u) << 2u) - 1.0;
+    let y = 1.0 - f32((idx & 2u) << 1u);
+    var out: VertexOutput;
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>(x * 0.5 + 0.5, y * 0.5 + 0.5);
+    return out;
+}
+
+@group(0) @binding(0) var t_y: texture_2d<f32>;
+@group(0) @binding(1) var t_u: texture_2d<f32>;
+@group(0) @binding(2) var t_v: texture_2d<f32>;
+@group(0) @binding(3) var s: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
+    let u_val = textureSample(t_u, s, in.uv).r * 255.0 - 128.0;
+    let v_val = textureSample(t_v, s, in.uv).r * 255.0 - 128.0;
+    let r = (298.0 * y_val + 409.0 * v_val + 128.0) / 256.0;
+    let g = (298.0 * y_val - 100.0 * u_val - 208.0 * v_val + 128.0) / 256.0;
+    let b = (298.0 * y_val + 517.0 * u_val + 128.0) / 256.0;
+    return vec4<f32>(
+        clamp(r / 255.0, 0.0, 1.0),
+        clamp(g / 255.0, 0.0, 1.0),
+        clamp(b / 255.0, 0.0, 1.0),
+        1.0
+    );
+}
+";
+
+/// GPU resources for planar YUV→RGB rendering. #11: 3 separate textures, no CPU interleaving.
+struct YuvGpuResources {
+    #[allow(dead_code)]
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    y_texture: wgpu::Texture,
+    u_texture: wgpu::Texture,
+    v_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
+    video_width: u32,
+    video_height: u32,
+}
+
+impl YuvGpuResources {
+    fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        video_width: u32,
+        video_height: u32,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
+        let y_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("y_plane"),
+            size: wgpu::Extent3d {
+                width: video_width,
+                height: video_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // #11: Separate U and V textures (planar YUV) — no interleaving needed
+        let uv_extent = wgpu::Extent3d {
+            width: video_width / 2,
+            height: video_height / 2,
+            depth_or_array_layers: 1,
+        };
+        let u_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("u_plane"),
+            size: uv_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let u_view = u_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let v_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("v_plane"),
+            size: uv_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let v_view = v_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("yuv_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuv_bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&u_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&v_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("yuv_shader"),
+            source: wgpu::ShaderSource::Wgsl(YUV_SHADER.into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("yuv_pl"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("yuv_rp"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            device,
+            queue,
+            y_texture,
+            u_texture,
+            v_texture,
+            bind_group,
+            pipeline,
+            video_width,
+            video_height,
+        }
+    }
+
+    /// #11: Upload planar Y/U/V planes to GPU textures (no CPU interleaving)
+    fn upload(&self, y_data: &[u8], u_data: &[u8], v_data: &[u8]) {
+        let w = self.video_width as usize;
+        let h = self.video_height as usize;
+        let uv_w = w / 2;
+        let uv_h = h / 2;
+
+        // Y plane — single write_texture call
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.y_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            y_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w as u32),
+                rows_per_image: Some(h as u32),
+            },
+            wgpu::Extent3d {
+                width: w as u32,
+                height: h as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // U plane — single write_texture call
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.u_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            u_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(uv_w as u32),
+                rows_per_image: Some(uv_h as u32),
+            },
+            wgpu::Extent3d {
+                width: uv_w as u32,
+                height: uv_h as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // V plane — single write_texture call
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.v_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            v_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(uv_w as u32),
+                rows_per_image: Some(uv_h as u32),
+            },
+            wgpu::Extent3d {
+                width: uv_w as u32,
+                height: uv_h as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
+/// egui PaintCallback that renders a fullscreen YUV→RGB quad
+struct YuvRenderCallback {
+    resources: Arc<Mutex<YuvGpuResources>>,
+}
+
+impl egui_wgpu::CallbackTrait for YuvRenderCallback {
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        _callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let res = self.resources.lock().unwrap();
+        render_pass.set_pipeline(&res.pipeline);
+        render_pass.set_bind_group(0, &res.bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+// ── App state ───────────────────────────────────────────────────────
+
 pub struct AppState {
-    pub texture: Option<TextureHandle>,
     pub last_frame_time: Instant,
     pub frame_count: u64,
     pub fps_timer: Instant,
@@ -33,36 +375,33 @@ pub struct AppState {
     pub link_status: LinkStatus,
     pub link_state: LinkStateHandle,
     pub config: Config,
-    pub telemetry: Arc<Mutex<Telemetry>>,
+    pub telemetry: Arc<ArcSwap<Telemetry>>,
     pub running: Arc<AtomicBool>,
-    pub rssi: Arc<Mutex<Option<i8>>>,
+    pub rssi: Arc<AtomicI8>,
     pub channels: Arc<Mutex<Vec<u16>>>,
 }
 
 pub struct RpvApp {
     state: AppState,
     frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
-    rgba_buf: Vec<u8>,
     needs_repaint: bool,
     has_ever_had_frame: bool,
-    frame_debug_logged: bool,
+    yuv_gpu: Option<Arc<Mutex<YuvGpuResources>>>,
+    update_logged: bool,
 }
 
 impl RpvApp {
     pub fn new(
         config: Config,
         frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
-        telemetry: Arc<Mutex<Telemetry>>,
+        telemetry: Arc<ArcSwap<Telemetry>>,
         running: Arc<AtomicBool>,
         link_state: LinkStateHandle,
-        rssi: Arc<Mutex<Option<i8>>>,
+        rssi: Arc<AtomicI8>,
         channels: Arc<Mutex<Vec<u16>>>,
     ) -> Self {
-        let w = config.video_width as usize;
-        let h = config.video_height as usize;
         Self {
             state: AppState {
-                texture: None,
                 last_frame_time: Instant::now(),
                 fps_timer: Instant::now(),
                 frame_count: 0,
@@ -76,96 +415,107 @@ impl RpvApp {
                 channels,
             },
             frame_rx,
-            rgba_buf: vec![0u8; w * h * 4],
             needs_repaint: false,
             has_ever_had_frame: false,
-            frame_debug_logged: false,
+            yuv_gpu: None,
+            update_logged: false,
         }
     }
 
-    fn update_texture(&mut self, ctx: &egui::Context) -> bool {
+    fn ensure_gpu_resources(&mut self, frame: &eframe::Frame) {
+        if self.yuv_gpu.is_some() {
+            return;
+        }
+        if let Some(rs) = frame.wgpu_render_state() {
+            tracing::info!(
+                "Initializing GPU YUV→RGB pipeline ({}x{})",
+                self.state.config.video_width,
+                self.state.config.video_height
+            );
+            self.yuv_gpu = Some(Arc::new(Mutex::new(YuvGpuResources::new(
+                rs.device.clone(),
+                rs.queue.clone(),
+                self.state.config.video_width,
+                self.state.config.video_height,
+                rs.target_format,
+            ))));
+        } else {
+            tracing::warn!("wgpu render state not available yet");
+        }
+    }
+
+    fn process_frames(&mut self) -> bool {
         let mut latest = None;
-        let mut recv_count = 0;
+        let mut recv_count = 0usize;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
             recv_count += 1;
         }
 
-        if recv_count > 0 && !self.frame_debug_logged {
-            tracing::info!("update_texture: first batch received {} frames", recv_count);
-            self.frame_debug_logged = true;
-        } else if recv_count > 0 {
-            tracing::debug!("update_texture: received {} frames", recv_count);
+        if recv_count > 0 {
+            if self.yuv_gpu.is_some() {
+                tracing::info!("process_frames: received {} frames, GPU ready", recv_count);
+            } else {
+                tracing::warn!("process_frames: received {} frames but GPU resources NOT initialized (yuv_gpu=None)", recv_count);
+            }
         }
-
-        if recv_count > 1 {
-            tracing::debug!("UI frame queue drain: {} frames dropped", recv_count - 1);
-        }
-        let frame_data = latest;
 
         let mut had_frame = false;
-        if let Some(frame) = frame_data {
-            let w = frame.width as usize;
-            let h = frame.height as usize;
-            let stride = frame.stride as usize;
-
-            let y_size = stride * h;
-            let uv_size = stride * h / 2;
-
-            if frame.nv12_data.len() >= y_size + uv_size {
-                let y_plane = &frame.nv12_data[0..y_size];
-                let uv_plane = &frame.nv12_data[y_size..y_size + uv_size];
-
-                crate::video::decoder::nv12_to_rgba(
-                    y_plane,
-                    uv_plane,
-                    stride,
-                    w,
-                    h,
-                    &mut self.rgba_buf,
-                );
-
-                let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buf);
-
-                if let Some(ref mut tex) = self.state.texture {
-                    tex.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.state.texture =
-                        Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
+        if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
+            if let Some(recv_time) = frame.recv_time {
+                let latency_ms = recv_time.elapsed().as_millis();
+                if self.state.frame_count % 60 == 0 {
+                    tracing::info!(
+                        "decode-to-display latency: {}ms, dropped {} stale frames",
+                        latency_ms,
+                        recv_count.saturating_sub(1)
+                    );
                 }
-
-                self.state.frame_count += 1;
-                self.state.last_frame_time = Instant::now();
-
-                if self.state.frame_count == 60 {
-                    self.state.fps = 60.0 / self.state.fps_timer.elapsed().as_secs_f64();
-                    self.state.frame_count = 0;
-                    self.state.fps_timer = Instant::now();
-                }
-
-                // Notify link state machine that video is flowing.
-                // This only transitions Searching->Connected, never overrides SignalLost.
-                self.state.link_state.video_frame_decoded();
-                self.has_ever_had_frame = true;
-                had_frame = true;
             }
+
+            // #11: Upload planar Y/U/V directly — no stride packing, no interleaving
+            let res = gpu.lock().unwrap();
+            res.upload(&frame.y_data, &frame.u_data, &frame.v_data);
+            drop(res);
+
+            self.state.frame_count += 1;
+            self.state.last_frame_time = Instant::now();
+
+            if self.state.frame_count == 30 {
+                self.state.fps = 30.0 / self.state.fps_timer.elapsed().as_secs_f64();
+                self.state.frame_count = 0;
+                self.state.fps_timer = Instant::now();
+            }
+
+            self.state.link_state.video_frame_decoded();
+            self.has_ever_had_frame = true;
+            had_frame = true;
         }
         had_frame
     }
 }
 
 impl eframe::App for RpvApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.state.running.load(Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        let had_frame = self.update_texture(ctx);
+        if !self.update_logged {
+            tracing::info!(
+                "update() called, wgpu_render_state available: {}",
+                frame.wgpu_render_state().is_some()
+            );
+            self.update_logged = true;
+        }
+
+        self.ensure_gpu_resources(frame);
+        let had_frame = self.process_frames();
         self.needs_repaint = had_frame;
 
         if !self.has_ever_had_frame {
-            let telem = self.state.telemetry.lock().unwrap();
+            let telem = self.state.telemetry.load();
             if !telem.camera_ok && self.state.link_status != LinkStatus::NoCamera {
                 self.state.link_state.camera_unavailable();
                 self.needs_repaint = true;
@@ -175,7 +525,6 @@ impl eframe::App for RpvApp {
             }
         }
 
-        // Read authoritative link state from the state machine.
         let new_status = self.state.link_state.get();
         if new_status != self.state.link_status {
             self.state.link_status = new_status;
@@ -185,7 +534,7 @@ impl eframe::App for RpvApp {
         if self.needs_repaint {
             ctx.request_repaint();
         } else if self.state.link_status == LinkStatus::Connected {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -199,7 +548,7 @@ impl eframe::App for RpvApp {
             .show(ctx, |ui| {
                 let available = ui.available_size();
 
-                if let Some(ref tex) = self.state.texture {
+                if self.has_ever_had_frame {
                     let tex_size = Vec2::new(
                         self.state.config.video_width as f32,
                         self.state.config.video_height as f32,
@@ -220,7 +569,16 @@ impl eframe::App for RpvApp {
                         egui::Color32::BLACK,
                     );
 
-                    egui::Image::from_texture(tex).paint_at(ui, rect);
+                    // GPU YUV→RGB via egui PaintCallback
+                    // Draw directly in the CentralPanel (no Area wrapper) so the
+                    // video renders in the correct sequence relative to the OSD.
+                    if let Some(ref gpu) = self.yuv_gpu {
+                        let callback = YuvRenderCallback {
+                            resources: gpu.clone(),
+                        };
+                        let paint_cb = egui_wgpu::Callback::new_paint_callback(rect, callback);
+                        ui.painter().add(paint_cb);
+                    }
                 } else {
                     ui.painter().rect_filled(
                         ui.available_rect_before_wrap(),
@@ -249,7 +607,8 @@ impl eframe::App for RpvApp {
 
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
-    let telem = state.telemetry.lock().unwrap().clone();
+    // #18: ArcSwap load — lock-free read, returns Arc<Telemetry>
+    let telem = state.telemetry.load();
     let p = ui.painter();
 
     // ── Top-left: link status, FPS, RSSI ──
@@ -262,6 +621,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         LinkStatus::NoCamera => ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false),
     };
 
+    // Blinking dot
     let dot_visible = if show_dot {
         true
     } else {
@@ -294,19 +654,27 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     );
     y += 16.0;
 
-    let rssi_val = state.rssi.lock().unwrap().clone();
-    let (rssi_text, rssi_color) = match rssi_val {
-        Some(dbm) if dbm >= -50 => (
-            format!("SIG: {} dBm (excellent)", dbm),
+    // #17: AtomicI8 read — no lock needed, -128 = "no signal" sentinel
+    let rssi_raw = state.rssi.load(Ordering::Relaxed);
+    let (rssi_text, rssi_color) = if rssi_raw == -128i8 {
+        ("SIG: ---".to_string(), egui::Color32::from_gray(100))
+    } else if rssi_raw >= -50 {
+        (
+            format!("SIG: {} dBm (excellent)", rssi_raw),
             egui::Color32::GREEN,
-        ),
-        Some(dbm) if dbm >= -70 => (
-            format!("SIG: {} dBm (good)", dbm),
+        )
+    } else if rssi_raw >= -70 {
+        (
+            format!("SIG: {} dBm (good)", rssi_raw),
             egui::Color32::from_rgb(100, 255, 100),
-        ),
-        Some(dbm) if dbm >= -80 => (format!("SIG: {} dBm (weak)", dbm), egui::Color32::YELLOW),
-        Some(dbm) => (format!("SIG: {} dBm (poor)", dbm), egui::Color32::RED),
-        None => ("SIG: ---".to_string(), egui::Color32::from_gray(100)),
+        )
+    } else if rssi_raw >= -80 {
+        (
+            format!("SIG: {} dBm (weak)", rssi_raw),
+            egui::Color32::YELLOW,
+        )
+    } else {
+        (format!("SIG: {} dBm (poor)", rssi_raw), egui::Color32::RED)
     };
     p.text(
         egui::pos2(10.0, y),
@@ -448,7 +816,7 @@ fn main() -> Result<(), eframe::Error> {
         .with_target(false)
         .init();
 
-    tracing::info!("rpv ground station starting (monitor mode)");
+    tracing::info!("rpv ground station starting (Pi 5, monitor mode)");
 
     let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
@@ -461,7 +829,6 @@ fn main() -> Result<(), eframe::Error> {
     })
     .expect("Failed to set ctrl+c handler");
 
-    // Open raw AF_PACKET socket on the configured interface (must be in monitor mode)
     let socket = match RawSocket::new(&config.interface) {
         Ok(s) => {
             tracing::info!("Raw socket bound to {} (monitor mode)", config.interface);
@@ -469,34 +836,27 @@ fn main() -> Result<(), eframe::Error> {
         }
         Err(e) => {
             tracing::error!("Failed to open raw socket on {}: {}", config.interface, e);
-            tracing::error!(
-                "Make sure the interface is in monitor mode: iw dev {} set type monitor",
-                config.interface
-            );
             std::process::exit(1);
         }
     };
 
-    // Shared link state machine
     let link_state = LinkStateHandle::new();
 
-    // Shared RSSI from camera (dBm, updated by RX dispatcher)
-    let rssi_shared: Arc<Mutex<Option<i8>>> = Arc::new(Mutex::new(None));
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
-    // Channel for video NAL data: RX dispatcher -> VideoReceiver
-    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
-    // Channel for decoded video frames: VideoReceiver -> VideoDecoder
-    // Bounded(4) + blocking send forces FEC thread to pace the pipeline naturally
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
-    // Channel for telemetry JSON: RX dispatcher -> TelemetryReceiver
-    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
+    // #31: Static byte array — no heap allocation for a simple channel test
+    static TEST_DATA: [u8; 8] = [0x52, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+    video_payload_tx
+        .try_send(TEST_DATA.to_vec())
+        .expect("video channel test failed");
+    tracing::info!("Video channel test OK");
 
-    // Create the decoder pipeline
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
     let ui_frame_rx = decoder.get_rx();
     decoder.spawn(video_frame_rx_decoder);
 
-    // Create telemetry receiver
     let telemetry = TelemetryReceiver::new(link_state.clone(), telem_payload_rx);
     let telemetry_state = telemetry.get_state();
 
@@ -504,11 +864,12 @@ fn main() -> Result<(), eframe::Error> {
         config.save();
     }
 
-    // ---- Background threads ----
+    // #22: AtomicU64 for heartbeat — stores UNIX timestamp in milliseconds
+    // No lock needed for the hot-path read in heartbeat_monitor
+    let last_heartbeat: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // #17: AtomicI8 for RSSI — -128 sentinel = "no signal"
+    let rssi_shared: Arc<AtomicI8> = Arc::new(AtomicI8::new(-128i8));
 
-    let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
-
-    // RX dispatcher: single reader from raw socket, strips Radiotap, dispatches by L2 type
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
     let rx_video_tx = video_payload_tx;
@@ -517,6 +878,8 @@ fn main() -> Result<(), eframe::Error> {
     let rx_last_hb = Arc::clone(&last_heartbeat);
     let rx_rssi = Arc::clone(&rssi_shared);
     let _rx_handle = std::thread::spawn(move || {
+        // #24: Pin RX dispatcher to core 0, SCHED_FIFO for socket I/O latency
+        pin_thread_to_core(0, Some(50));
         rx_dispatcher(
             rx_running,
             rx_socket,
@@ -528,18 +891,15 @@ fn main() -> Result<(), eframe::Error> {
         );
     });
 
-    // Video receiver thread: FEC reassembly from video payload channel
     let vr = VideoReceiver::new(video_frame_tx, video_payload_rx);
     let _vr_handle = std::thread::spawn(move || {
         vr.run();
     });
 
-    // Telemetry receiver thread
     let _telem_handle = std::thread::spawn(move || {
         telemetry.run();
     });
 
-    // RC joystick thread
     let rc_socket = Arc::clone(&socket);
     let rc_drone_id = config.drone_id;
     let rc_running = running.clone();
@@ -549,7 +909,6 @@ fn main() -> Result<(), eframe::Error> {
         rc.run();
     });
 
-    // Heartbeat sender thread
     let hb_running = running.clone();
     let hb_socket = Arc::clone(&socket);
     let hb_drone_id = config.drone_id;
@@ -557,7 +916,6 @@ fn main() -> Result<(), eframe::Error> {
         heartbeat_sender(hb_running, hb_socket, hb_drone_id);
     });
 
-    // Heartbeat monitor thread: detects when camera stops sending heartbeats
     let hm_running = running.clone();
     let hm_last = Arc::clone(&last_heartbeat);
     let hm_link_state = link_state.clone();
@@ -565,13 +923,12 @@ fn main() -> Result<(), eframe::Error> {
         heartbeat_monitor(hm_running, hm_last, hm_link_state);
     });
 
-    // Run egui on main thread with custom wgpu limits for Pi 5 V3D GPU
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Fifo,
             device_descriptor: std::sync::Arc::new(|_adapter| {
                 let limits = wgpu::Limits {
                     max_texture_dimension_1d: 4096,
@@ -609,21 +966,22 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-/// Single raw socket RX dispatcher.
-/// Reads all incoming frames, strips Radiotap, filters by L2 magic+drone_id,
-/// then dispatches by payload type to the appropriate channels.
 fn rx_dispatcher(
     running: Arc<AtomicBool>,
     socket: Arc<RawSocket>,
     drone_id: u8,
     video_tx: crossbeam_channel::Sender<Vec<u8>>,
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
-    last_heartbeat: Arc<Mutex<Instant>>,
-    rssi: Arc<Mutex<Option<i8>>>,
+    last_heartbeat: Arc<AtomicU64>,
+    rssi: Arc<AtomicI8>,
 ) {
     tracing::info!("RX dispatcher started (raw socket)");
     let mut buf = vec![0u8; 65536];
     let mut reject_count: u64 = 0;
+    let mut video_count: u64 = 0;
+    let mut telemetry_count: u64 = 0;
+    let mut heartbeat_count: u64 = 0;
+    let mut total_frames: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
@@ -635,34 +993,34 @@ fn rx_dispatcher(
             }
         };
 
-        // Strip Radiotap + 802.11 header, extract RSSI
         let (payload, frame_rssi) = match rawsock::recv_extract(&buf[..len], reject_count < 10) {
             Some(p) => p,
             None => {
                 reject_count += 1;
-                if reject_count <= 5 {
-                    tracing::debug!(
-                        "RX: rejected frame ({}B), first 8 bytes: {:02x?}",
+                if reject_count <= 10 || reject_count % 500 == 0 {
+                    tracing::warn!(
+                        "RX: rejected frame #{} ({}B), first 16 bytes: {:02x?}",
+                        reject_count,
                         len,
-                        &buf[..8.min(len)]
+                        &buf[..16.min(len)]
                     );
                 }
                 continue;
             }
         };
 
-        // Update RSSI if available
+        // #17: AtomicI8 write — no lock contention on the hot RX path
         if let Some(rssi_val) = frame_rssi {
-            *rssi.lock().unwrap() = Some(rssi_val);
+            rssi.store(rssi_val, Ordering::Relaxed);
         }
 
-        // Check magic and drone_id
         if !link::L2Header::matches_magic(payload) {
             reject_count += 1;
-            if reject_count <= 5 {
-                tracing::debug!(
-                    "RX: magic mismatch, payload first 8 bytes: {:02x?}",
-                    &payload[..8.min(payload.len())]
+            if reject_count <= 10 || reject_count % 500 == 0 {
+                tracing::warn!(
+                    "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
+                    reject_count,
+                    &payload[..16.min(payload.len())]
                 );
             }
             continue;
@@ -673,31 +1031,82 @@ fn rx_dispatcher(
         };
 
         if header.drone_id != drone_id {
-            continue; // different swarm
+            continue;
+        }
+
+        total_frames += 1;
+        if total_frames % 500 == 0 {
+            tracing::info!(
+                "RX stats: total={} video={} telem={} hb={} rejected={}",
+                total_frames,
+                video_count,
+                telemetry_count,
+                heartbeat_count,
+                reject_count
+            );
         }
 
         match header.payload_type {
             link::PAYLOAD_VIDEO => {
+                video_count += 1;
                 if video_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Video queue dropped (backpressure)");
                 }
             }
             link::PAYLOAD_TELEMETRY => {
+                telemetry_count += 1;
                 if telem_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Telemetry queue dropped");
                 }
             }
             link::PAYLOAD_HEARTBEAT => {
-                *last_heartbeat.lock().unwrap() = Instant::now();
+                heartbeat_count += 1;
+                // #22: AtomicU64 write — stores UNIX timestamp in milliseconds
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                last_heartbeat.store(now_ms, Ordering::Relaxed);
             }
-            _ => {}
+            _ => {
+                tracing::debug!("RX: unknown payload type 0x{:02x}", header.payload_type);
+            }
         }
     }
-
-    tracing::info!("RX dispatcher stopped");
 }
 
-/// Heartbeat sender — sends heartbeat packets via raw socket at 10Hz.
+fn heartbeat_monitor(
+    running: Arc<AtomicBool>,
+    last_heartbeat: Arc<AtomicU64>,
+    link_state: LinkStateHandle,
+) {
+    tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let mut ever_connected = false;
+
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // #22: AtomicU64 read — no lock contention
+        let last_ms = last_heartbeat.load(Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let elapsed_ms = now_ms.saturating_sub(last_ms);
+
+        if last_ms == 0 || elapsed_ms > 500 {
+            if ever_connected {
+                link_state.heartbeat_lost();
+            }
+        } else {
+            ever_connected = true;
+            link_state.heartbeat_restored();
+        }
+    }
+}
+
 fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
     tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
     let mut l2_seq: u32 = 0;
@@ -711,7 +1120,6 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Heartbeat payload: [7B "rpv-bea"][4B seq][8B timestamp]
         payload_buf.clear();
         payload_buf.extend_from_slice(b"rpv-bea");
         payload_buf.extend_from_slice(&l2_seq.to_le_bytes());
@@ -727,33 +1135,5 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
 
         l2_seq = l2_seq.wrapping_add(1);
         std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-/// Heartbeat monitor — detects when camera stops sending heartbeats.
-/// This is the PRIMARY link liveness source. Only heartbeat transitions
-/// can override SignalLost back to Connected.
-fn heartbeat_monitor(
-    running: Arc<AtomicBool>,
-    last_heartbeat: Arc<Mutex<Instant>>,
-    link_state: LinkStateHandle,
-) {
-    tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
-    std::thread::sleep(std::time::Duration::from_secs(1)); // initial grace period
-
-    let mut ever_connected = false;
-
-    while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let elapsed = last_heartbeat.lock().unwrap().elapsed();
-        if elapsed > std::time::Duration::from_millis(500) {
-            if ever_connected {
-                link_state.heartbeat_lost();
-            }
-        } else {
-            ever_connected = true;
-            link_state.heartbeat_restored();
-        }
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -7,6 +6,8 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 const DATA_SHARDS: usize = 1;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+/// #13: Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
+const RING_SIZE: usize = 256;
 /// Only need 1 shard (data shard) since parity is not sent
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
 ///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
@@ -47,7 +48,7 @@ impl VideoReceiver {
     }
 
     fn check_stall(
-        blocks: &mut HashMap<u32, RsBlock>,
+        blocks: &mut [Option<RsBlock>; RING_SIZE],
         next_block: &mut Option<u32>,
         last_decode_time: &mut Instant,
         nal_buf: &mut Vec<u8>,
@@ -55,13 +56,13 @@ impl VideoReceiver {
     ) -> bool {
         if let Some(cur) = *next_block {
             if last_decode_time.elapsed() > STALL_TIMEOUT {
-                if let Some(block) = blocks.get(&cur) {
+                let idx = (cur as usize) % RING_SIZE;
+                if let Some(ref block) = blocks[idx] {
                     warn!(
                         "RS: block {} stalled (had {}/{} shards), dropping",
                         cur, block.received, DATA_SHARDS
                     );
                 } else {
-                    // Only log occasionally to avoid spam during large gaps
                     if cur % 100 == 0 {
                         warn!("RS: block {} stalled (no shards received), dropping", cur);
                     }
@@ -70,14 +71,18 @@ impl VideoReceiver {
                     nal_buf.clear();
                     *nal_started = false;
                 }
-                blocks.remove(&cur);
-                // Jump to nearest available block in HashMap instead of +1
-                let next_seq = blocks
-                    .keys()
-                    .filter(|&&k| k.wrapping_sub(cur) < 0x8000_0000) // ahead of cur
-                    .min_by_key(|&&k| k.wrapping_sub(cur))
-                    .copied();
-                *next_block = next_seq.or(Some(cur.wrapping_add(1)));
+                blocks[idx] = None;
+                // Jump to nearest available block in ring buffer
+                let mut next_seq = cur.wrapping_add(1);
+                for offset in 1..RING_SIZE {
+                    let check_seq = cur.wrapping_add(offset as u32);
+                    let check_idx = (check_seq as usize) % RING_SIZE;
+                    if blocks[check_idx].is_some() {
+                        next_seq = check_seq;
+                        break;
+                    }
+                }
+                *next_block = Some(next_seq);
                 *last_decode_time = Instant::now();
                 return true;
             }
@@ -89,8 +94,12 @@ impl VideoReceiver {
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 
-        let mut blocks: HashMap<u32, RsBlock> = HashMap::new();
-        let mut processed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // #13: Fixed-size ring buffer — O(1) zero-allocation lookups via seq % RING_SIZE
+        let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
+        // #15: Ring buffer for processed sequence tracking — O(1) check
+        let mut processed_ring: [u32; RING_SIZE] = [0; RING_SIZE];
+        let mut processed_head: usize = 0;
+        let mut processed_count: usize = 0;
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
         let mut _block_count: u64 = 0;
@@ -170,8 +179,18 @@ impl VideoReceiver {
             }
             let shard_data = payload[DATA_START..].to_vec();
 
-            // Skip already-processed blocks (prevents duplicate NALs from FEC 1+1)
-            if processed.contains(&block_seq) {
+            // #15: O(1) ring buffer check instead of HashSet.contains
+            let is_processed = {
+                let mut found = false;
+                for i in 0..processed_count {
+                    if processed_ring[(processed_head + i) % RING_SIZE] == block_seq {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if is_processed {
                 continue;
             }
 
@@ -179,27 +198,20 @@ impl VideoReceiver {
                 next_block = Some(block_seq);
             }
 
-            // Prune blocks that are too old (more than 256 behind the latest received)
-            if !blocks.is_empty() {
-                let max_seq = blocks.keys().max().copied().unwrap_or(0);
-                blocks.retain(|&k, _| {
-                    let age = max_seq.wrapping_sub(k);
-                    age < 256
+            // #13: O(1) ring buffer lookup — no HashMap allocation or hashing
+            let idx = (block_seq as usize) % RING_SIZE;
+
+            // #13: Direct array access instead of HashMap entry API
+            if blocks[idx].is_none() {
+                blocks[idx] = Some(RsBlock {
+                    shards: vec![None; TOTAL_SHARDS],
+                    shard_sizes: vec![0; TOTAL_SHARDS],
+                    received: 0,
+                    actual_data_shards,
+                    shard_lens: parsed_shard_lens,
                 });
             }
-
-            let block = blocks.entry(block_seq).or_insert_with(|| RsBlock {
-                shards: vec![None; TOTAL_SHARDS],
-                shard_sizes: vec![0; TOTAL_SHARDS],
-                received: 0,
-                actual_data_shards,
-                shard_lens: parsed_shard_lens,
-            });
-
-            // Always update shard_lens from any received shard (sender puts
-            // the full array in every shard header). This ensures that even if
-            // shard i was lost and reconstructed, we still have its original length.
-            block.shard_lens = parsed_shard_lens;
+            let block = blocks[idx].as_mut().unwrap();
 
             if block.shards[shard_index].is_none() {
                 block.received += 1;
@@ -207,15 +219,17 @@ impl VideoReceiver {
             }
             block.shards[shard_index] = Some(shard_data);
 
-            // Scan ALL blocks and process any that have enough shards
-            // This handles out-of-order delivery and gaps gracefully
-            let ready: Vec<u32> = blocks
-                .iter()
-                .filter(|(_, b)| b.received >= DATA_SHARDS)
-                .map(|(&k, _)| k)
-                .collect();
-            for seq in ready {
-                let block = blocks.remove(&seq).unwrap();
+            // #13: Scan ring buffer for blocks with enough shards
+            let mut ready_slots: Vec<usize> = Vec::new();
+            for slot in 0..RING_SIZE {
+                if let Some(ref block) = blocks[slot] {
+                    if block.received >= DATA_SHARDS {
+                        ready_slots.push(slot);
+                    }
+                }
+            }
+            for slot in ready_slots {
+                let block = blocks[slot].take().unwrap();
                 let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
                 if let Some(data_shards) = reconstructed {
                     fec_recovered += 1;
@@ -240,13 +254,11 @@ impl VideoReceiver {
                             continue;
                         }
 
-                        // Skip the 2-byte frag_index header, send the NAL data directly
                         let frag_payload = &trimmed[2..];
                         if frag_payload.is_empty() {
                             continue;
                         }
 
-                        // Log first NALs to debug corruption
                         if fec_recovered <= 5 {
                             info!(
                                 "NAL #{}: {} bytes, first16={:02x?}",
@@ -256,31 +268,42 @@ impl VideoReceiver {
                             );
                         }
 
-                        // The shard data already contains the NAL start code
-                        // (00 00 00 01 or 00 00 01). Send as-is.
                         if let Err(e) = self.tx.send(frag_payload.to_vec()) {
                             warn!("Video frame channel closed: {}", e);
                         }
                     }
                     _block_count += 1;
-                    processed.insert(seq);
-                    // Advance next_block past this recovered block
+                    // #15: Add to processed ring buffer (O(1))
+                    if processed_count < RING_SIZE {
+                        processed_ring[(processed_head + processed_count) % RING_SIZE] = block_seq;
+                        processed_count += 1;
+                    } else {
+                        processed_ring[processed_head] = block_seq;
+                        processed_head = (processed_head + 1) % RING_SIZE;
+                    }
                     if let Some(nb) = next_block {
-                        if seq >= nb {
-                            next_block = Some(seq.wrapping_add(1));
+                        if block_seq >= nb {
+                            next_block = Some(block_seq.wrapping_add(1));
                         }
                     }
                     last_decode_time = Instant::now();
                 } else {
                     fec_dropped += 1;
-                    processed.insert(seq);
+                    // #15: Add to processed ring buffer
+                    if processed_count < RING_SIZE {
+                        processed_ring[(processed_head + processed_count) % RING_SIZE] = block_seq;
+                        processed_count += 1;
+                    } else {
+                        processed_ring[processed_head] = block_seq;
+                        processed_head = (processed_head + 1) % RING_SIZE;
+                    }
                     if nal_started {
                         nal_buf.clear();
                         nal_started = false;
                     }
                     if let Some(nb) = next_block {
-                        if seq >= nb {
-                            next_block = Some(seq.wrapping_add(1));
+                        if block_seq >= nb {
+                            next_block = Some(block_seq.wrapping_add(1));
                         }
                     }
                 }
@@ -294,12 +317,7 @@ impl VideoReceiver {
                 &mut nal_started,
             );
 
-            // Periodic cleanup of processed set to prevent memory leak
-            if processed.len() > 1000 {
-                if let Some(nb) = next_block {
-                    processed.retain(|&s| nb.wrapping_sub(s) < 500);
-                }
-            }
+            // #15: Ring buffer handles cleanup automatically — no periodic retain needed
         }
     }
 }

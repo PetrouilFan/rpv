@@ -13,6 +13,40 @@ use rawsock::RawSocket;
 
 const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
+/// #24: Pin the current thread to a specific CPU core and optionally set SCHED_FIFO.
+fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core_id, &mut set);
+        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if ret < 0 {
+            tracing::warn!(
+                "Failed to pin thread to core {}: {}",
+                core_id,
+                std::io::Error::last_os_error()
+            );
+        }
+
+        if let Some(prio) = fifo_priority {
+            let param = libc::sched_param {
+                sched_priority: prio,
+            };
+            let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+            if ret < 0 {
+                tracing::warn!(
+                    "Failed to set SCHED_FIFO priority {}: {}",
+                    prio,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+/// #30: Video health flag — set by video_tx when NALs are being extracted
+static VIDEO_HEALTHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn write_link_status(status: &str) {
     let _ = std::fs::write(STATUS_FILE, status);
 }
@@ -23,7 +57,7 @@ fn main() {
         .with_level(true)
         .init();
 
-    tracing::info!("rpv-cam starting on Raspberry Pi Zero 2W (monitor mode)");
+    tracing::info!("rpv-cam starting (Pi 5, monitor mode)");
 
     let (config, _was_default) = config::Config::load();
     tracing::info!("Config: {:?}", config);
@@ -64,15 +98,14 @@ fn main() {
         None => (None, None),
     };
 
-    // Start the raw socket RX dispatcher thread.
-    // This is the single reader from the AF_PACKET socket.
-    // It strips Radiotap, parses L2 headers, and dispatches by payload type.
+    // Start the raw socket RX dispatcher thread — #24: pin to core 0, SCHED_FIFO priority 50
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
     let rx_last_hb = Arc::clone(&last_heartbeat);
     let rx_drone_id = config.drone_id;
     let rx_rc_tx = fc_rc_tx.clone();
     let rx_handle = thread::spawn(move || {
+        pin_thread_to_core(0, Some(50));
         rx_dispatcher(rx_running, rx_socket, rx_drone_id, rx_last_hb, rx_rc_tx);
     });
 
@@ -82,7 +115,7 @@ fn main() {
         crossbeam_channel::Receiver<Vec<u8>>,
     ) = crossbeam_channel::unbounded();
 
-    // Start video capture and streaming
+    // Start video capture and streaming — #24: pin to core 1, SCHED_FIFO priority 50
     let video_running = running.clone();
     let video_socket = Arc::clone(&socket);
     let video_width = config.video_width;
@@ -91,6 +124,7 @@ fn main() {
     let video_bitrate = config.bitrate;
     let video_device = config.video_device.clone();
     let video_handle = thread::spawn(move || {
+        pin_thread_to_core(1, Some(50));
         video_tx::run(
             video_running,
             video_socket,
@@ -105,14 +139,7 @@ fn main() {
         );
     });
 
-    // Start RC file fallback if no FC link
-    if fc_rc_tx.is_none() {
-        tracing::info!(
-            "No FC link — RC commands will be written to file (received via raw socket)"
-        );
-    }
-
-    // Start telemetry sender — sends FC telemetry or placeholder over raw socket
+    // Start telemetry sender
     let telem_running = running.clone();
     let telem_socket = Arc::clone(&socket);
     let telem_handle = thread::spawn(move || {
@@ -125,12 +152,17 @@ fn main() {
         );
     });
 
-    // Start heartbeat monitor (triggers link status based on last_heartbeat)
+    // Start heartbeat monitor
     let hm_running = running.clone();
     let hm_last = Arc::clone(&last_heartbeat);
     let hm_handle = thread::spawn(move || {
         heartbeat_monitor(hm_running, hm_last);
     });
+
+    // Wait for shutdown
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(500));
+    }
 
     rx_handle.join().ok();
     video_handle.join().ok();
@@ -140,9 +172,6 @@ fn main() {
     tracing::info!("rpv-cam stopped");
 }
 
-/// Single raw socket RX dispatcher.
-/// Reads all incoming frames, strips Radiotap, filters by L2 magic+drone_id,
-/// then dispatches by payload type.
 fn rx_dispatcher(
     running: Arc<AtomicBool>,
     socket: Arc<RawSocket>,
@@ -159,11 +188,8 @@ fn rx_dispatcher(
     let mut reject_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
-        // RC failsafe: checked FIRST on every iteration, before any blocking recv.
-        // If no RC data received for 2s while using file fallback, delete the
-        // RC file so the FC reads nothing (safe hover/RTL) instead of stale inputs.
-        // This MUST run before socket.recv() so a long or repeated recv timeout
-        // cannot prevent the failsafe from triggering during total RF loss.
+        // RC failsafe: checked FIRST, before socket.recv(), so total RF loss
+        // cannot prevent failsafe triggering via repeated recv timeouts.
         if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
             tracing::warn!(
                 "RC failsafe triggered: no data for {}s, clearing RC file",
@@ -174,7 +200,7 @@ fn rx_dispatcher(
         }
 
         let len = match socket.recv(&mut buf) {
-            Ok(0) => continue, // timeout
+            Ok(0) => continue,
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!("RX recv error: {}", e);
@@ -182,7 +208,6 @@ fn rx_dispatcher(
             }
         };
 
-        // Strip Radiotap + 802.11 header (+ optional LLC/SNAP)
         let payload = match rawsock::recv_strip_headers(&buf[..len], reject_count < 10) {
             Some(p) => p,
             None => {
@@ -198,7 +223,6 @@ fn rx_dispatcher(
             }
         };
 
-        // Check magic and drone_id
         if !link::L2Header::matches_magic(payload) {
             reject_count += 1;
             if reject_count <= 5 {
@@ -215,12 +239,11 @@ fn rx_dispatcher(
         };
 
         if header.drone_id != drone_id {
-            continue; // different swarm
+            continue;
         }
 
         match header.payload_type {
             link::PAYLOAD_RC => {
-                // RC payload: [4B channel_count][N x 2B channel_values LE]
                 if data.len() < 4 {
                     continue;
                 }
@@ -239,7 +262,6 @@ fn rx_dispatcher(
                 if let Some(ref tx) = rc_tx {
                     let _ = tx.try_send(channels);
                 } else {
-                    // File fallback
                     let ch_str: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
                     let tmp_path = format!("{}.tmp", rc_file_path);
                     if let Ok(mut f) = std::fs::File::create(&tmp_path) {
@@ -255,19 +277,14 @@ fn rx_dispatcher(
             link::PAYLOAD_HEARTBEAT => {
                 *last_heartbeat.lock().unwrap() = Instant::now();
             }
-            _ => {
-                // Ignore video/telemetry from ground (we're the camera)
-            }
+            _ => {}
         }
     }
-
-    tracing::info!("RX dispatcher stopped");
 }
 
-/// Heartbeat monitor — checks last_heartbeat age and logs link status.
 fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant>>) {
     tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
-    thread::sleep(Duration::from_secs(1)); // initial grace period
+    thread::sleep(Duration::from_secs(1));
 
     let mut was_connected = true;
 
@@ -281,50 +298,29 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<Mutex<Instant
                 write_link_status("searching");
                 was_connected = false;
             }
-        } else {
-            if !was_connected {
-                tracing::info!("Heartbeat restored");
-                write_link_status("connected");
-                was_connected = true;
-            }
+        } else if !was_connected {
+            tracing::info!("Heartbeat restored");
+            write_link_status("connected");
+            was_connected = true;
         }
     }
 }
 
 fn check_camera_available() -> bool {
-    let child = match std::process::Command::new("vcgencmd")
+    if let Ok(output) = std::process::Command::new("vcgencmd")
         .arg("get_camera")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .output()
     {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    // Spawn a watchdog that kills vcgencmd after 2s to avoid blocking telemetry
-    let child_id = child.id();
-    let _watchdog = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        unsafe { libc::kill(child_id as i32, libc::SIGKILL) };
-    });
-
-    match child.wait_with_output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(val) = stdout.split("detected=").nth(1) {
-                if let Some(count) = val.split(',').next() {
-                    return count.trim().parse::<i32>().unwrap_or(0) > 0;
-                }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(val) = stdout.split("detected=").nth(1) {
+            if let Some(count) = val.split(',').next() {
+                return count.trim().parse::<i32>().unwrap_or(0) > 0;
             }
-            false
         }
-        _ => false,
     }
+    false
 }
 
-/// Telemetry sender — sends FC telemetry (or placeholder) via raw socket.
-/// High-priority packets are enqueued to hp_tx for immediate dispatch by video_tx.
 fn telemetry_sender(
     running: Arc<AtomicBool>,
     socket: Arc<RawSocket>,
@@ -341,15 +337,13 @@ fn telemetry_sender(
         tracing::info!("Telemetry sender ready (no FC, L2 broadcast)");
     }
 
-    let interval = Duration::from_millis(200); // 5Hz
+    let interval = Duration::from_millis(200);
     let camera_check_interval = Duration::from_secs(5);
     let mut last_camera_check = Instant::now();
     let mut camera_ok = check_camera_available();
     let mut fc_telem = fc::FcTelemetry::default();
     let mut l2_seq: u32 = 0;
-    // Reusable buffers for send path
     let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
-    let mut json_buf: Vec<u8> = Vec::with_capacity(512);
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
@@ -357,15 +351,12 @@ fn telemetry_sender(
             last_camera_check = Instant::now();
         }
 
-        // Drain FC telemetry (non-blocking)
         if let Some(ref rx) = fc_telem_rx {
             while let Ok(t) = rx.try_recv() {
                 fc_telem = t;
             }
         }
 
-        // Serialize telemetry directly to json_buf (avoids json!() + to_string() allocs)
-        json_buf.clear();
         let telem = serde_json::json!({
             "lat": fc_telem.lat,
             "lon": fc_telem.lon,
@@ -377,20 +368,18 @@ fn telemetry_sender(
             "battery_pct": if fc_telem.battery_pct >= 0 { fc_telem.battery_pct as u32 } else { 0 },
             "mode": fc_telem.mode,
             "armed": fc_telem.armed,
-            "camera_ok": camera_ok,
+            "camera_ok": camera_ok && VIDEO_HEALTHY.load(Ordering::Relaxed),
         });
 
-        if serde_json::to_writer(&mut json_buf, &telem).is_ok() {
+        if let Ok(data) = serde_json::to_string(&telem) {
             let header = link::L2Header {
                 drone_id,
                 payload_type: link::PAYLOAD_TELEMETRY,
                 seq: l2_seq,
             };
-            header.encode_into(&json_buf, &mut l2_buf);
-            // Cap pending telemetry to avoid unbounded growth if video stalls
-            if hp_tx.len() <= 10 {
-                let _ = hp_tx.send(l2_buf.clone());
-            }
+            header.encode_into(data.as_bytes(), &mut l2_buf);
+            // Enqueue to high-priority TX channel (drained by video_tx before shards)
+            let _ = hp_tx.send(l2_buf.clone());
             l2_seq = l2_seq.wrapping_add(1);
         }
 

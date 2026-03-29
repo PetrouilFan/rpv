@@ -8,6 +8,37 @@ use std::io;
 
 /// Fixed 802.11 header size for a broadcast data frame (no QoS, no 4th address).
 const IEEE80211_HDR_LEN: usize = 24;
+const RADIOTAP_LEN: usize = 8;
+const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 32 bytes
+
+/// Static radiotap header (version=0, pad=0, hdr_len=8, present=0)
+static RADIOTAP: [u8; RADIOTAP_LEN] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+/// Static 802.11 broadcast data frame header (pre-computed)
+static DATA_FRAME_HDR: [u8; IEEE80211_HDR_LEN] = {
+    let mut hdr = [0u8; IEEE80211_HDR_LEN];
+    hdr[0] = 0x08; // Data frame
+    hdr[1] = 0x00; // No flags
+    hdr[4] = 0xFF;
+    hdr[5] = 0xFF;
+    hdr[6] = 0xFF;
+    hdr[7] = 0xFF;
+    hdr[8] = 0xFF;
+    hdr[9] = 0xFF; // DA: broadcast
+    hdr[10] = 0xFF;
+    hdr[11] = 0xFF;
+    hdr[12] = 0xFF;
+    hdr[13] = 0xFF;
+    hdr[14] = 0xFF;
+    hdr[15] = 0xFF; // SA: broadcast
+    hdr[16] = 0xFF;
+    hdr[17] = 0xFF;
+    hdr[18] = 0xFF;
+    hdr[19] = 0xFF;
+    hdr[20] = 0xFF;
+    hdr[21] = 0xFF; // BSSID: broadcast
+    hdr
+};
 
 pub struct RawSocket {
     fd: i32,
@@ -60,41 +91,64 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // 100ms receive timeout for responsive shutdown (was 500ms)
+        // 100ms receive timeout for responsive shutdown
         let tv = libc::timeval {
             tv_sec: 0,
             tv_usec: 100_000,
         };
-        unsafe {
+        let rc = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
                 &tv as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            );
+            )
+        };
+        if rc < 0 {
+            tracing::warn!("Failed to set SO_RCVTIMEO: {}", io::Error::last_os_error());
         }
 
-        // 8MB send/receive buffers
+        // 8MB send/receive buffers — requires net.core.rmem_max/wmem_max >= 8388608
         let sndbuf: libc::c_int = 8 * 1024 * 1024;
-        unsafe {
+        let rc = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
                 &sndbuf as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            tracing::warn!(
+                "Failed to set SO_SNDBUF to 8MB (check sysctl net.core.wmem_max): {}",
+                io::Error::last_os_error()
             );
         }
         let rcvbuf: libc::c_int = 8 * 1024 * 1024;
-        unsafe {
+        let rc = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
                 &rcvbuf as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            tracing::warn!(
+                "Failed to set SO_RCVBUF to 8MB (check sysctl net.core.rmem_max): {}",
+                io::Error::last_os_error()
             );
+        }
+
+        // #2: Set O_NONBLOCK so send() never blocks on a full TX ring
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
         }
 
         Ok(Self { fd })
@@ -102,15 +156,11 @@ impl RawSocket {
 
     /// Send a raw 802.11 frame.
     /// Prepends a minimal Radiotap header + broadcast data frame header.
-    /// The Radiotap header is required by mac80211 for injected frames in monitor mode.
     #[allow(dead_code)]
     pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        // Minimal Radiotap header: version=0, pad=0, hdr_len=8, present=0
-        // Minimal Radiotap header (driver picks rate)
-        static RADIOTAP: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mut frame = Vec::with_capacity(RADIOTAP.len() + IEEE80211_HDR_LEN + payload.len());
+        let mut frame = Vec::with_capacity(HEADER_TOTAL + payload.len());
         frame.extend_from_slice(&RADIOTAP);
-        frame.extend_from_slice(&build_data_frame_header());
+        frame.extend_from_slice(&DATA_FRAME_HDR);
         frame.extend_from_slice(payload);
 
         let ret = unsafe {
@@ -122,35 +172,41 @@ impl RawSocket {
             )
         };
         if ret < 0 {
-            Err(io::Error::last_os_error())
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
+            {
+                return Ok(0); // TX ring full, frame dropped
+            }
+            Err(e)
         } else {
             Ok(ret as usize)
         }
     }
 
-    /// Send using a reusable buffer to avoid per-call heap allocation.
-    /// Prepends Radiotap + 802.11 header to `payload`, sends, then returns
-    /// the buffer for reuse. The buffer is cleared before use.
+    /// Send using a reusable buffer. Non-blocking: returns Ok(0) if TX ring is full.
     pub fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {
-        static RADIOTAP: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let total = RADIOTAP.len() + IEEE80211_HDR_LEN + payload.len();
+        let total = HEADER_TOTAL + payload.len();
         buf.clear();
         buf.reserve(total);
         buf.extend_from_slice(&RADIOTAP);
-        buf.extend_from_slice(&build_data_frame_header());
+        buf.extend_from_slice(&DATA_FRAME_HDR);
         buf.extend_from_slice(payload);
 
         let ret = unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
         if ret < 0 {
-            Err(io::Error::last_os_error())
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
+            {
+                return Ok(0);
+            }
+            Err(e)
         } else {
             Ok(ret as usize)
         }
     }
 
-    /// Receive a raw frame and extract the L2 protocol payload.
-    /// Strips Radiotap header + 802.11 MAC header.
-    /// Returns the number of bytes written into `buf`, or 0 on timeout.
+    /// Receive a raw frame. Returns bytes read or 0 on timeout.
+    /// #3: Uses SO_RCVTIMEO directly (no redundant poll()).
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let ret =
             unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
@@ -175,32 +231,7 @@ impl Drop for RawSocket {
     }
 }
 
-/// Build a minimal 802.11 data frame header for a broadcast frame.
-/// No QoS, no 4th address, no WEP. Frame body follows immediately.
-fn build_data_frame_header() -> [u8; IEEE80211_HDR_LEN] {
-    let mut hdr = [0u8; IEEE80211_HDR_LEN];
-    // Frame Control: Data frame (0x0008), To DS=0, From DS=1 (IBSS/ad-hoc style broadcast)
-    hdr[0] = 0x08; // Type=Data, Subtype=0
-    hdr[1] = 0x00; // No flags (no WEP, no retry, no more data)
-                   // Duration: 0
-    hdr[2] = 0x00;
-    hdr[3] = 0x00;
-    // Address 1 (DA): broadcast
-    hdr[4..10].fill(0xFF);
-    // Address 2 (SA): broadcast (source doesn't matter for filtering, we use L2 header)
-    hdr[10..16].fill(0xFF);
-    // Address 3 (BSSID): broadcast
-    hdr[16..22].fill(0xFF);
-    // Sequence Control: 0
-    hdr[22] = 0x00;
-    hdr[23] = 0x00;
-    hdr
-}
-
 /// Strip the Radiotap header from a received monitor-mode frame.
-/// Returns a slice starting at the 802.11 header, or None if too short.
-///
-/// Radiotap header length is in bytes 2..4 (little-endian u16).
 pub fn strip_radiotap(frame: &[u8]) -> Option<&[u8]> {
     if frame.len() < 4 {
         return None;
@@ -213,31 +244,21 @@ pub fn strip_radiotap(frame: &[u8]) -> Option<&[u8]> {
 }
 
 /// Parse the 802.11 header length from the Frame Control field.
-/// This handles variable-length headers (QoS data, 4-address frames, etc).
-/// Returns None if the frame is too short to contain a valid header.
 pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
     if frame.len() < 2 {
         return None;
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
-    let frame_type = (fc >> 2) & 0x3; // 0=Management, 1=Control, 2=Data
+    let frame_type = (fc >> 2) & 0x3;
     let to_ds = (fc >> 8) & 1;
     let from_ds = (fc >> 9) & 1;
     let subtype = (fc >> 4) & 0xF;
 
-    // Only Data frames (type=2) have variable-length headers with QoS
     if frame_type != 2 {
-        // Management and Control frames: 24 bytes (no QoS, no 4-addr)
         return if frame.len() >= 24 { Some(24) } else { None };
     }
 
-    let base_len = if to_ds == 1 && from_ds == 1 {
-        30 // 4-address frame
-    } else {
-        24 // standard 3-address frame
-    };
-
-    // QoS data frames (subtype bit 3 set) have an extra 2-byte QoS Control field
+    let base_len = if to_ds == 1 && from_ds == 1 { 30 } else { 24 };
     let qos_bit = subtype & 0x8 != 0;
     let hdr_len = if qos_bit { base_len + 2 } else { base_len };
 
@@ -249,8 +270,6 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
 }
 
 /// Strip Radiotap + 802.11 header from a received monitor-mode frame.
-/// Returns the L2 protocol payload (our link.rs header + application data).
-/// Returns None if parsing fails.
 pub fn recv_strip_headers(frame: &[u8], log_rejections: bool) -> Option<&[u8]> {
     recv_extract(frame, log_rejections).map(|(payload, _rssi)| payload)
 }
@@ -281,9 +300,6 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
 }
 
 /// Parse antenna signal (RSSI in dBm) from the Radiotap header if present.
-/// Radiotap fields are variable-length and ordered by the present bitmask.
-/// Antenna signal is present bit 5. Field sizes (bytes):
-///   0:TSFT(8) 1:FLAGS(1) 2:RATE(1) 3:CHANNEL(4) 4:FHSS(2) 5:SIGNAL(1) 6:NOISE(1)
 fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
     if frame.len() < 8 {
         return None;
@@ -295,46 +311,25 @@ fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
 
     let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
 
-    // Field sizes for present bits 0..31 (only bits 0-6 are common)
     const FIELD_SIZES: [u8; 32] = [
-        8, // 0: TSFT
-        1, // 1: FLAGS
-        1, // 2: RATE
-        4, // 3: CHANNEL
-        2, // 4: FHSS
-        1, // 5: ANTENNA SIGNAL (this is what we want)
-        1, // 6: ANTENNA NOISE
-        2, // 7: LOCK QUALITY
-        2, // 8: TX ATTENUATION
-        2, // 9: dB TX ATTENUATION
-        1, // 10: dBm TX POWER
-        1, // 11: ANTENNA
-        1, // 12: dB ANTENNA SIGNAL
-        1, // 13: dB ANTENNA NOISE
-        2, // 14: RX FLAGS
-        4, 4, 4, 4, // 15-18: various
-        2, 2, 2, 2, // 19-22
-        1, 1, 1, 1, // 23-26
-        8, 2, 4, 2, 1, // 27-31
+        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8, 2, 4,
+        2, 1,
     ];
 
-    // Check if bit 5 (antenna signal) is present
     if present & (1 << 5) == 0 {
         return None;
     }
 
-    // Walk through all present bits before bit 5 to find offset
-    let mut offset = 8; // start after the first present word
+    let mut offset = 8;
     for bit in 0..5u32 {
         if present & (1 << bit) != 0 {
             offset += FIELD_SIZES[bit as usize] as usize;
         }
     }
 
-    // Antenna signal is at `offset` within the Radiotap header
-    if offset >= hdr_len {
+    // #4: Bounds check before indexing
+    if offset >= hdr_len || offset >= frame.len() {
         return None;
     }
-    let signal = frame[offset] as i8; // signed dBm value
-    Some(signal)
+    Some(frame[offset] as i8)
 }

@@ -7,9 +7,9 @@ Rust FPV system for Raspberry Pi. Low-latency H.264 video over raw 802.11 monito
 ```
 ┌─────────────┐    raw 802.11     ┌──────────────┐
 │  rpv-cam    │ ──── air ──────→  │  rpv-ground   │
-│  (Pi Zero)  │ ←──── air ─────  │  (Pi 5)       │
+│  (Pi 5)     │ ←──── air ─────  │  (Pi 5)       │
 │             │                   │               │
-│ rpicam-vid  │  Video  (RS 4+2)  │ VideoReceiver │
+│ ffmpeg      │  Video (RS 1+1)   │ VideoReceiver │
 │ → NAL frag  │  Telemetry (JSON) │ → libavcodec  │
 │ → FEC encode│  RC (16ch @ 50Hz) │ → egui/wgpu   │
 │ → 802.11 TX │  Heartbeat (10Hz) │ → OSD         │
@@ -23,28 +23,18 @@ Rust FPV system for Raspberry Pi. Low-latency H.264 video over raw 802.11 monito
 
 ### rpv-cam
 
-Camera sender. Two binaries:
-
-| Binary | Target | Description |
-|--------|--------|-------------|
-| `rpv-cam` | Pi Zero 2W | Lightweight, joins `wlan1` directly |
-| `rpv-cam-rpi5` | Pi 5 + HQ camera | Same logic, different deployment path |
+Camera sender. Single binary targeting Pi 5.
 
 Features:
-- Captures H.264 via `rpicam-vid` (configurable resolution, framerate, bitrate)
-- Fragments NALUs, RS 4+2 FEC encodes, streams over raw 802.11
+- Captures H.264 via `ffmpeg` (configurable resolution, framerate, bitrate)
+- Fragments NALUs, RS FEC encodes, streams over raw 802.11
 - Receives RC commands from ground → writes to FC via MAVLink (or file fallback)
 - Sends FC telemetry, camera status, and heartbeats back to ground
 - RC failsafe: releases override after 500ms (FC path) or clears file after 2s (file path)
 
 ### rpv-ground
 
-Ground station (RPi 5 + HDMI). Two binaries:
-
-| Binary | Description |
-|--------|-------------|
-| `rpv-ground` | Software NV12→RGBA decode, egui texture upload |
-| `rpv-ground-rpi5` | GPU YUV→RGB via wgpu shader (lower CPU, same latency) |
+Ground station (RPi 5 + HDMI). Single binary with GPU YUV→RGB via wgpu shader.
 
 Features:
 - RS 4+2 FEC reassembly with out-of-order tolerance and stall recovery
@@ -164,29 +154,26 @@ RPV_FREQ=5805   # 5 GHz (less interference, shorter range)
 
 | Component | Camera (sender) | Ground (receiver) |
 |-----------|----------------|-------------------|
-| Board | Raspberry Pi Zero 2W | Raspberry Pi 5 |
+| Board | Raspberry Pi 5 | Raspberry Pi 5 |
 | Camera | Raspberry Pi HQ (IMX477, CSI) | — |
 | Display | — | HDMI monitor |
 | WiFi | RTL8821AU USB adapter (wlan1) | RTL8821AU USB adapter (wlan1) |
-| Network | hostapd AP on camera side | Joins AP or uses monitor mode |
 
 ## Project Structure
 
 ```
 ├── rpv-cam/src/
-│   ├── main.rs          # Pi Zero entry point, RX dispatcher, telemetry, heartbeat
-│   ├── main_rpi5.rs     # Pi 5 entry point (same logic, different deployment)
-│   ├── video_tx.rs      # rpicam-vid capture, NAL fragmentation, RS 4+2 FEC encode
+│   ├── main.rs          # Entry point, RX dispatcher, telemetry, heartbeat
+│   ├── video_tx.rs      # ffmpeg capture, NAL fragmentation, RS FEC encode
 │   ├── fc.rs            # MAVLink serial link (RC override, telemetry parsing)
 │   ├── rawsock.rs       # AF_PACKET socket, 802.11 frame build/parse, RSSI
 │   ├── link.rs          # L2 header encode/decode (shared with ground)
 │   └── config.rs        # TOML config with serde defaults
 │
 ├── rpv-ground/src/
-│   ├── main.rs          # egui fullscreen app, NV12→RGBA CPU decode, OSD
-│   ├── main_rpi5.rs     # egui + wgpu GPU YUV→RGB shader, OSD
+│   ├── main.rs          # egui + wgpu GPU YUV→RGB shader, OSD
 │   ├── video/
-│   │   ├── receiver.rs  # RS 4+2 FEC reassembly, NAL reassembly, stall detection
+│   │   ├── receiver.rs  # RS FEC reassembly, NAL reassembly, stall detection
 │   │   └── decoder.rs   # libavcodec H.264 decode, NV12 output
 │   ├── rc/
 │   │   └── joystick.rs  # RC transmitter (50Hz, deadline scheduling)
@@ -197,9 +184,9 @@ RPV_FREQ=5805   # 5 GHz (less interference, shorter range)
 │   └── config.rs        # TOML config
 │
 ├── deploy/
-│   ├── install-cam.sh       # Installs systemd services + network scripts
+│   ├── install-cam.sh       # Installs systemd service + network scripts
 │   ├── install-ground.sh    # Installs desktop autostart + network scripts
-│   ├── cam/                 # rpv-cam.service, rpv-cam-rpi5.service, net scripts
+│   ├── cam/                 # rpv-cam.service, net scripts
 │   └── ground/              # rpv-ground.desktop, rpv-ground.service, net scripts
 │
 ├── Cargo.toml           # Workspace root
@@ -218,7 +205,7 @@ cargo build --release -p rpv-ground
 cargo build --release -p rpv-cam
 ```
 
-Binaries: `target/release/rpv-ground`, `target/release/rpv-ground-rpi5`, `target/release/rpv-cam`, `target/release/rpv-cam-rpi5`.
+Binaries: `target/release/rpv-ground`, `target/release/rpv-cam`.
 
 ## Deploy
 
@@ -230,7 +217,7 @@ sudo deploy/install-cam.sh
 sudo deploy/install-ground.sh
 ```
 
-The camera script installs `rpv-cam.service` (or `rpv-cam-rpi5.service`) as a systemd service. The ground script installs a desktop autostart entry that launches `rpv-ground` on login.
+The camera script installs `rpv-cam.service` as a systemd service. The ground script installs a desktop autostart entry that launches `rpv-ground` on login.
 
 Both deploy scripts copy network setup/teardown scripts that configure the RTL8821AU adapter in monitor mode on the configured channel.
 
@@ -239,7 +226,7 @@ Both deploy scripts copy network setup/teardown scripts that configure the RTL88
 ### Camera service
 
 ```
-rpv-cam.service / rpv-cam-rpi5.service
+rpv-cam.service
   ExecStartPre: rpv-net-setup-pre.sh (monitor mode, freq, txpower)
   ExecStart:    rpv-cam
   ExecStopPost: rpv-net-teardown.sh (restore managed mode)
