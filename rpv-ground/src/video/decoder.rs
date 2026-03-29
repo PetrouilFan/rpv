@@ -370,15 +370,48 @@ fn decode_loop_libavcodec(
                             nv12[dst_start..dst_start + copy_w].copy_from_slice(src);
                         }
 
-                        // Copy UV plane (NV12: interleaved U/V, half height)
+                        // Copy UV plane
+                        // libavcodec H.264 decoder outputs YUV420P (separate U,V planes)
+                        // We need NV12 (interleaved U,V), so interleave manually
+                        let data2 = unsafe { (*frame).data[2] };
+                        let linesize2 = unsafe { (*frame).linesize[1] } as usize; // same as linesize[1] for YUV420P
                         let uv_copy_h = (fh / 2).min(height as usize / 2);
-                        let uv_copy_w = copy_w.min(linesize1);
-                        for row in 0..uv_copy_h {
-                            let src = unsafe {
-                                std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w)
-                            };
-                            let dst_start = y_size + row * stride as usize;
-                            nv12[dst_start..dst_start + uv_copy_w].copy_from_slice(src);
+                        let uv_half_w = (copy_w / 2).min(linesize1);
+                        if !data2.is_null() {
+                            for row in 0..uv_copy_h {
+                                let u_row = unsafe {
+                                    std::slice::from_raw_parts(
+                                        data1.add(row * linesize1),
+                                        uv_half_w,
+                                    )
+                                };
+                                let v_row = unsafe {
+                                    std::slice::from_raw_parts(
+                                        data2.add(row * linesize2),
+                                        uv_half_w,
+                                    )
+                                };
+                                let dst_start = y_size + row * stride as usize;
+                                for col in 0..uv_half_w {
+                                    nv12[dst_start + col * 2] = u_row[col];
+                                    nv12[dst_start + col * 2 + 1] = v_row[col];
+                                }
+                            }
+                        } else {
+                            // Fallback: if data2 is null, just copy U plane (will look greenish)
+                            for row in 0..uv_copy_h {
+                                let src = unsafe {
+                                    std::slice::from_raw_parts(
+                                        data1.add(row * linesize1),
+                                        uv_half_w,
+                                    )
+                                };
+                                let dst_start = y_size + row * stride as usize;
+                                for col in 0..uv_half_w {
+                                    nv12[dst_start + col * 2] = src[col];
+                                    nv12[dst_start + col * 2 + 1] = 128; // neutral V
+                                }
+                            }
                         }
 
                         let decoded = DecodedFrame {
