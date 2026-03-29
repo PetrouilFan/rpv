@@ -95,23 +95,33 @@ pub fn run(
         let width_s = video_width.to_string();
         let height_s = video_height.to_string();
         let framerate_s = framerate.to_string();
-        let gop_s = (framerate * 2).to_string(); // keyframe every 2 seconds
-        let bufsize_s = format!("{}k", bitrate / 500); // 2x bitrate for VBV buffer
+        let gop_s = framerate.to_string(); // keyframe every second (min latency)
+                                           // VBV buffer = bitrate / framerate (one frame worth, minimum latency)
+        let bufsize_s = format!("{}k", (bitrate / framerate).max(1) / 1000);
         let child = Command::new("ffmpeg")
             .args(&[
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                // Global low-latency flags
+                "-fflags",
+                "nobuffer",
+                "-avioflags",
+                "direct",
+                // Input: V4L2 with minimal kernel buffering
+                "-thread_queue_size",
+                "1",
                 "-f",
                 "v4l2",
                 "-input_format",
-                "yuyv422",
+                "mjpeg",
                 "-video_size",
                 &format!("{}x{}", width_s, height_s),
                 "-framerate",
                 &framerate_s,
                 "-i",
                 &video_device,
+                // Output: H.264 with absolute minimum latency
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -126,6 +136,8 @@ pub fn run(
                 &bufsize_s,
                 "-g",
                 &gop_s,
+                "-x264-params",
+                "rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
                 "-f",
                 "h264",
                 "-an",
