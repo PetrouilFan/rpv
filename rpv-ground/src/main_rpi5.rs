@@ -537,7 +537,7 @@ impl eframe::App for RpvApp {
         if self.needs_repaint {
             ctx.request_repaint();
         } else if self.state.link_status == LinkStatus::Connected {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -836,9 +836,9 @@ fn main() -> Result<(), eframe::Error> {
 
     let link_state = LinkStateHandle::new();
 
-    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
-    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(16);
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
     // Test the video channel works
     let test_data = vec![0x52, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];

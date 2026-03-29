@@ -105,7 +105,7 @@ pub fn run(
                 "-f",
                 "v4l2",
                 "-input_format",
-                "mjpeg",
+                "yuyv422",
                 "-video_size",
                 &format!("{}x{}", width_s, height_s),
                 "-framerate",
