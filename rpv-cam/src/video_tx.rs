@@ -108,13 +108,19 @@ pub fn run(
                 "nobuffer",
                 "-avioflags",
                 "direct",
+                "-probesize",
+                "32",
+                "-analyzeduration",
+                "0",
                 // Input: V4L2 with minimal kernel buffering
                 "-thread_queue_size",
                 "1",
+                "-rtbufsize",
+                "1M",
                 "-f",
                 "v4l2",
                 "-input_format",
-                "mjpeg",
+                "mjpeg", // mjpeg for less USB bandwidth; change to yuyv422 to skip MJPEG decode
                 "-video_size",
                 &format!("{}x{}", width_s, height_s),
                 "-framerate",
@@ -197,6 +203,7 @@ pub fn run(
         let mut read_buf = vec![0u8; 65536];
         let mut total_bytes = u64::default();
         let mut total_nals: u64 = 0;
+        let mut last_nal_time = std::time::Instant::now();
         let mut total_groups: u64 = 0;
         let mut fail_count: u8 = 0;
         let mut last_stats = std::time::Instant::now();
@@ -256,14 +263,17 @@ pub fn run(
                         nal_head += consumed;
                         extracted_any = true;
                         total_nals += 1;
+                        let inter_nal_ms = last_nal_time.elapsed().as_millis();
+                        last_nal_time = std::time::Instant::now();
 
                         if last_stats.elapsed().as_secs() >= 5 {
                             tracing::info!(
-                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s",
+                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s, last NAL inter-arrival: {}ms",
                                 total_bytes as f64 / 1_048_576.0,
                                 total_nals,
                                 total_groups,
-                                last_stats.elapsed().as_secs()
+                                last_stats.elapsed().as_secs(),
+                                inter_nal_ms
                             );
                             last_stats = std::time::Instant::now();
                         }

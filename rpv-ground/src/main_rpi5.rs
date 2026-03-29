@@ -470,6 +470,17 @@ impl RpvApp {
 
         let mut had_frame = false;
         if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
+            // Log decode-to-display latency
+            if let Some(recv_time) = frame.recv_time {
+                let latency_ms = recv_time.elapsed().as_millis();
+                if self.state.frame_count % 60 == 0 {
+                    tracing::info!(
+                        "decode-to-display latency: {}ms, dropped {} stale frames",
+                        latency_ms,
+                        recv_count.saturating_sub(1)
+                    );
+                }
+            }
             let h = frame.height as usize;
             let stride = frame.stride as usize;
             let y_size = stride * h;

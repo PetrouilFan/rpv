@@ -439,7 +439,7 @@ fn decode_loop_libavcodec(
                             height: height,
                             stride,
                             send_ts_us: None,
-                            recv_time: None,
+                            recv_time: Some(std::time::Instant::now()),
                         };
 
                         if frame_tx.try_send(decoded).is_err() {
