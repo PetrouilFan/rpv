@@ -63,8 +63,10 @@ impl L2Header {
         Some((header, &frame[HEADER_LEN..]))
     }
 
-    /// Check if a buffer starts with the RPV magic bytes (fast filter).
+    /// #11: Fast magic check — avoids bounds check on HEADER_LEN since rawsock
+    /// already verified frame >= 16 bytes.
+    #[inline]
     pub fn matches_magic(frame: &[u8]) -> bool {
-        frame.len() >= HEADER_LEN && frame[0] == MAGIC[0] && frame[1] == MAGIC[1]
+        frame.len() >= 2 && frame[0] == MAGIC[0] && frame[1] == MAGIC[1]
     }
 }

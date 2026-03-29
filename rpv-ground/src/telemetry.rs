@@ -67,22 +67,22 @@ impl TelemetryReceiver {
         info!("Telemetry receiver ready (L2 payload channel)");
 
         let mut last_telem_time = Instant::now();
-        let timeout = std::time::Duration::from_secs(3);
+        // #22: 100ms timeout — fast Ctrl+C shutdown (was 3s)
+        let timeout = std::time::Duration::from_millis(100);
 
         loop {
             match self.rx.recv_timeout(timeout) {
                 Ok(payload) => {
-                    if let Ok(json_str) = std::str::from_utf8(&payload) {
-                        if let Ok(telem) = serde_json::from_str::<Telemetry>(json_str) {
-                            // #18: Atomic swap — no lock contention on the UI read path
-                            self.state.store(Arc::new(telem));
-                            last_telem_time = Instant::now();
-                            self.link_state.telemetry_activity();
-                        }
+                    // #3: Use from_slice directly — faster, no UTF-8 intermediate check
+                    if let Ok(telem) = serde_json::from_slice::<Telemetry>(&payload) {
+                        self.state.store(Arc::new(telem));
+                        last_telem_time = Instant::now();
+                        self.link_state.telemetry_activity();
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    if last_telem_time.elapsed() > timeout {
+                    // #22: Check running flag more frequently
+                    if last_telem_time.elapsed() > std::time::Duration::from_secs(3) {
                         // No action needed; heartbeat_monitor is the authority.
                     }
                 }

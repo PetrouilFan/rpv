@@ -87,6 +87,7 @@ pub fn run(
 
     let mut fec_block_seq: u32 = 0;
     let mut l2_pkt_seq: u32 = 0;
+    let mut use_hw_encoder = true; // false after h264_v4l2m2m fails
 
     while running.load(Ordering::SeqCst) {
         tracing::info!(
@@ -97,59 +98,69 @@ pub fn run(
         );
 
         let bitrate_s = format!("{}k", bitrate / 1000);
-        let width_s = video_width.to_string();
-        let height_s = video_height.to_string();
+        // #12: Pre-format video_size once (avoids allocation per restart)
+        let video_size_s = format!("{}x{}", video_width, video_height);
         let framerate_s = framerate.to_string();
-        // #7: Use GOP = intra frames (keyframe interval), not framerate
         let gop_s = intra.to_string();
         let bufsize_s = format!("{}k", (bitrate / framerate).max(1) / 1000);
 
-        // #7: Use hardware encoder (h264_v4l2m2m) for Pi 5 VPU offload
-        let encoder_codec = "h264_v4l2m2m";
+        // Encoder: h264_v4l2m2m (Pi 5 VPU) or libx264 (software fallback)
+        let encoder_codec = if use_hw_encoder {
+            "h264_v4l2m2m"
+        } else {
+            "libx264"
+        };
         let mut child = Command::new("ffmpeg");
-        child
-            .args(&[
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-fflags",
-                "nobuffer",
-                "-avioflags",
-                "direct",
-                "-probesize",
-                "32",
-                "-analyzeduration",
-                "0",
-                "-thread_queue_size",
-                "1",
-                "-rtbufsize",
-                "1M",
-                "-f",
-                "v4l2",
-                "-input_format",
-                "mjpeg",
-                "-video_size",
-                &format!("{}x{}", width_s, height_s),
-                "-framerate",
-                &framerate_s,
-                "-i",
-                &video_device,
-                "-c:v",
-                encoder_codec,
-                "-b:v",
-                &bitrate_s,
-                "-bufsize",
-                &bufsize_s,
-                "-g",
-                &gop_s,
-                "-f",
-                "h264",
-                "-an",
-                "-y",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        child.args(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-avioflags",
+            "direct",
+            "-probesize",
+            "32768",
+            "-analyzeduration",
+            "0",
+            "-thread_queue_size",
+            "1",
+            "-rtbufsize",
+            "1M",
+            "-f",
+            "v4l2",
+            "-input_format",
+            "mjpeg",
+            "-video_size",
+            &video_size_s,
+            "-framerate",
+            &framerate_s,
+            "-i",
+            &video_device,
+            "-c:v",
+            encoder_codec,
+            "-b:v",
+            &bitrate_s,
+            "-bufsize",
+            &bufsize_s,
+            "-g",
+            &gop_s,
+        ]);
+        // Add libx264-specific options when using software encoder
+        if !use_hw_encoder {
+            child.args(&[
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-crf",
+                "28",
+                "-x264-params",
+                "rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
+            ]);
+        }
+        child.args(&["-f", "h264", "-an", "-y", "pipe:1"]);
+        child.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // #32: If rpv-cam dies, kernel kills ffmpeg automatically (no orphaned zombie)
         unsafe {
@@ -172,27 +183,33 @@ pub fn run(
         let mut stdout = child.stdout.take().expect("No stdout");
 
         let stderr = child.stderr.take();
+        // #10: Reuse String buffer for stderr lines (no per-line allocation)
         thread::spawn(move || {
             if let Some(mut stderr) = stderr {
                 use std::io::BufRead;
-                let reader = std::io::BufReader::new(&mut stderr);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) if !line.is_empty() => {
-                            if line.contains("ERROR")
-                                || line.contains("failed")
-                                || line.contains("error")
-                            {
-                                tracing::error!("ffmpeg: {}", line);
-                            } else {
-                                tracing::info!("ffmpeg: {}", line);
+                let mut reader = std::io::BufReader::new(&mut stderr);
+                let mut line_buf = String::with_capacity(256);
+                loop {
+                    line_buf.clear();
+                    match reader.read_line(&mut line_buf) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let line = line_buf.trim();
+                            if !line.is_empty() {
+                                if line.contains("ERROR")
+                                    || line.contains("failed")
+                                    || line.contains("error")
+                                {
+                                    tracing::error!("ffmpeg: {}", line);
+                                } else {
+                                    tracing::info!("ffmpeg: {}", line);
+                                }
                             }
                         }
                         Err(e) => {
                             tracing::warn!("ffmpeg stderr read error: {}", e);
                             break;
                         }
-                        _ => {}
                     }
                 }
             }
@@ -391,6 +408,12 @@ pub fn run(
         let _ = child.wait();
         // #30: ffmpeg died — signal video health as unhealthy
         VIDEO_HEALTHY.store(false, Ordering::Relaxed);
+
+        // Fallback: if h264_v4l2m2m produced 0 bytes, switch to libx264
+        if total_bytes == 0 && use_hw_encoder {
+            tracing::warn!("h264_v4l2m2m encoder failed, falling back to libx264 (software)");
+            use_hw_encoder = false;
+        }
 
         tracing::info!(
             "ffmpeg stopped, sent {:.1} MB total",

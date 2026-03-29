@@ -17,6 +17,9 @@ fi
 # Idempotent teardown of any existing WiFi state
 pkill hostapd 2>/dev/null || true
 pkill wpa_supplicant 2>/dev/null || true
+# #25: Mask wpa_supplicant so systemd doesn't restart it mid-flight
+systemctl mask wpa_supplicant@${IFACE}.service 2>/dev/null || true
+systemctl mask wpa_supplicant.service 2>/dev/null || true
 ip link set "$IFACE" down 2>/dev/null || true
 ip addr flush dev "$IFACE" 2>/dev/null || true
 ip link set "$IFACE" nomacaddr 2>/dev/null || true
@@ -41,9 +44,15 @@ iw dev "$IFACE" set power_save off 2>/dev/null || true
 sysctl -w net.core.rmem_max=8388608 2>/dev/null || true
 sysctl -w net.core.wmem_max=8388608 2>/dev/null || true
 
-# Set CPU governor to performance
+# #4: Set CPU governor to performance (handles pstate driver too)
 for gov in /sys/devices/system/cpu/*/cpufreq/scaling_governor; do
     echo performance > "$gov" 2>/dev/null || true
 done
+# Also try intel_pstate path
+for gov in /sys/devices/system/cpu/*/cpufreq/energy_performance_preference; do
+    echo performance > "$gov" 2>/dev/null || true
+done
 
+# #20: For true zero-jitter RF, add isolcpus=0,1 to /boot/firmware/cmdline.txt
+# This hides cores 0 and 1 from the kernel scheduler entirely.
 echo "Monitor mode ready on $IFACE @ 2437 MHz (2.4 GHz ch6)"

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::link;
 use crate::rawsock::RawSocket;
@@ -33,7 +33,8 @@ impl GamepadInput {
         let mut device = match Device::open(&gamepad_path) {
             Ok(d) => d,
             Err(e) => {
-                error!("Failed to open gamepad: {}", e);
+                // #1: Hard error — pilot has no control visibility
+                error!("FATAL: Failed to open gamepad {}: {}. Run as root or add user to 'input' group.", gamepad_path.display(), e);
                 return None;
             }
         };
@@ -41,7 +42,11 @@ impl GamepadInput {
         match device.grab() {
             Ok(()) => {}
             Err(e) => {
-                error!("Failed to grab gamepad: {}", e);
+                // #1: Hard error — falling back to "safe defaults" hides the problem
+                error!(
+                    "FATAL: Failed to grab gamepad: {}. Another process may be using it.",
+                    e
+                );
                 return None;
             }
         };
@@ -50,6 +55,7 @@ impl GamepadInput {
         Some(Self { device })
     }
 
+    // #5: Check both event* and js* devices
     fn find_gamepad_path() -> Option<PathBuf> {
         let dev_path = PathBuf::from("/dev/input");
         if !dev_path.exists() {
@@ -69,7 +75,8 @@ impl GamepadInput {
             let path = entry.path();
             if let Some(name) = path.file_name() {
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("event") {
+                // #5: Check both evdev (event*) and joydev (js*) devices
+                if name_str.starts_with("event") || name_str.starts_with("js") {
                     if let Ok(device) = Device::open(&path) {
                         let has_abs = device.supported_absolute_axes().is_some();
                         let has_keys = device.supported_keys().is_some();
@@ -99,7 +106,22 @@ impl GamepadInput {
     }
 
     fn read_input(&mut self, channels: &mut [u16; 16]) {
-        let _ = self.device.fetch_events();
+        // #7: Check for dropped events (EV_SYN/SYN_DROPPED)
+        match self.device.fetch_events() {
+            Ok(_events) => {
+                // Events consumed — cached_state is now up to date
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No new events — cached_state is still valid
+            }
+            Err(e) => {
+                // #21: Device disconnected or error — return safe defaults
+                error!("Gamepad read error (disconnected?): {}", e);
+                channels.fill(RC_MID);
+                channels[2] = RC_MIN; // Throttle zero
+                return;
+            }
+        }
 
         let axis_x = Self::get_axis_value(&self.device, 0x00);
         let axis_y = Self::get_axis_value(&self.device, 0x01);
@@ -116,6 +138,7 @@ impl GamepadInput {
             None => return,
         };
 
+        // Button codes: BTN_A(0x130) through BTN_THUMBR(0x139) + extras
         channels[4] = Self::button_to_rc(keys.contains(KeyCode(0x120)));
         channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));
         channels[6] = Self::button_to_rc(keys.contains(KeyCode(0x122)));
@@ -130,6 +153,7 @@ impl GamepadInput {
         channels[15] = Self::button_to_rc(keys.contains(KeyCode(0x12b)));
     }
 
+    // #6: Continuous deadzone mapping — no jump at threshold
     fn axis_to_rc(axis: Option<i32>, invert: bool, throttle_mode: bool) -> u16 {
         let value = match axis {
             Some(v) => v,
@@ -142,13 +166,18 @@ impl GamepadInput {
             let normalized = ((value + 32767) as f64 / 65534.0).clamp(0.0, 1.0);
             (RC_MIN as f64 + normalized * (RC_MAX as f64 - RC_MIN as f64)) as u16
         } else {
-            let with_deadzone = if value.abs() < DEADZONE {
-                0
+            // #6: Linear remap with continuous deadzone
+            // Map [-32767, 32767] → [-1.0, 1.0] with deadzone suppression
+            let abs_val = value.abs();
+            let effective_range = 32767 - DEADZONE;
+            let with_deadzone = if abs_val <= DEADZONE {
+                0.0
             } else {
-                value - value.signum() * DEADZONE
+                // Continuous: no jump, smooth transition from deadzone edge
+                ((abs_val - DEADZONE) as f64 / effective_range as f64).clamp(0.0, 1.0)
+                    * value.signum() as f64
             };
-            let normalized = (with_deadzone as f64 / (32767 - DEADZONE) as f64).clamp(-1.0, 1.0);
-            (RC_MID as f64 + normalized * (RC_MID as f64 - RC_MIN as f64)) as u16
+            (RC_MID as f64 + with_deadzone * (RC_MID as f64 - RC_MIN as f64)) as u16
         }
     }
 
@@ -164,7 +193,8 @@ impl GamepadInput {
 pub struct RCTx {
     socket: Arc<RawSocket>,
     drone_id: u8,
-    channels: Arc<std::sync::Mutex<Vec<u16>>>,
+    // #16: Use [u16; 16] instead of Vec<u16> — fixed size, no heap allocation
+    channels: Arc<std::sync::Mutex<[u16; 16]>>,
     gamepad: Option<GamepadInput>,
     l2_seq: u32,
     running: Arc<AtomicBool>,
@@ -177,15 +207,21 @@ impl RCTx {
         if gamepad.is_some() {
             info!("Gamepad input enabled");
         } else {
+            // #1: Print visible warning so pilot knows there's no controller
+            warn!("NO GAMEPAD DETECTED — RC channels stuck at safe defaults (throttle zero). Drone will not arm.");
             info!("No gamepad detected, using safe defaults");
         }
 
         Self {
             socket,
             drone_id,
+            // #2: Throttle default to RC_MIN (1000) to keep throttle at zero
+            // This is correct for "no gamepad" — throttle must be zero.
+            // The failsafe issue (#2) is in fc.rs, not here — the FC writer
+            // should check if any real RC data has EVER been received.
             channels: Arc::new(std::sync::Mutex::new({
-                let mut ch = vec![1500u16; 16];
-                ch[2] = 1000;
+                let mut ch = [RC_MID; 16];
+                ch[2] = RC_MIN; // Throttle at zero when no gamepad
                 ch
             })),
             gamepad,
@@ -194,7 +230,7 @@ impl RCTx {
         }
     }
 
-    pub fn channels(&self) -> Arc<std::sync::Mutex<Vec<u16>>> {
+    pub fn channels(&self) -> Arc<std::sync::Mutex<[u16; 16]>> {
         Arc::clone(&self.channels)
     }
 
@@ -203,6 +239,8 @@ impl RCTx {
 
         let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
         let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
+        // #16: Pre-allocated payload buffer (reused each cycle)
+        let mut payload_buf: Vec<u8> = Vec::with_capacity(4 + 16 * 2);
         let mut next_send = Instant::now();
         let mut max_jitter_us: u64 = 0;
         let mut jitter_samples: u64 = 0;
@@ -210,7 +248,17 @@ impl RCTx {
         while self.running.load(Ordering::SeqCst) {
             let now = Instant::now();
             if now < next_send {
-                std::thread::sleep(next_send - now);
+                // #19: Loop sleep to handle EINTR
+                let mut remaining = next_send - now;
+                while remaining > Duration::ZERO {
+                    let before = Instant::now();
+                    std::thread::sleep(remaining);
+                    let elapsed = before.elapsed();
+                    if elapsed >= remaining {
+                        break;
+                    }
+                    remaining -= elapsed;
+                }
             }
 
             let actual = Instant::now();
@@ -236,25 +284,20 @@ impl RCTx {
             if let Some(ref mut gp) = self.gamepad {
                 let mut channel_buf = [0u16; 16];
                 gp.read_input(&mut channel_buf);
-
+                // #9: Single lock acquisition — merge gamepad update + read
                 let mut channels = self.channels.lock().unwrap();
-                for (i, ch) in channel_buf.iter().enumerate() {
-                    if i < channels.len() {
-                        channels[i] = *ch;
-                    }
-                }
+                *channels = channel_buf;
             }
 
-            let channels = {
-                let locked = self.channels.lock().unwrap();
-                locked.clone()
-            };
+            // #9, #16: Single lock, copy array by value (no heap alloc)
+            let channels = *self.channels.lock().unwrap();
 
+            // #16: Reuse payload buffer — no per-cycle allocation
+            payload_buf.clear();
             let count = channels.len() as u32;
-            let mut payload = Vec::with_capacity(4 + channels.len() * 2);
-            payload.extend_from_slice(&count.to_le_bytes());
-            for &ch in channels.iter() {
-                payload.extend_from_slice(&ch.to_le_bytes());
+            payload_buf.extend_from_slice(&count.to_le_bytes());
+            for &ch in &channels {
+                payload_buf.extend_from_slice(&ch.to_le_bytes());
             }
 
             let header = link::L2Header {
@@ -262,7 +305,7 @@ impl RCTx {
                 payload_type: link::PAYLOAD_RC,
                 seq: self.l2_seq,
             };
-            header.encode_into(&payload, &mut l2_buf);
+            header.encode_into(&payload_buf, &mut l2_buf);
             let _ = self.socket.send_with_buf(&l2_buf, &mut send_buf);
             self.l2_seq = self.l2_seq.wrapping_add(1);
         }

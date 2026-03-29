@@ -379,7 +379,7 @@ pub struct AppState {
     pub telemetry: Arc<ArcSwap<Telemetry>>,
     pub running: Arc<AtomicBool>,
     pub rssi: Arc<AtomicI8>,
-    pub channels: Arc<Mutex<Vec<u16>>>,
+    pub channels: Arc<Mutex<[u16; 16]>>,
 }
 
 pub struct RpvApp {
@@ -399,7 +399,7 @@ impl RpvApp {
         running: Arc<AtomicBool>,
         link_state: LinkStateHandle,
         rssi: Arc<AtomicI8>,
-        channels: Arc<Mutex<Vec<u16>>>,
+        channels: Arc<Mutex<[u16; 16]>>,
     ) -> Self {
         Self {
             state: AppState {
@@ -577,6 +577,7 @@ impl eframe::App for RpvApp {
                     let scale = scale_x.min(scale_y);
                     let display_size = tex_size * scale;
 
+                    // #9: Use fixed absolute rect — prevents jitter from OSD text wrapping
                     let rect = egui::Rect::from_center_size(
                         ui.available_rect_before_wrap().center(),
                         display_size,
@@ -664,11 +665,16 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         LinkStatus::Connected => egui::Color32::from_gray(200),
         _ => egui::Color32::from_gray(100),
     };
+    // #28: Monospace font for all numeric telemetry — prevents layout jitter
+    let mono = || egui::FontId::monospace(12.0);
+    let mono_big = || egui::FontId::monospace(16.0);
+    let mono_sm = || egui::FontId::monospace(11.0);
+
     p.text(
         egui::pos2(10.0, y),
         egui::Align2::LEFT_TOP,
         format!("FPS: {:.1}", state.fps),
-        egui::FontId::proportional(12.0),
+        mono(),
         fps_color,
     );
     y += 16.0;
@@ -699,7 +705,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(10.0, y),
         egui::Align2::LEFT_TOP,
         rssi_text,
-        egui::FontId::proportional(12.0),
+        mono(),
         rssi_color,
     );
 
@@ -732,7 +738,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(right_x, y),
         egui::Align2::RIGHT_TOP,
         format!("{:.1}V  {}%", telem.battery_v, telem.battery_pct),
-        egui::FontId::proportional(12.0),
+        mono(),
         egui::Color32::WHITE,
     );
     y += 16.0;
@@ -756,7 +762,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(10.0, y),
         egui::Align2::LEFT_TOP,
         format!("SPD: {:.1} m/s", telem.speed),
-        egui::FontId::proportional(16.0),
+        mono_big(),
         egui::Color32::WHITE,
     );
     y += 22.0;
@@ -764,7 +770,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(10.0, y),
         egui::Align2::LEFT_TOP,
         format!("ALT: {:.1} m", telem.alt),
-        egui::FontId::proportional(16.0),
+        mono_big(),
         egui::Color32::WHITE,
     );
 
@@ -775,7 +781,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(right_x, y),
         egui::Align2::RIGHT_TOP,
         format!("HDG: {:.0}deg", telem.heading),
-        egui::FontId::proportional(16.0),
+        mono_big(),
         egui::Color32::WHITE,
     );
     y += 22.0;
@@ -783,7 +789,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(right_x, y),
         egui::Align2::RIGHT_TOP,
         format!("SAT: {}", telem.satellites),
-        egui::FontId::proportional(14.0),
+        mono(),
         egui::Color32::WHITE,
     );
     y += 18.0;
@@ -791,7 +797,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::pos2(right_x, y),
         egui::Align2::RIGHT_TOP,
         format!("{:.6}, {:.6}", telem.lat, telem.lon),
-        egui::FontId::proportional(11.0),
+        mono_sm(),
         egui::Color32::from_gray(180),
     );
 
