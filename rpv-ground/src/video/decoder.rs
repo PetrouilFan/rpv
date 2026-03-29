@@ -343,11 +343,21 @@ fn decode_loop_libavcodec(
                         let linesize1 = unsafe { (*frame).linesize[1] } as usize;
                         let data0 = unsafe { (*frame).data[0] };
                         let data1 = unsafe { (*frame).data[1] };
+                        let data2 = unsafe { (*frame).data[2] };
                         let fw = unsafe { (*frame).width } as usize;
                         let fh = unsafe { (*frame).height } as usize;
+                        let pix_fmt = unsafe { (*frame).format };
 
                         if data0.is_null() || data1.is_null() {
                             continue;
+                        }
+
+                        // Log pixel format once
+                        if frame_count == 0 {
+                            info!("Decoded frame: {}x{}, format={}, linesize=[{},{},{}], data2_null={}",
+                                fw, fh, pix_fmt, linesize0, linesize1,
+                                unsafe { (*frame).linesize[2] },
+                                data2.is_null());
                         }
 
                         // Skip frames with unexpected dimensions (corrupt decode)
@@ -370,46 +380,55 @@ fn decode_loop_libavcodec(
                             nv12[dst_start..dst_start + copy_w].copy_from_slice(src);
                         }
 
-                        // Copy UV plane
-                        // libavcodec H.264 decoder outputs YUV420P (separate U,V planes)
-                        // We need NV12 (interleaved U,V), so interleave manually
-                        let data2 = unsafe { (*frame).data[2] };
-                        let linesize2 = unsafe { (*frame).linesize[1] } as usize; // same as linesize[1] for YUV420P
-                        let uv_copy_h = (fh / 2).min(height as usize / 2);
+                        // Copy UV plane — handle different pixel formats
+                        // YUV420P (format 0/12): UV height = h/2
+                        // YUV422P (format 1/13): UV height = h (full height)
+                        // NV12 (format 23): UV is interleaved, height = h/2
+                        let is_nv12 = pix_fmt == 23;
+                        let uv_src_h = if pix_fmt == 1 || pix_fmt == 13 {
+                            fh // YUV422P: full height UV
+                        } else {
+                            fh / 2 // YUV420P or NV12: half height UV
+                        };
+                        let uv_copy_h = uv_src_h.min(height as usize / 2);
                         let uv_half_w = (copy_w / 2).min(linesize1);
-                        if !data2.is_null() {
+
+                        if is_nv12 {
+                            // NV12: copy interleaved UV directly
+                            let uv_copy_w = copy_w.min(linesize1);
                             for row in 0..uv_copy_h {
-                                let u_row = unsafe {
+                                let src = unsafe {
                                     std::slice::from_raw_parts(
                                         data1.add(row * linesize1),
+                                        uv_copy_w,
+                                    )
+                                };
+                                let dst_start = y_size + row * stride as usize;
+                                nv12[dst_start..dst_start + uv_copy_w].copy_from_slice(src);
+                            }
+                        } else {
+                            // YUV420P or YUV422P: interleave U and V from separate planes
+                            let linesize2 = unsafe { (*frame).linesize[2] } as usize;
+                            // For YUV422P, subsample vertically (take every other row)
+                            let step = if uv_src_h > height as usize / 2 { 2 } else { 1 };
+                            for out_row in 0..uv_copy_h {
+                                let src_row = out_row * step;
+                                let u_row = unsafe {
+                                    std::slice::from_raw_parts(
+                                        data1.add(src_row * linesize1),
                                         uv_half_w,
                                     )
                                 };
                                 let v_row = unsafe {
                                     std::slice::from_raw_parts(
-                                        data2.add(row * linesize2),
+                                        data2.add(src_row * linesize2),
                                         uv_half_w,
                                     )
                                 };
-                                let dst_start = y_size + row * stride as usize;
+                                let dst_start = y_size + out_row * stride as usize;
                                 for col in 0..uv_half_w {
                                     nv12[dst_start + col * 2] = u_row[col];
                                     nv12[dst_start + col * 2 + 1] = v_row[col];
-                                }
-                            }
-                        } else {
-                            // Fallback: if data2 is null, just copy U plane (will look greenish)
-                            for row in 0..uv_copy_h {
-                                let src = unsafe {
-                                    std::slice::from_raw_parts(
-                                        data1.add(row * linesize1),
-                                        uv_half_w,
-                                    )
-                                };
-                                let dst_start = y_size + row * stride as usize;
-                                for col in 0..uv_half_w {
-                                    nv12[dst_start + col * 2] = src[col];
-                                    nv12[dst_start + col * 2 + 1] = 128; // neutral V
                                 }
                             }
                         }
