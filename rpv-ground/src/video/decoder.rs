@@ -359,8 +359,10 @@ fn decode_loop_libavcodec(
                         let mut nv12 = vec![0u8; total_size];
 
                         // Copy Y plane (row by row for stride mismatch)
+                        // Cap at configured dimensions to prevent buffer overflow
                         let copy_w = fw.min(stride as usize).min(linesize0);
-                        for row in 0..fh {
+                        let copy_h = fh.min(height as usize);
+                        for row in 0..copy_h {
                             let src = unsafe {
                                 std::slice::from_raw_parts(data0.add(row * linesize0), copy_w)
                             };
@@ -369,9 +371,9 @@ fn decode_loop_libavcodec(
                         }
 
                         // Copy UV plane (NV12: interleaved U/V, half height)
-                        let uv_h = fh / 2;
+                        let uv_copy_h = (fh / 2).min(height as usize / 2);
                         let uv_copy_w = copy_w.min(linesize1);
-                        for row in 0..uv_h {
+                        for row in 0..uv_copy_h {
                             let src = unsafe {
                                 std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w)
                             };
@@ -381,8 +383,8 @@ fn decode_loop_libavcodec(
 
                         let decoded = DecodedFrame {
                             nv12_data: nv12,
-                            width: fw as u32,
-                            height: fh as u32,
+                            width: width,
+                            height: height,
                             stride,
                             send_ts_us: None,
                             recv_time: None,
