@@ -6,18 +6,21 @@
 /// the L2 protocol payload.
 use std::io;
 
-/// Fixed 802.11 header size for a broadcast data frame (no QoS, no 4th address).
-const IEEE80211_HDR_LEN: usize = 24;
+/// Fixed 802.11 QoS Data header size (26 bytes with QoS Control field).
+/// #9: QoS Data frames enable HT/VHT MCS rates instead of legacy 1-6 Mbps.
+const IEEE80211_HDR_LEN: usize = 26;
 const RADIOTAP_LEN: usize = 8;
-const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 32 bytes
+const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 34 bytes
 
 /// Static radiotap header (version=0, pad=0, hdr_len=8, present=0)
 static RADIOTAP: [u8; RADIOTAP_LEN] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-/// Static 802.11 broadcast data frame header (pre-computed)
+/// Static 802.11 QoS Data broadcast header (pre-computed).
+/// #9: QoS Data (subtype 0x88) enables HT/VHT rates.
+/// #10: Sequence control at bytes 22-23, updated per send.
 static DATA_FRAME_HDR: [u8; IEEE80211_HDR_LEN] = {
     let mut hdr = [0u8; IEEE80211_HDR_LEN];
-    hdr[0] = 0x08; // Data frame
+    hdr[0] = 0x88; // #9: QoS Data frame (type=2, subtype=0x08 -> 0x88)
     hdr[1] = 0x00; // No flags
     hdr[4] = 0xFF;
     hdr[5] = 0xFF;
@@ -37,11 +40,15 @@ static DATA_FRAME_HDR: [u8; IEEE80211_HDR_LEN] = {
     hdr[19] = 0xFF;
     hdr[20] = 0xFF;
     hdr[21] = 0xFF; // BSSID: broadcast
+                    // Bytes 22-23: Sequence Control — updated per send in send_with_buf
+                    // Bytes 24-25: QoS Control — 0x00 = best effort AC
     hdr
 };
 
 pub struct RawSocket {
     fd: i32,
+    // #10: 802.11 sequence counter — must increment per frame
+    seq_control: std::sync::atomic::AtomicU16,
 }
 
 impl RawSocket {
@@ -76,6 +83,8 @@ impl RawSocket {
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_protocol = (libc::ETH_P_ALL.to_be()) as u16;
         addr.sll_ifindex = ifindex as i32;
+        // #8: Set hardware type for monitor mode radiotap
+        addr.sll_hatype = libc::ARPHRD_IEEE80211_RADIOTAP as u16;
 
         let ret = unsafe {
             libc::bind(
@@ -151,7 +160,10 @@ impl RawSocket {
             }
         }
 
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            seq_control: std::sync::atomic::AtomicU16::new(0),
+        })
     }
 
     /// Send a raw 802.11 frame.
@@ -184,12 +196,23 @@ impl RawSocket {
     }
 
     /// Send using a reusable buffer. Non-blocking: returns Ok(0) if TX ring is full.
+    /// #10: Increments 802.11 sequence control to prevent duplicate drops.
     pub fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {
         let total = HEADER_TOTAL + payload.len();
         buf.clear();
         buf.reserve(total);
         buf.extend_from_slice(&RADIOTAP);
         buf.extend_from_slice(&DATA_FRAME_HDR);
+
+        // #10: Write sequence control field (bytes 22-23 in the 802.11 header)
+        let seq = self
+            .seq_control
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq_bytes = seq.to_le_bytes();
+        // Offset: RADIOTAP_LEN(8) + 22 = byte 30, 31
+        buf[RADIOTAP_LEN + 22] = seq_bytes[0];
+        buf[RADIOTAP_LEN + 23] = seq_bytes[1];
+
         buf.extend_from_slice(payload);
 
         let ret = unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };

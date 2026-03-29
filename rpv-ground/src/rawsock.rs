@@ -6,20 +6,18 @@
 /// the L2 protocol payload.
 use std::io;
 
-const IEEE80211_HDR_LEN: usize = 24;
+const IEEE80211_HDR_LEN: usize = 26; // #9: QoS Data (26 bytes)
 const RADIOTAP_LEN: usize = 8;
-const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 32 bytes
+const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 34 bytes
 
 /// Static radiotap header (version=0, pad=0, hdr_len=8, present=0)
 static RADIOTAP: [u8; RADIOTAP_LEN] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-/// Static 802.11 broadcast data frame header (pre-computed, never changes)
+/// #9: Static 802.11 QoS Data broadcast header (enables HT/VHT rates)
 static DATA_FRAME_HDR: [u8; IEEE80211_HDR_LEN] = {
     let mut hdr = [0u8; IEEE80211_HDR_LEN];
-    hdr[0] = 0x08; // Data frame
+    hdr[0] = 0x88; // #9: QoS Data (subtype 0x88)
     hdr[1] = 0x00; // No flags
-                   // Duration: 0, 0
-                   // DA: broadcast (FF:FF:FF:FF:FF:FF)
     hdr[4] = 0xFF;
     hdr[5] = 0xFF;
     hdr[6] = 0xFF;
@@ -46,6 +44,8 @@ static DATA_FRAME_HDR: [u8; IEEE80211_HDR_LEN] = {
 
 pub struct RawSocket {
     fd: i32,
+    // #10: 802.11 sequence counter
+    seq_control: std::sync::atomic::AtomicU16,
 }
 
 impl RawSocket {
@@ -80,6 +80,8 @@ impl RawSocket {
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
         addr.sll_ifindex = ifindex as i32;
+        // #8: Set hardware type for monitor mode radiotap
+        addr.sll_hatype = libc::ARPHRD_IEEE80211_RADIOTAP as u16;
 
         let ret = unsafe {
             libc::bind(
@@ -158,7 +160,10 @@ impl RawSocket {
         // Attach BPF filter — kernel-side rejection of non-RPV frames
         let _ = Self::try_attach_bpf_filter(fd);
 
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            seq_control: std::sync::atomic::AtomicU16::new(0),
+        })
     }
 
     /// BPF filter: accept only frames that pass the RPV magic byte check.
@@ -197,11 +202,11 @@ impl RawSocket {
             filter: *const sock_filter,
         }
 
-        // BPF filter: check RPV magic bytes at radiotap_len + 24 (common 802.11 header offset)
+        // BPF filter: check RPV magic bytes at radiotap_len + 26 (26-byte QoS 802.11 header)
         const BPF_LD_B_IND: u16 = 0x0040; // BPF_LD | BPF_B | BPF_IND (load byte [X + k])
 
         let filters = [
-            // 0: Check minimum packet length >= 36 (8+24+2+2 for L2 header)
+            // 0: Load radiotap length field (u16 LE at offset 2)
             sock_filter {
                 code: BPF_LD_H_ABS, // Load halfword at absolute offset
                 jt: 0,
@@ -215,35 +220,35 @@ impl RawSocket {
                 jf: 0,
                 k: 0,
             },
-            // 2: Load byte at X+24 (first byte of L2 payload assuming 24-byte 802.11 header)
+            // 2: Load byte at X+26 (first byte of L2 payload after 26-byte QoS header)
             sock_filter {
                 code: BPF_LD_B_IND, // Load byte at [X + k]
                 jt: 0,
                 jf: 0,
-                k: 24, // offset into 802.11 frame body (after 24-byte header)
+                k: 26, // #9: offset after 26-byte QoS 802.11 header
             },
-            // A = byte at radiotap_len + 24. Check == 0x52 ('R')
+            // A = byte at radiotap_len + 26. Check == 0x52 ('R')
             sock_filter {
                 code: BPF_JEQ_K,
                 jt: 0,
-                jf: 6, // jump to reject (#9)
+                jf: 6, // jump to reject
                 k: 0x52,
             },
-            // 4: Load byte at X+25 (second byte of L2 payload)
+            // 4: Load byte at X+27 (second byte of L2 payload)
             sock_filter {
                 code: BPF_LD_B_IND,
                 jt: 0,
                 jf: 0,
-                k: 25,
+                k: 27, // #9: offset after 26-byte QoS 802.11 header + 1
             },
-            // A = byte at radiotap_len + 25. Check == 0x50 ('P')
+            // A = byte at radiotap_len + 27. Check == 0x50 ('P')
             sock_filter {
                 code: BPF_JEQ_K,
                 jt: 0,
-                jf: 4, // jump to reject (#9)
+                jf: 4, // jump to reject
                 k: 0x50,
             },
-            // 6: Also verify minimum frame size >= 36 (8 radiotap + 24 802.11 + 4 L2 header min)
+            // 6: Accept: return 0xffff (accept all remaining bytes)
             //    We already loaded radiotap into X, but checking absolute frame length
             //    is harder in BPF. We can check that we didn't fault on the indirect loads
             //    (BPF returns 0 for out-of-bounds loads) but the JEQ already handles that
@@ -334,12 +339,23 @@ impl RawSocket {
     /// Send using a persistent header buffer (avoids per-call static lookup + extend).
     /// The buffer should be pre-filled with Radiotap + 802.11 header at positions 0..32.
     /// Only the payload portion (after HEADER_TOTAL) is written per call.
+    /// #10: Increments 802.11 sequence control to prevent duplicate drops.
     pub fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {
         let total = HEADER_TOTAL + payload.len();
         buf.clear();
         buf.reserve(total);
         buf.extend_from_slice(&RADIOTAP);
         buf.extend_from_slice(&DATA_FRAME_HDR);
+
+        // #10: Write sequence control field (bytes 22-23 in the 802.11 header)
+        let seq = self
+            .seq_control
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq_bytes = seq.to_le_bytes();
+        // Offset: RADIOTAP_LEN(8) + 22 = byte 30, 31
+        buf[RADIOTAP_LEN + 22] = seq_bytes[0];
+        buf[RADIOTAP_LEN + 23] = seq_bytes[1];
+
         buf.extend_from_slice(payload);
 
         let ret = unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
