@@ -9,11 +9,19 @@ use std::io;
 /// Fixed 802.11 QoS Data header size (26 bytes with QoS Control field).
 /// #9: QoS Data frames enable HT/VHT MCS rates instead of legacy 1-6 Mbps.
 const IEEE80211_HDR_LEN: usize = 26;
-const RADIOTAP_LEN: usize = 8;
-const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 34 bytes
+/// 11-byte radiotap with MCS field to force HT20 rate (MCS7 = 65 Mbps)
+const RADIOTAP_LEN: usize = 11;
+const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 37 bytes
 
-/// Static radiotap header (version=0, pad=0, hdr_len=8, present=0)
-static RADIOTAP: [u8; RADIOTAP_LEN] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// Static radiotap header with MCS rate field to enable HT20 transmission
+static RADIOTAP: [u8; RADIOTAP_LEN] = [
+    0x00, 0x00, // version=0, pad=0
+    0x0b, 0x00, // hdr_len=11 (LE)
+    0x00, 0x00, 0x08, 0x00, // present=0x00080000 (bit 19 = MCS field)
+    0x07, // MCS known: bandwidth(0) + MCS index(1) + GI(2) = 0x07
+    0x00, // MCS flags: 20 MHz, long GI
+    0x07, // MCS index 7 → 65 Mbps @ HT20
+];
 
 /// Static 802.11 QoS Data broadcast header (pre-computed).
 /// #9: QoS Data (subtype 0x88) enables HT/VHT rates.
@@ -222,6 +230,11 @@ impl RawSocket {
             {
                 return Ok(0);
             }
+            // ENXIO means interface state changed (driver invalidated socket)
+            // Caller should reopen socket
+            if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::ENODEV) {
+                return Err(e);
+            }
             Err(e)
         } else {
             Ok(ret as usize)
@@ -237,6 +250,10 @@ impl RawSocket {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
                 Ok(0)
+            } else if err.raw_os_error() == Some(libc::ENXIO)
+                || err.raw_os_error() == Some(libc::ENODEV)
+            {
+                Err(err)
             } else {
                 Err(err)
             }

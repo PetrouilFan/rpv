@@ -32,10 +32,13 @@ ip link set "$IFACE" up
 # Set target frequency — 2.4 GHz channel 6 (2437 MHz) for better penetration/range
 # Override with RPV_FREQ env var (e.g., RPV_FREQ=2412 for ch1, RPV_FREQ=2462 for ch11)
 FREQ="${RPV_FREQ:-2437}"
-iw dev "$IFACE" set freq "$FREQ"
+iw dev "$IFACE" set freq "$FREQ" HT20 2>/dev/null || iw dev "$IFACE" set freq "$FREQ"
 
-# Max out TX power (fixed 3000 = 30 dBm)
-iw dev "$IFACE" set txpower fixed 3000 2>/dev/null || true
+# Max out TX power (fixed 3000 = 30 dBm) - retry multiple times
+for i in 1 2 3; do
+    iw dev "$IFACE" set txpower fixed 3000 2>/dev/null && break
+    sleep 0.5
+done
 
 # Disable power save — critical for latency
 iw dev "$IFACE" set power_save off 2>/dev/null || true
@@ -55,4 +58,11 @@ done
 
 # #20: For true zero-jitter RF, add isolcpus=0,1 to /boot/firmware/cmdline.txt
 # This hides cores 0 and 1 from the kernel scheduler entirely.
+
+# Final TX power setting with retries
+for i in 1 2 3 4 5; do
+    iw dev "$IFACE" set txpower fixed 3000 2>/dev/null && break
+    sleep 0.2
+done
+
 echo "Monitor mode ready on $IFACE @ 2437 MHz (2.4 GHz ch6)"

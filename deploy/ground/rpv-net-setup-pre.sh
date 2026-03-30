@@ -29,10 +29,13 @@ ip link set "$IFACE" up
 
 # Set target frequency — 2.4 GHz channel 6 (2437 MHz) for better penetration/range
 FREQ="${RPV_FREQ:-2437}"
-iw dev "$IFACE" set freq "$FREQ"
+iw dev "$IFACE" set freq "$FREQ" HT20 2>/dev/null || iw dev "$IFACE" set freq "$FREQ"
 
 # Max out TX power (fixed 3000 = 30 dBm)
-iw dev "$IFACE" set txpower fixed 3000 2>/dev/null || true
+for i in 1 2 3; do
+    iw dev "$IFACE" set txpower fixed 3000 2>/dev/null && break
+    sleep 0.5
+done
 
 # Disable power save — critical for latency
 iw dev "$IFACE" set power_save off 2>/dev/null || true
