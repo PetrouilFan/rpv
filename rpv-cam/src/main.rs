@@ -111,10 +111,11 @@ fn main() {
     });
 
     // High-priority TX channel: telemetry/RC/heartbeat preempt video shards
+    // Bounded to prevent infinite queue buildup if video stalls
     let (hp_tx, hp_rx): (
         crossbeam_channel::Sender<Vec<u8>>,
         crossbeam_channel::Receiver<Vec<u8>>,
-    ) = crossbeam_channel::unbounded();
+    ) = crossbeam_channel::bounded(256);
 
     // Start video capture and streaming — #24: pin to core 1, SCHED_FIFO priority 50
     let video_running = running.clone();

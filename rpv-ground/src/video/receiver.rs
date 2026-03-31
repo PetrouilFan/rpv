@@ -8,7 +8,7 @@ const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 /// #13: Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
 const RING_SIZE: usize = 256;
-/// Only need 1 shard (data shard) since parity is not sent
+/// Only need 1 shard (data shard) — parity shard allows recovery of lost data
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
 ///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
 ///   [2B * DATA_SHARDS shard_len_array]
@@ -17,7 +17,7 @@ const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
 /// If no FEC block completes within this window, drop the stalled block.
-const STALL_TIMEOUT: Duration = Duration::from_millis(100);
+const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 struct RsBlock {
     shards: Vec<Option<Vec<u8>>>,
@@ -96,10 +96,8 @@ impl VideoReceiver {
 
         // #13: Fixed-size ring buffer — O(1) zero-allocation lookups via seq % RING_SIZE
         let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
-        // #15: Ring buffer for processed sequence tracking — O(1) check
+        // #15: Ring buffer for processed sequence tracking — O(1) bitmap lookup
         let mut processed_ring: [u32; RING_SIZE] = [0; RING_SIZE];
-        let mut processed_head: usize = 0;
-        let mut processed_count: usize = 0;
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
         let mut _block_count: u64 = 0;
@@ -179,18 +177,9 @@ impl VideoReceiver {
             }
             let shard_data = payload[DATA_START..].to_vec();
 
-            // #15: O(1) ring buffer check instead of HashSet.contains
-            let is_processed = {
-                let mut found = false;
-                for i in 0..processed_count {
-                    if processed_ring[(processed_head + i) % RING_SIZE] == block_seq {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-            if is_processed {
+            // #15: O(1) bitmap lookup — seq % RING_SIZE maps to slot
+            let dedup_idx = (block_seq as usize) % RING_SIZE;
+            if processed_ring[dedup_idx] == block_seq {
                 continue;
             }
 
@@ -273,14 +262,9 @@ impl VideoReceiver {
                         }
                     }
                     _block_count += 1;
-                    // #15: Add to processed ring buffer (O(1))
-                    if processed_count < RING_SIZE {
-                        processed_ring[(processed_head + processed_count) % RING_SIZE] = block_seq;
-                        processed_count += 1;
-                    } else {
-                        processed_ring[processed_head] = block_seq;
-                        processed_head = (processed_head + 1) % RING_SIZE;
-                    }
+                    // #15: Mark as processed in O(1) bitmap
+                    let dedup_idx = (block_seq as usize) % RING_SIZE;
+                    processed_ring[dedup_idx] = block_seq;
                     if let Some(nb) = next_block {
                         if block_seq >= nb {
                             next_block = Some(block_seq.wrapping_add(1));
@@ -289,14 +273,9 @@ impl VideoReceiver {
                     last_decode_time = Instant::now();
                 } else {
                     fec_dropped += 1;
-                    // #15: Add to processed ring buffer
-                    if processed_count < RING_SIZE {
-                        processed_ring[(processed_head + processed_count) % RING_SIZE] = block_seq;
-                        processed_count += 1;
-                    } else {
-                        processed_ring[processed_head] = block_seq;
-                        processed_head = (processed_head + 1) % RING_SIZE;
-                    }
+                    // #15: Mark as processed in O(1) bitmap
+                    let dedup_idx = (block_seq as usize) % RING_SIZE;
+                    processed_ring[dedup_idx] = block_seq;
                     if nal_started {
                         nal_buf.clear();
                         nal_started = false;

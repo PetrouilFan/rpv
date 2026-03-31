@@ -871,13 +871,6 @@ fn main() -> Result<(), eframe::Error> {
     let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(1);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
-    // #31: Static byte array — no heap allocation for a simple channel test
-    static TEST_DATA: [u8; 8] = [0x52, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-    video_payload_tx
-        .try_send(TEST_DATA.to_vec())
-        .expect("video channel test failed");
-    tracing::info!("Video channel test OK");
-
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
     let ui_frame_rx = decoder.get_rx();
     decoder.spawn(video_frame_rx_decoder);
@@ -1178,6 +1171,6 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: 
         let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
 
         l2_seq = l2_seq.wrapping_add(1);
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

@@ -397,14 +397,25 @@ impl Drop for RawSocket {
     }
 }
 
-pub fn strip_radiotap(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() < 4 {
+/// Walk radiotap header properly, handling extended present bitmaps.
+/// Returns the offset where the 802.11 frame starts.
+fn radiotap_hdr_len(frame: &[u8]) -> Option<usize> {
+    if frame.len() < 8 {
+        return None;
+    }
+    let version = frame[0];
+    if version != 0 {
         return None;
     }
     let hdr_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
-    if hdr_len >= frame.len() || hdr_len < 8 {
+    if hdr_len < 8 || hdr_len > frame.len() {
         return None;
     }
+    Some(hdr_len)
+}
+
+pub fn strip_radiotap(frame: &[u8]) -> Option<&[u8]> {
+    let hdr_len = radiotap_hdr_len(frame)?;
     Some(&frame[hdr_len..])
 }
 
@@ -467,11 +478,8 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
 }
 
 fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
-    if frame.len() < 8 {
-        return None;
-    }
-    let hdr_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
-    if hdr_len < 8 || hdr_len > frame.len() {
+    let hdr_len = radiotap_hdr_len(frame)?;
+    if hdr_len < 12 {
         return None;
     }
     let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
@@ -488,7 +496,6 @@ fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
             offset += FIELD_SIZES[bit as usize] as usize;
         }
     }
-    // #4: Bounds check before indexing — prevents OOB panic on malformed packets
     if offset >= hdr_len || offset >= frame.len() {
         return None;
     }

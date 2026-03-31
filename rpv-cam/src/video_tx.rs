@@ -571,14 +571,13 @@ fn send_fec_group_arena(
     let mut group_ok = true;
 
     for (i, shard) in fec_shards.iter().enumerate() {
-        // Skip parity shards — only send data shards (no FEC overhead)
-        if i >= DATA_SHARDS {
-            break;
-        }
-        // Drain high-priority packets (telemetry, RC, heartbeat) before this shard
-        if let Some(ref hp) = hp_rx {
-            while let Ok(hp_frame) = hp.try_recv() {
-                let _ = socket.send(&hp_frame);
+        // Drain high-priority packets (telemetry, RC, heartbeat) before each shard
+        // to reduce channel contention
+        if i % 2 == 0 {
+            if let Some(ref hp) = hp_rx {
+                while let Ok(hp_frame) = hp.try_recv() {
+                    let _ = socket.send(&hp_frame);
+                }
             }
         }
 

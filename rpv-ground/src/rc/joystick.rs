@@ -12,7 +12,7 @@ const RC_MIN: u16 = 1000;
 const RC_MID: u16 = 1500;
 const RC_MAX: u16 = 2000;
 const DEADZONE: i32 = 4096;
-const RC_INTERVAL: Duration = Duration::from_millis(20);
+const RC_INTERVAL: Duration = Duration::from_millis(50);
 
 struct GamepadInput {
     device: Device,
@@ -235,7 +235,7 @@ impl RCTx {
     }
 
     pub fn run(&mut self) {
-        info!("RC transmitter ready (L2 broadcast, 50Hz, deadline-based)");
+        info!("RC transmitter ready (L2 broadcast, 20Hz, deadline-based)");
 
         let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
         let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
