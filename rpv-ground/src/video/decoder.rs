@@ -296,7 +296,7 @@ fn decode_loop_libavcodec(
             return;
         }
 
-        let parser = unsafe { av_parser_init(AV_CODEC_ID_H264) };
+        let mut parser = unsafe { av_parser_init(AV_CODEC_ID_H264) };
         if parser.is_null() {
             error!("libavcodec: failed to init H.264 parser");
             unsafe { avcodec_free_context(&mut { codec_ctx }) };
@@ -354,7 +354,13 @@ fn decode_loop_libavcodec(
                 };
 
                 if consumed < 0 {
-                    warn!("libavcodec: parser error {}", consumed);
+                    warn!("libavcodec: parser error {}, resetting parser", consumed);
+                    unsafe { av_parser_close(parser) };
+                    parser = unsafe { av_parser_init(AV_CODEC_ID_H264) };
+                    if parser.is_null() {
+                        error!("libavcodec: failed to re-init H.264 parser");
+                        break 'decode_loop;
+                    }
                     break;
                 }
                 parse_offset += consumed as usize;

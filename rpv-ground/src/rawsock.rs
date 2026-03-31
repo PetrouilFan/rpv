@@ -457,17 +457,22 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
     let hdr_len = ieee80211_hdr_len(after_radiotap)?;
     let after_80211 = &after_radiotap[hdr_len..];
 
-    // Standard LLC/SNAP: DSAP=0xAA, SSAP=0xAA, Control=0x03
+    // LLC/SNAP header: DSAP=0xAA, SSAP=0xAA, Control=0x03
+    // Then 3-byte OUI + 2-byte EtherType (8 bytes total skip)
+    // Or bare LLC without SNAP (6 bytes)
     if after_80211.len() >= 8
         && after_80211[0] == 0xAA
         && after_80211[1] == 0xAA
         && after_80211[2] == 0x03
     {
-        let payload = &after_80211[8..];
-        if payload.is_empty() {
-            return None;
+        // Full LLC/SNAP with EtherType: skip 8 bytes
+        if after_80211.len() >= 8 {
+            let payload = &after_80211[8..];
+            if !payload.is_empty() {
+                return Some((payload, rssi));
+            }
         }
-        return Some((payload, rssi));
+        return None;
     }
 
     if after_80211.is_empty() {
@@ -479,25 +484,69 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
 
 fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
     let hdr_len = radiotap_hdr_len(frame)?;
-    if hdr_len < 12 {
+
+    // Walk present bitmaps (handle extended bit 31 chaining)
+    let mut present_words: Vec<u32> = Vec::new();
+    let mut pres_offset = 4usize;
+    loop {
+        if pres_offset + 4 > hdr_len || pres_offset + 4 > frame.len() {
+            return None;
+        }
+        let word = u32::from_le_bytes([
+            frame[pres_offset],
+            frame[pres_offset + 1],
+            frame[pres_offset + 2],
+            frame[pres_offset + 3],
+        ]);
+        present_words.push(word);
+        pres_offset += 4;
+        if word & (1 << 31) == 0 {
+            break;
+        }
+    }
+
+    // Check if RSSI (bit 5: dBm antenna signal) is present
+    let has_rssi = present_words.iter().any(|w| w & (1 << 5) != 0);
+    if !has_rssi {
         return None;
     }
-    let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
-    if present & (1 << 5) == 0 {
-        return None;
-    }
-    const FIELD_SIZES: [u8; 32] = [
+
+    // Natural alignment for each radiotap field
+    const FIELD_ALIGN: [usize; 32] = [
         8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8, 2, 4,
         2, 1,
     ];
-    let mut offset = 8;
-    for bit in 0..5u32 {
-        if present & (1 << bit) != 0 {
-            offset += FIELD_SIZES[bit as usize] as usize;
+    const FIELD_SIZE: [usize; 32] = [
+        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8, 2, 4,
+        2, 1,
+    ];
+
+    let mut offset = pres_offset;
+    for (word_idx, &present) in present_words.iter().enumerate() {
+        let base_bit = word_idx * 32;
+        for bit in 0..32u32 {
+            if present & (1 << bit) != 0 {
+                let field_idx = base_bit + bit as usize;
+                if field_idx >= 32 {
+                    continue;
+                }
+                let align = FIELD_ALIGN[field_idx];
+                if align > 1 {
+                    offset = (offset + align - 1) & !(align - 1);
+                }
+                if field_idx == 5 {
+                    // dBm antenna signal
+                    if offset >= hdr_len || offset >= frame.len() {
+                        return None;
+                    }
+                    return Some(frame[offset] as i8);
+                }
+                offset += FIELD_SIZE[field_idx];
+                if offset > hdr_len {
+                    return None;
+                }
+            }
         }
     }
-    if offset >= hdr_len || offset >= frame.len() {
-        return None;
-    }
-    Some(frame[offset] as i8)
+    None
 }

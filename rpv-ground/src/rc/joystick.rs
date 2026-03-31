@@ -279,7 +279,7 @@ impl RCTx {
                 }
             }
 
-            next_send = actual + RC_INTERVAL;
+            next_send += RC_INTERVAL;
 
             if let Some(ref mut gp) = self.gamepad {
                 let mut channel_buf = [0u16; 16];

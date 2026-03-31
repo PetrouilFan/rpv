@@ -103,6 +103,10 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
                 }
                 Ok(n) => {
                     acc.extend_from_slice(&raw_buf[..n]);
+                    // Cap accumulator to prevent OOM under sustained noise
+                    if acc.len() > 8192 {
+                        acc.clear();
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
@@ -257,7 +261,7 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
 /// MAVLink RC_CHANNELS_OVERRIDE only supports 8 channels. Values of 0 mean
 /// "release back to RC radio" per the MAVLink spec (used for missing channels).
 fn channels_to_override(channels: &[u16], target_system: u8) -> MavMessage {
-    let ch = |i: usize| -> u16 { channels.get(i).copied().unwrap_or(0) };
+    let ch = |i: usize| -> u16 { channels.get(i).copied().unwrap_or(1500) };
     // #24: Warn aux channels only once (not every 50Hz packet)
     // Use a static to track if warning was already emitted
     static AUX_WARNED: AtomicBool = AtomicBool::new(false);
