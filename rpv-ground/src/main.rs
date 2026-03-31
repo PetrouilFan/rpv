@@ -1007,6 +1007,7 @@ fn rx_dispatcher(
     let mut telemetry_count: u64 = 0;
     let mut heartbeat_count: u64 = 0;
     let mut total_frames: u64 = 0;
+    let mut _self_filtered: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
@@ -1059,6 +1060,13 @@ fn rx_dispatcher(
             continue;
         }
 
+        // Self-transmission filter: ground sends HEARTBEAT and RC.
+        // In monitor mode we receive our own frames back — drop RC.
+        if header.payload_type == link::PAYLOAD_RC {
+            _self_filtered += 1;
+            continue;
+        }
+
         total_frames += 1;
         if total_frames % 500 == 0 {
             tracing::info!(
@@ -1077,16 +1085,27 @@ fn rx_dispatcher(
                 if video_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Video queue dropped (backpressure)");
                 }
+                // Any valid frame from camera = link alive
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                last_heartbeat.store(now_ms, Ordering::Relaxed);
             }
             link::PAYLOAD_TELEMETRY => {
                 telemetry_count += 1;
                 if telem_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Telemetry queue dropped");
                 }
+                // Any valid frame from camera = link alive
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                last_heartbeat.store(now_ms, Ordering::Relaxed);
             }
             link::PAYLOAD_HEARTBEAT => {
                 heartbeat_count += 1;
-                // #22: AtomicU64 write — stores UNIX timestamp in milliseconds
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1105,7 +1124,7 @@ fn heartbeat_monitor(
     last_heartbeat: Arc<AtomicU64>,
     link_state: LinkStateHandle,
 ) {
-    tracing::info!("Heartbeat monitor started (timeout: 0.5s)");
+    tracing::info!("Heartbeat monitor started (timeout: 5.0s)");
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     let mut ever_connected = false;
@@ -1121,7 +1140,7 @@ fn heartbeat_monitor(
             .as_millis() as u64;
         let elapsed_ms = now_ms.saturating_sub(last_ms);
 
-        if last_ms == 0 || elapsed_ms > 500 {
+        if last_ms == 0 || elapsed_ms > 5000 {
             if ever_connected {
                 link_state.heartbeat_lost();
             }

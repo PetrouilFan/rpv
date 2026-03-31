@@ -353,21 +353,11 @@ fn decode_loop_libavcodec(
         let mut _decode_err_count: u32 = 0;
 
         'decode_loop: loop {
-            // #12: Drain stale NALs before decoding — only process the latest data
-            // This prevents the decoder from working on outdated video data when behind
-            let nal_data = loop {
-                match rx.recv() {
-                    Ok(d) => {
-                        // Try to drain any remaining pending NALs (keep only the latest)
-                        match rx.try_recv() {
-                            Ok(latest) => break latest,
-                            Err(_) => break d,
-                        }
-                    }
-                    Err(_) => {
-                        info!("Decoder input channel closed");
-                        break 'decode_loop;
-                    }
+            let nal_data = match rx.recv() {
+                Ok(d) => d,
+                Err(_) => {
+                    info!("Decoder input channel closed");
+                    break 'decode_loop;
                 }
             };
 

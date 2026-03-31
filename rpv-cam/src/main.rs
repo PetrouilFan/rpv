@@ -164,6 +164,13 @@ fn main() {
         heartbeat_monitor(hm_running, hm_last);
     });
 
+    // Start heartbeat sender — sends PAYLOAD_HEARTBEAT to ground at 10Hz
+    let hb_running = running.clone();
+    let hb_socket = Arc::clone(&socket);
+    let hb_handle = thread::spawn(move || {
+        heartbeat_sender(hb_running, hb_socket, config.drone_id);
+    });
+
     // Wait for shutdown
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(500));
@@ -173,6 +180,7 @@ fn main() {
     video_handle.join().ok();
     telem_handle.join().ok();
     hm_handle.join().ok();
+    hb_handle.join().ok();
 
     tracing::info!("rpv-cam stopped");
 }
@@ -193,6 +201,8 @@ fn rx_dispatcher(
     let mut reject_count: u64 = 0;
     let mut radiotap_rejects: u64 = 0; // #28: separate counters
     let mut magic_rejects: u64 = 0;
+
+    let mut _self_filtered: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         // #1: Check failsafe for BOTH FC and file modes
@@ -252,6 +262,15 @@ fn rx_dispatcher(
         };
 
         if header.drone_id != drone_id {
+            continue;
+        }
+
+        // Self-transmission filter: camera sends VIDEO, TELEMETRY, HEARTBEAT.
+        // In monitor mode we receive our own frames back — drop them.
+        if header.payload_type == link::PAYLOAD_VIDEO
+            || header.payload_type == link::PAYLOAD_TELEMETRY
+        {
+            _self_filtered += 1;
             continue;
         }
 
@@ -413,5 +432,36 @@ fn telemetry_sender(
         l2_seq = l2_seq.wrapping_add(1);
 
         thread::sleep(interval);
+    }
+}
+
+fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
+    tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
+    let mut l2_seq: u32 = 0;
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(19);
+    let mut l2_buf: Vec<u8> = Vec::with_capacity(link::HEADER_LEN + 19);
+    let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::HEADER_LEN + 19);
+
+    while running.load(Ordering::SeqCst) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        payload_buf.clear();
+        payload_buf.extend_from_slice(b"rpv-bea");
+        payload_buf.extend_from_slice(&l2_seq.to_le_bytes());
+        payload_buf.extend_from_slice(&ts.to_le_bytes());
+
+        let header = link::L2Header {
+            drone_id,
+            payload_type: link::PAYLOAD_HEARTBEAT,
+            seq: l2_seq,
+        };
+        header.encode_into(&payload_buf, &mut l2_buf);
+        let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
+
+        l2_seq = l2_seq.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

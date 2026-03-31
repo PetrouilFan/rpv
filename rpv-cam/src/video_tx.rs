@@ -122,6 +122,8 @@ pub fn run(
                 "--inline",
                 "-o",
                 "pipe:1",
+                "--libav-format",
+                "h264",
                 "--width",
                 &video_width.to_string(),
                 "--height",
@@ -136,7 +138,7 @@ pub fn run(
                     cmd.arg(opt);
                 }
             }
-            cmd.args(&["--tune", "low-latency"]);
+            // --tune may not be available on all rpicam-vid versions
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd
         } else {
