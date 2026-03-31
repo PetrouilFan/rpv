@@ -346,26 +346,16 @@ pub fn run(
                         }
 
                         let mut off = 0;
-                        let mut frag_idx: u16 = 0;
                         while off < nal_data.len() {
                             let slot = shards_in_group % DATA_SHARDS;
                             let arena_offset = slot_filled[slot];
 
-                            // If starting a new slot, write frag header first
-                            if arena_offset == 0 {
-                                let hdr_written =
-                                    arena.write_frag(slot, 0, &frag_idx.to_le_bytes());
-                                slot_filled[slot] = hdr_written;
-                                slot_frag_lens[slot] = hdr_written;
-                            }
-
-                            // Write as much NAL data as fits in this slot
-                            let nal_chunk =
-                                &nal_data[off..nal_data.len().min(off + MAX_SHARD_DATA)];
-                            let written = arena.write_frag(slot, slot_filled[slot], nal_chunk);
+                            // Write NAL data chunk directly into slot (no fragment header)
+                            let nal_chunk = &nal_data
+                                [off..nal_data.len().min(off + MAX_SHARD_DATA - arena_offset)];
+                            let written = arena.write_frag(slot, arena_offset, nal_chunk);
                             slot_filled[slot] += written;
                             off += written;
-                            frag_idx += 1;
 
                             // If slot is full or NAL is done, advance
                             if slot_filled[slot] >= MAX_SHARD_DATA || off >= nal_data.len() {

@@ -867,8 +867,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let link_state = LinkStateHandle::new();
 
-    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(16);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
     let decoder = VideoDecoder::new(config.video_width, config.video_height);

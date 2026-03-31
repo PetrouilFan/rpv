@@ -20,6 +20,7 @@ const DATA_START: usize = VIDEO_HDR_LEN;
 const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 struct RsBlock {
+    block_seq: u32,
     shards: Vec<Option<Vec<u8>>>,
     shard_sizes: Vec<usize>,
     received: usize,
@@ -97,7 +98,8 @@ impl VideoReceiver {
         // #13: Fixed-size ring buffer — O(1) zero-allocation lookups via seq % RING_SIZE
         let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
         // #15: Ring buffer for processed sequence tracking — O(1) bitmap lookup
-        let mut processed_ring: [u32; RING_SIZE] = [0; RING_SIZE];
+        // Use Option<u32> so block_seq=0 isn't confused with empty slot
+        let mut processed_ring: [Option<u32>; RING_SIZE] = [None; RING_SIZE];
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
         let mut _block_count: u64 = 0;
@@ -179,7 +181,7 @@ impl VideoReceiver {
 
             // #15: O(1) bitmap lookup — seq % RING_SIZE maps to slot
             let dedup_idx = (block_seq as usize) % RING_SIZE;
-            if processed_ring[dedup_idx] == block_seq {
+            if processed_ring[dedup_idx] == Some(block_seq) {
                 continue;
             }
 
@@ -190,9 +192,17 @@ impl VideoReceiver {
             // #13: O(1) ring buffer lookup — no HashMap allocation or hashing
             let idx = (block_seq as usize) % RING_SIZE;
 
+            // Clear stale slot if it contains a different block_seq
+            if let Some(ref existing) = blocks[idx] {
+                if existing.block_seq != block_seq {
+                    blocks[idx] = None;
+                }
+            }
+
             // #13: Direct array access instead of HashMap entry API
             if blocks[idx].is_none() {
                 blocks[idx] = Some(RsBlock {
+                    block_seq,
                     shards: vec![None; TOTAL_SHARDS],
                     shard_sizes: vec![0; TOTAL_SHARDS],
                     received: 0,
@@ -239,32 +249,33 @@ impl VideoReceiver {
                         } else {
                             shard_data
                         };
-                        if trimmed.len() < 2 {
+                        if trimmed.is_empty() {
                             continue;
                         }
-
-                        let frag_payload = &trimmed[2..];
-                        if frag_payload.is_empty() {
-                            continue;
+                        if fec_recovered <= 3 {
+                            info!(
+                                "RS block #{}: shard_lens={:?}, orig_len={}, shard_data.len={}, trimmed.len={}",
+                                fec_recovered, block.shard_lens, orig_len, shard_data.len(), trimmed.len()
+                            );
                         }
 
                         if fec_recovered <= 5 {
                             info!(
                                 "NAL #{}: {} bytes, first16={:02x?}",
                                 fec_recovered,
-                                frag_payload.len(),
-                                &frag_payload[..16.min(frag_payload.len())]
+                                trimmed.len(),
+                                &trimmed[..16.min(trimmed.len())]
                             );
                         }
 
-                        if let Err(e) = self.tx.send(frag_payload.to_vec()) {
+                        if let Err(e) = self.tx.send(trimmed.to_vec()) {
                             warn!("Video frame channel closed: {}", e);
                         }
                     }
                     _block_count += 1;
                     // #15: Mark as processed in O(1) bitmap
                     let dedup_idx = (block_seq as usize) % RING_SIZE;
-                    processed_ring[dedup_idx] = block_seq;
+                    processed_ring[dedup_idx] = Some(block_seq);
                     if let Some(nb) = next_block {
                         if block_seq >= nb {
                             next_block = Some(block_seq.wrapping_add(1));
@@ -275,7 +286,7 @@ impl VideoReceiver {
                     fec_dropped += 1;
                     // #15: Mark as processed in O(1) bitmap
                     let dedup_idx = (block_seq as usize) % RING_SIZE;
-                    processed_ring[dedup_idx] = block_seq;
+                    processed_ring[dedup_idx] = Some(block_seq);
                     if nal_started {
                         nal_buf.clear();
                         nal_started = false;

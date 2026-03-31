@@ -351,6 +351,7 @@ fn decode_loop_libavcodec(
 
         let mut frame_count: u64 = 0;
         let mut _decode_err_count: u32 = 0;
+        let mut nal_recv_count: u64 = 0;
 
         'decode_loop: loop {
             let nal_data = match rx.recv() {
@@ -360,6 +361,16 @@ fn decode_loop_libavcodec(
                     break 'decode_loop;
                 }
             };
+
+            nal_recv_count += 1;
+            if nal_recv_count <= 3 {
+                info!(
+                    "DECODER NAL #{}: {} bytes, first8={:02x?}",
+                    nal_recv_count,
+                    nal_data.len(),
+                    &nal_data[..8.min(nal_data.len())]
+                );
+            }
 
             let mut parse_offset = 0usize;
             while parse_offset < nal_data.len() {
