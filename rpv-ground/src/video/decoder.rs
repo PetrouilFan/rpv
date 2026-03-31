@@ -361,6 +361,7 @@ fn decode_loop_libavcodec(
                         error!("libavcodec: failed to re-init H.264 parser");
                         break 'decode_loop;
                     }
+                    // Skip remaining bytes in this NAL, get fresh data from channel
                     break;
                 }
                 parse_offset += consumed as usize;

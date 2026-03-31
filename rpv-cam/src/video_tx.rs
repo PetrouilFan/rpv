@@ -54,7 +54,6 @@ impl ShardArena {
     }
 
     /// Zero-pad slot `idx` from `filled` to MAX_SHARD_DATA.
-    #[allow(dead_code)]
     fn pad_slot(&mut self, slot: usize, filled: usize) {
         if slot < DATA_SHARDS && filled < MAX_SHARD_DATA {
             self.slots[slot][filled..].fill(0);
@@ -361,7 +360,7 @@ pub fn run(
                             send_fec_group_arena(
                                 &socket,
                                 &rs,
-                                &arena,
+                                &mut arena,
                                 &slot_filled,
                                 &slot_frag_lens,
                                 drone_id,
@@ -387,7 +386,7 @@ pub fn run(
                         send_fec_group_arena(
                             &socket,
                             &rs,
-                            &arena,
+                            &mut arena,
                             &slot_filled,
                             &slot_frag_lens,
                             drone_id,
@@ -510,7 +509,7 @@ fn extract_next_nal_cursor(data: &[u8]) -> Option<(&[u8], usize)> {
 fn send_fec_group_arena(
     socket: &RawSocket,
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
-    arena: &ShardArena,
+    arena: &mut ShardArena,
     slot_filled: &[usize; DATA_SHARDS],
     _slot_frag_lens: &[usize; DATA_SHARDS],
     drone_id: u8,
@@ -537,6 +536,8 @@ fn send_fec_group_arena(
 
     // Reuse pre-allocated shard Vecs (resize + zero-fill instead of new allocs)
     for i in 0..DATA_SHARDS {
+        // Zero-pad slot tail so stale bytes don't corrupt RS parity
+        arena.pad_slot(i, slot_filled[i]);
         fec_shards[i].resize(max_shard_size, 0);
         fec_shards[i].fill(0);
         let copy_len = slot_filled[i].min(max_shard_size);
