@@ -345,46 +345,40 @@ pub fn run(
                             last_stats = std::time::Instant::now();
                         }
 
-                        let mut off = 0;
-                        while off < nal_data.len() {
-                            let slot = shards_in_group % DATA_SHARDS;
-                            let arena_offset = slot_filled[slot];
+                        // Only send NALs that fit in a single shard to avoid
+                        // fragmentation across FEC groups (receiver can't reassemble)
+                        if nal_data.len() > MAX_SHARD_DATA {
+                            continue;
+                        }
 
-                            // Write NAL data chunk directly into slot (no fragment header)
-                            let nal_chunk = &nal_data
-                                [off..nal_data.len().min(off + MAX_SHARD_DATA - arena_offset)];
-                            let written = arena.write_frag(slot, arena_offset, nal_chunk);
-                            slot_filled[slot] += written;
-                            off += written;
+                        let slot = shards_in_group % DATA_SHARDS;
+                        let arena_offset = slot_filled[slot];
+                        let written = arena.write_frag(slot, arena_offset, &nal_data);
+                        slot_filled[slot] += written;
+                        shards_in_group += 1;
 
-                            // If slot is full or NAL is done, advance
-                            if slot_filled[slot] >= MAX_SHARD_DATA || off >= nal_data.len() {
-                                shards_in_group += 1;
-
-                                if shards_in_group == DATA_SHARDS {
-                                    send_fec_group_arena(
-                                        &socket,
-                                        &rs,
-                                        &arena,
-                                        &slot_filled,
-                                        &slot_frag_lens,
-                                        drone_id,
-                                        &mut fec_block_seq,
-                                        &mut l2_pkt_seq,
-                                        &mut fail_count,
-                                        &mut l2_frame_buf,
-                                        &mut send_buf,
-                                        &mut video_payload_buf,
-                                        &hp_rx,
-                                        &mut fec_shards,
-                                    );
-                                    total_groups += 1;
-                                    // Reset arena state
-                                    shards_in_group = 0;
-                                    slot_filled = [0; DATA_SHARDS];
-                                    slot_frag_lens = [0; DATA_SHARDS];
-                                }
-                            }
+                        if shards_in_group == DATA_SHARDS {
+                            send_fec_group_arena(
+                                &socket,
+                                &rs,
+                                &arena,
+                                &slot_filled,
+                                &slot_frag_lens,
+                                drone_id,
+                                &mut fec_block_seq,
+                                &mut l2_pkt_seq,
+                                &mut fail_count,
+                                &mut l2_frame_buf,
+                                &mut send_buf,
+                                &mut video_payload_buf,
+                                &hp_rx,
+                                &mut fec_shards,
+                            );
+                            total_groups += 1;
+                            // Reset arena state
+                            shards_in_group = 0;
+                            slot_filled = [0; DATA_SHARDS];
+                            slot_frag_lens = [0; DATA_SHARDS];
                         }
                     }
 

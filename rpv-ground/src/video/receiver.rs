@@ -254,8 +254,9 @@ impl VideoReceiver {
                         }
                         if fec_recovered <= 3 {
                             info!(
-                                "RS block #{}: shard_lens={:?}, orig_len={}, shard_data.len={}, trimmed.len={}",
-                                fec_recovered, block.shard_lens, orig_len, shard_data.len(), trimmed.len()
+                                "RS block #{} (seq={}): shard_lens={:?}, orig_len={}, shard_data.len={}, trimmed.len={}, first8={:02x?}",
+                                fec_recovered, block.block_seq, block.shard_lens, orig_len, shard_data.len(), trimmed.len(),
+                                &trimmed[..8.min(trimmed.len())]
                             );
                         }
 

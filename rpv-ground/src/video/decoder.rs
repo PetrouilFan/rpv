@@ -21,84 +21,46 @@ struct AvCodecParserContext {
     _private: [u8; 0],
 }
 
-/// AVPacket — fields must match FFmpeg 6.x AVPacket struct layout.
-/// We only touch data/size/buf; the rest are zeroed by av_packet_alloc.
+/// AVPacket — fields must match FFmpeg 7.x AVPacket struct layout exactly.
+/// Offsets verified against libavcodec 61.19 on aarch64.
+/// We only touch data/size; the rest are zeroed by av_packet_alloc.
 #[repr(C)]
 struct AvPacket {
-    _buf: *mut u8, // AVBufferRef*
-    pts: i64,
-    dts: i64,
-    data: *mut u8,
-    size: i32,
-    stream_index: i32,
-    flags: i32,
-    _side_data: *mut u8, // AVPacketSideData*
-    _side_data_elems: i32,
-    duration: i64,
-    pos: i64,
-    _opaque: *mut u8, // void* opaque_ref
-    _opaque2: i64,
-}
+    _buf: *mut u8,         // offset 0
+    pts: i64,              // offset 8
+    dts: i64,              // offset 16
+    data: *mut u8,         // offset 24
+    size: i32,             // offset 32
+    _stream_index: i32,    // offset 36
+    flags: i32,            // offset 40
+    _pad44: [u8; 4],       // offset 44 (padding)
+    _side_data: *mut u8,   // offset 48
+    _side_data_elems: i32, // offset 56
+    _pad60: [u8; 4],       // offset 60 (padding)
+    duration: i64,         // offset 64
+    pos: i64,              // offset 72
+    _opaque: *mut u8,      // offset 80
+    _opaque_ref: *mut u8,  // offset 88
+    _time_base_num: i32,   // offset 96
+    _time_base_den: i32,   // offset 100
+} // sizeof = 104
 
-/// AVFrame — fields must match FFmpeg 6.x AVFrame struct layout.
+/// AVFrame — fields must match FFmpeg 7.x AVFrame struct layout exactly.
+/// Offsets verified against libavutil 59.39 on aarch64.
 #[repr(C)]
 struct AvFrame {
-    data: [*mut u8; 8],
-    linesize: [i32; 8],
-    _extended_data: *mut *mut u8,
-    width: i32,
-    height: i32,
-    nb_samples: i32,
-    format: i32,
-    _key_frame: i32,
-    _pict_type: i32,
-    _sample_aspect_ratio_num: i32,
-    _sample_aspect_ratio_den: i32,
-    pts: i64,
-    _pkt_pts: i64,
-    _pkt_dts: i64,
-    _coded_picture_number: i32,
-    _display_picture_number: i32,
-    quality: i32,
-    _opaque: *mut u8,
-    _repeat_pict: i32,
-    _interlaced_frame: i32,
-    _top_field_first: i32,
-    _palette_has_changed: i32,
-    _reordered_opaque: i64,
-    _sample_rate: i32,
-    _channel_layout: u64,
-    _buf: [*mut u8; 8],
-    _extended_buf: *mut *mut u8,
-    _nb_extended_buf: i32,
-    _side_data: *mut u8,
-    _nb_side_data: i32,
-    _flags: i32,
-    _color_range: i32,
-    _color_primaries: i32,
-    _color_trc: i32,
-    _colorspace: i32,
-    _chroma_location: i32,
-    _best_effort_timestamp: i64,
-    _pkt_pos: i64,
-    _pkt_duration: i64,
-    _metadata: *mut u8,
-    _decode_error_flags: i32,
-    _channels: i32,
-    _pkt_size: i32,
-    _qscale_table: *mut i8,
-    _qstride: i32,
-    _qscale_type: i32,
-    _qp_table_buf: *mut u8,
-    _hw_frames_ctx: *mut u8,
-    _opaque_ref: *mut u8,
-    _crop_top: usize,
-    _crop_bottom: usize,
-    _crop_left: usize,
-    _crop_right: usize,
-    _private_ref: *mut u8,
-    _hwaccel_picture_private: *mut u8,
-}
+    data: [*mut u8; 8], // offset 0,   64 bytes
+    linesize: [i32; 8], // offset 64,  32 bytes
+    _pad96: [u8; 8],    // offset 96,   8 bytes (extended_data ptr)
+    width: i32,         // offset 104
+    height: i32,        // offset 108
+    _pad112: [u8; 4],   // offset 112,  4 bytes (nb_samples)
+    format: i32,        // offset 116
+    _pad120: [u8; 16],  // offset 120, 16 bytes (key_frame, pict_type, SAR)
+    pts: i64,           // offset 136
+    _pad144: [u8; 24],  // offset 144, 24 bytes (pkt_dts, time_base, quality)
+    _pad168: [u8; 272], // offset 168, 272 bytes (rest of struct)
+} // sizeof = 440
 
 // FFmpeg extern declarations
 extern "C" {
