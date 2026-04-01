@@ -24,6 +24,8 @@ pub struct Config {
     pub framerate: u32,
     #[serde(default = "default_bitrate")]
     pub bitrate: u32,
+    #[serde(default = "default_intra")]
+    pub intra: u32,
 }
 
 fn default_interface() -> String {
@@ -70,6 +72,10 @@ fn default_bitrate() -> u32 {
     1_000_000
 }
 
+fn default_intra() -> u32 {
+    1
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -84,6 +90,7 @@ impl Default for Config {
             video_height: default_video_height(),
             framerate: default_framerate(),
             bitrate: default_bitrate(),
+            intra: default_intra(),
         }
     }
 }

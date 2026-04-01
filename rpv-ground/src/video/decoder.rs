@@ -290,6 +290,14 @@ fn decode_loop_libavcodec(
                         (*pkt).size = out_size;
                     }
 
+                    if nal_recv_count <= 5 {
+                        info!(
+                            "SEND pkt: size={}, out_buf_null={}",
+                            out_size,
+                            out_buf.is_null()
+                        );
+                    }
+
                     let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
                     if send_ret < 0 {
                         if send_ret == AVERROR_EAGAIN {
@@ -323,7 +331,16 @@ fn decode_loop_libavcodec(
                             break;
                         }
                         if recv_ret < 0 {
+                            warn!("libavcodec: receive_frame error {}", recv_ret);
                             break;
+                        }
+                        if nal_recv_count <= 5 {
+                            info!(
+                                "RECV frame: ret={}, width={}, height={}",
+                                recv_ret,
+                                unsafe { (*frame).width },
+                                unsafe { (*frame).height }
+                            );
                         }
                         process_decoded_frame(frame, &frame_tx, width, height, &mut frame_count);
                     }

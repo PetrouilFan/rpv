@@ -134,7 +134,7 @@ fn main() {
             video_socket,
             config.drone_id,
             video_bitrate,
-            10,
+            config.intra,
             Some(hp_rx),
             video_width,
             video_height,
