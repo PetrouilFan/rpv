@@ -107,9 +107,7 @@ impl VideoReceiver {
         let mut fec_dropped: u64 = 0;
         let mut payload_count: u64 = 0;
         let mut nal_buf: Vec<u8> = Vec::with_capacity(65536);
-
-        let mut nal_buf: Vec<u8> = Vec::new();
-        let mut nal_started = false;
+        let mut nal_started: bool = false;
 
         info!("VideoReceiver loop starting");
 
@@ -274,24 +272,26 @@ impl VideoReceiver {
                                 }
                             }
                             0x01 => {
-                                // First fragment — reset buffer
+                                // First fragment — reset buffer and mark started
                                 nal_buf.clear();
                                 nal_buf.extend_from_slice(frag_data);
+                                nal_started = true;
                             }
                             0x02 => {
                                 // Continuation — append only if we have a start
-                                if !nal_buf.is_empty() {
+                                if nal_started {
                                     nal_buf.extend_from_slice(frag_data);
                                 }
                             }
                             0x03 => {
                                 // Last fragment — send only if we have preceding parts
-                                if !nal_buf.is_empty() {
+                                if nal_started {
                                     nal_buf.extend_from_slice(frag_data);
                                     if let Err(e) = self.tx.send(nal_buf.clone()) {
                                         warn!("Video frame channel closed: {}", e);
                                     }
                                     nal_buf.clear();
+                                    nal_started = false;
                                 }
                             }
                             _ => {}
