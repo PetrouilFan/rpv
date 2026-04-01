@@ -67,7 +67,7 @@ fn default_framerate() -> u32 {
 }
 
 fn default_bitrate() -> u32 {
-    3_000_000
+    1_000_000
 }
 
 impl Default for Config {

@@ -181,7 +181,7 @@ pub fn run(
                 "-bufsize",
                 &bufsize_s,
                 "-g",
-                "1",
+                &gop_s,
             ]);
             if !use_hw_encoder {
                 cmd.args(&[
