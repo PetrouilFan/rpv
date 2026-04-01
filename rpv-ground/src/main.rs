@@ -478,6 +478,8 @@ impl RpvApp {
                     self.yuv_gpu = None;
                     self.state.config.video_width = frame.width;
                     self.state.config.video_height = frame.height;
+                    self.state.frame_count = 0;
+                    self.state.fps_timer = Instant::now();
                     self.has_ever_had_frame = false;
                     self.needs_repaint = true;
                     return false;

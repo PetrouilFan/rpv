@@ -68,6 +68,9 @@ fn process_decoded_frame(
     width: u32,
     height: u32,
     frame_count: &mut u64,
+    y_buf: &mut Vec<u8>,
+    u_buf: &mut Vec<u8>,
+    v_buf: &mut Vec<u8>,
 ) {
     let fw = unsafe { (*frame).width } as usize;
     let fh = unsafe { (*frame).height } as usize;
@@ -102,21 +105,22 @@ fn process_decoded_frame(
     let w = width as usize;
     let h = height as usize;
 
-    // Y plane
-    let mut y_data = vec![0u8; w * h];
+    // Zero-fill pre-allocated buffers and copy Y plane
+    y_buf.fill(0);
     let copy_w = fw.min(w).min(linesize0);
     let copy_h = fh.min(h);
     for row in 0..copy_h {
         let src = unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), copy_w) };
-        y_data[row * w..row * w + copy_w].copy_from_slice(src);
+        y_buf[row * w..row * w + copy_w].copy_from_slice(src);
     }
 
     // U/V planes
     let uv_w = w / 2;
     let uv_h = h / 2;
-    let mut u_data = vec![0u8; uv_w * uv_h];
-    let mut v_data = vec![0u8; uv_w * uv_h];
+    u_buf.fill(0);
+    v_buf.fill(0);
     let uv_copy_w = (fw / 2).min(uv_w).min(linesize1);
+    let uv_v_copy_w = (fw / 2).min(uv_w).min(linesize2);
 
     if pix_fmt == AV_PIX_FMT_NV12 as i32 {
         let uv_interleaved_w = fw.min(linesize1);
@@ -125,8 +129,8 @@ fn process_decoded_frame(
             let src =
                 unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_interleaved_w) };
             for col in 0..uv_copy_w.min(uv_interleaved_w / 2) {
-                u_data[row * uv_w + col] = src[col * 2];
-                v_data[row * uv_w + col] = src[col * 2 + 1];
+                u_buf[row * uv_w + col] = src[col * 2];
+                v_buf[row * uv_w + col] = src[col * 2 + 1];
             }
         }
     } else {
@@ -137,20 +141,20 @@ fn process_decoded_frame(
             if !data1.is_null() {
                 let u_src =
                     unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
-                u_data[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
+                u_buf[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
             }
             if !data2.is_null() {
                 let v_src =
-                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_copy_w) };
-                v_data[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(v_src);
+                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_v_copy_w) };
+                v_buf[row * uv_w..row * uv_w + uv_v_copy_w].copy_from_slice(v_src);
             }
         }
     }
 
     let decoded = DecodedFrame {
-        y_data,
-        u_data,
-        v_data,
+        y_data: y_buf.clone(),
+        u_data: u_buf.clone(),
+        v_data: v_buf.clone(),
         width,
         height,
         send_ts_us: None,
@@ -225,6 +229,13 @@ fn decode_loop_libavcodec(
 
         let mut frame_count: u64 = 0;
         let mut nal_recv_count: u64 = 0;
+
+        // Pre-allocate YUV buffers to avoid 3 allocations per frame at 30fps
+        let w = width as usize;
+        let h = height as usize;
+        let mut y_buf = vec![0u8; w * h];
+        let mut u_buf = vec![0u8; (w / 2) * (h / 2)];
+        let mut v_buf = vec![0u8; (w / 2) * (h / 2)];
 
         'decode_loop: loop {
             let nal_data = match rx.recv() {
@@ -320,6 +331,9 @@ fn decode_loop_libavcodec(
                                     width,
                                     height,
                                     &mut frame_count,
+                                    &mut y_buf,
+                                    &mut u_buf,
+                                    &mut v_buf,
                                 );
                             }
                             let retry = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
@@ -349,7 +363,16 @@ fn decode_loop_libavcodec(
                                 unsafe { (*frame).height }
                             );
                         }
-                        process_decoded_frame(frame, &frame_tx, width, height, &mut frame_count);
+                        process_decoded_frame(
+                            frame,
+                            &frame_tx,
+                            width,
+                            height,
+                            &mut frame_count,
+                            &mut y_buf,
+                            &mut u_buf,
+                            &mut v_buf,
+                        );
                     }
 
                     unsafe {

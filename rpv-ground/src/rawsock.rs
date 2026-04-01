@@ -313,34 +313,6 @@ impl RawSocket {
         Ok(())
     }
 
-    /// Send a raw 802.11 frame with Radiotap + broadcast data header + payload.
-    #[allow(dead_code)]
-    pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        let mut frame = Vec::with_capacity(HEADER_TOTAL + payload.len());
-        frame.extend_from_slice(&RADIOTAP);
-        frame.extend_from_slice(&DATA_FRAME_HDR);
-        frame.extend_from_slice(payload);
-
-        let ret = unsafe {
-            libc::send(
-                self.fd,
-                frame.as_ptr() as *const libc::c_void,
-                frame.len(),
-                0,
-            )
-        };
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
-            {
-                return Ok(0); // TX ring full, frame dropped
-            }
-            Err(e)
-        } else {
-            Ok(ret as usize)
-        }
-    }
-
     /// Send using a persistent header buffer (avoids per-call static lookup + extend).
     /// The buffer should be pre-filled with Radiotap + 802.11 header at positions 0..32.
     /// Only the payload portion (after HEADER_TOTAL) is written per call.
@@ -447,12 +419,6 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
     } else {
         Some(hdr_len)
     }
-}
-
-/// Strip Radiotap + 802.11 header (+ optional LLC/SNAP) from received frame.
-#[allow(dead_code)]
-pub fn recv_strip_headers(frame: &[u8], _log_rejections: bool) -> Option<&[u8]> {
-    recv_extract(frame, _log_rejections).map(|(payload, _rssi)| payload)
 }
 
 /// Strip Radiotap + 802.11 header, returning the L2 payload and optional RSSI (dBm).

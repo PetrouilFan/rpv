@@ -266,7 +266,7 @@ pub fn run(
         let mut total_bytes = u64::default();
         let mut total_nals: u64 = 0;
         let mut total_groups: u64 = 0;
-        let mut fail_count: u8 = 0;
+        let mut fail_count: u32 = 0;
         let mut last_stats = std::time::Instant::now();
         // #9: BytesMut ring buffer — O(1) advance instead of copy_within memory shifts
         let mut nal_buf = BytesMut::with_capacity(MAX_NAL_BUF);
@@ -459,6 +459,10 @@ fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
             None => return None,
         };
         if zero + 2 < data.len() && data[zero + 1] == 0 && data[zero + 2] == 1 {
+            // Check for 4-byte start code (00 00 00 01)
+            if zero > 0 && data[zero - 1] == 0 {
+                return Some(zero - 1);
+            }
             return Some(zero);
         }
         pos = zero + 1;
@@ -513,7 +517,7 @@ fn send_fec_group_arena(
     drone_id: u8,
     fec_block_seq: &mut u32,
     l2_pkt_seq: &mut u32,
-    fail_count: &mut u8,
+    fail_count: &mut u32,
     l2_frame_buf: &mut Vec<u8>,
     send_buf: &mut Vec<u8>,
     video_payload_buf: &mut Vec<u8>,
@@ -559,7 +563,8 @@ fn send_fec_group_arena(
         if i % 2 == 0 {
             if let Some(ref hp) = hp_rx {
                 while let Ok(hp_frame) = hp.try_recv() {
-                    let _ = socket.send(&hp_frame);
+                    let mut tmp_buf = Vec::new();
+                    let _ = socket.send_with_buf(&hp_frame, &mut tmp_buf);
                 }
             }
         }

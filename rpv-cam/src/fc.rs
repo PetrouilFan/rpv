@@ -332,28 +332,27 @@ fn write_mavlink(port: &mut dyn Write, header: &mut MavHeader, msg: &MavMessage)
 /// (non-zero payload length byte after magic) to avoid false positives
 /// in dense telemetry streams.
 fn find_next_mavlink_magic(buf: &[u8]) -> usize {
-    for i in 1..buf.len() {
-        let b = buf[i];
-        if b != 0xFE && b != 0xFD {
-            continue;
-        }
-        // Found candidate magic byte — verify there's enough data for a header
-        if b == 0xFE && i + 6 <= buf.len() {
-            // MAVLink v1: magic(1) + len(1) + seq(1) + sysid(1) + compid(1) + msgid(1) = 6 bytes
-            let len = buf[i + 1] as usize;
-            if len <= 255 && i + 6 + len + 2 <= buf.len() {
-                return i; // Plausible v1 message
-            }
-            if i + 6 <= buf.len() {
-                return i; // At least a complete v1 header
-            }
-        }
-        if b == 0xFD && i + 10 <= buf.len() {
-            // MAVLink v2: magic(1) + len(1) + incflags(1) + compat(1) + seq(1) + sysid(1) + compid(1) + msgid(3) = 10 bytes
-            return i; // Complete v2 header
-        }
+    if buf.len() < 2 {
+        return buf.len();
     }
-    buf.len() // No valid magic found — skip everything
+    let mut search_from = 1;
+    while search_from < buf.len() {
+        let Some(rel) = memchr::memchr2(0xFE, 0xFD, &buf[search_from..]) else {
+            return buf.len();
+        };
+        let i = search_from + rel;
+        let b = buf[i];
+        // MAVLink v1: magic(1) + len(1) + seq(1) + sysid(1) + compid(1) + msgid(1) = 6 bytes
+        if b == 0xFE && i + 6 <= buf.len() {
+            return i;
+        }
+        // MAVLink v2: magic(1) + len(1) + incflags(1) + compat(1) + seq(1) + sysid(1) + compid(1) + msgid(3) = 10 bytes
+        if b == 0xFD && i + 10 <= buf.len() {
+            return i;
+        }
+        search_from = i + 1;
+    }
+    buf.len()
 }
 
 fn ardupilot_mode_name(custom_mode: u32) -> &'static str {

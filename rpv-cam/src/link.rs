@@ -26,15 +26,6 @@ pub struct L2Header {
 }
 
 impl L2Header {
-    /// Encode header + payload into a new Vec (legacy API).
-    #[allow(dead_code)]
-    pub fn encode(&self, payload: &[u8]) -> Vec<u8> {
-        let total = HEADER_LEN + payload.len();
-        let mut buf = Vec::with_capacity(total);
-        self.encode_into(payload, &mut buf);
-        buf
-    }
-
     /// Encode header + payload into a reusable buffer (avoids per-call allocation).
     /// Clears the buffer first, then writes: MAGIC | drone_id | payload_type | seq | payload.
     pub fn encode_into(&self, payload: &[u8], buf: &mut Vec<u8>) {

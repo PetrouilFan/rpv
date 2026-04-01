@@ -173,35 +173,6 @@ impl RawSocket {
         })
     }
 
-    /// Send a raw 802.11 frame.
-    /// Prepends a minimal Radiotap header + broadcast data frame header.
-    #[allow(dead_code)]
-    pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        let mut frame = Vec::with_capacity(HEADER_TOTAL + payload.len());
-        frame.extend_from_slice(&RADIOTAP);
-        frame.extend_from_slice(&DATA_FRAME_HDR);
-        frame.extend_from_slice(payload);
-
-        let ret = unsafe {
-            libc::send(
-                self.fd,
-                frame.as_ptr() as *const libc::c_void,
-                frame.len(),
-                0,
-            )
-        };
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
-            {
-                return Ok(0); // TX ring full, frame dropped
-            }
-            Err(e)
-        } else {
-            Ok(ret as usize)
-        }
-    }
-
     /// Send using a reusable buffer. Non-blocking: returns Ok(0) if TX ring is full.
     /// #10: Increments 802.11 sequence control to prevent duplicate drops.
     pub fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {
