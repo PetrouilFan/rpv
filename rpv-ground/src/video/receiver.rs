@@ -106,6 +106,7 @@ impl VideoReceiver {
         let mut fec_recovered: u64 = 0;
         let mut fec_dropped: u64 = 0;
         let mut payload_count: u64 = 0;
+        let mut nal_buf: Vec<u8> = Vec::with_capacity(65536);
 
         let mut nal_buf: Vec<u8> = Vec::new();
         let mut nal_started = false;
@@ -249,28 +250,41 @@ impl VideoReceiver {
                         } else {
                             shard_data
                         };
-                        if trimmed.is_empty() {
+                        if trimmed.is_empty() || trimmed.len() < 2 {
                             continue;
                         }
-                        if fec_recovered <= 3 {
-                            info!(
-                                "RS block #{} (seq={}): shard_lens={:?}, orig_len={}, shard_data.len={}, trimmed.len={}, first8={:02x?}",
-                                fec_recovered, block.block_seq, block.shard_lens, orig_len, shard_data.len(), trimmed.len(),
-                                &trimmed[..8.min(trimmed.len())]
-                            );
-                        }
 
-                        if fec_recovered <= 5 {
-                            info!(
-                                "NAL #{}: {} bytes, first16={:02x?}",
-                                fec_recovered,
-                                trimmed.len(),
-                                &trimmed[..16.min(trimmed.len())]
-                            );
-                        }
+                        // Fragment header: first byte is fragment type
+                        let frag_type = trimmed[0];
+                        let frag_data = &trimmed[1..];
 
-                        if let Err(e) = self.tx.send(trimmed.to_vec()) {
-                            warn!("Video frame channel closed: {}", e);
+                        match frag_type {
+                            0x00 => {
+                                // Complete NAL — send directly
+                                if let Err(e) = self.tx.send(frag_data.to_vec()) {
+                                    warn!("Video frame channel closed: {}", e);
+                                }
+                            }
+                            0x01 => {
+                                // First fragment — reset buffer
+                                nal_buf.clear();
+                                nal_buf.extend_from_slice(frag_data);
+                            }
+                            0x02 => {
+                                // Continuation — append
+                                nal_buf.extend_from_slice(frag_data);
+                            }
+                            0x03 => {
+                                // Last fragment — append and send
+                                nal_buf.extend_from_slice(frag_data);
+                                if let Err(e) = self.tx.send(nal_buf.clone()) {
+                                    warn!("Video frame channel closed: {}", e);
+                                }
+                                nal_buf.clear();
+                            }
+                            _ => {
+                                // Unknown fragment type — skip
+                            }
                         }
                     }
                     _block_count += 1;
