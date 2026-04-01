@@ -199,7 +199,7 @@ pub struct RCTx {
     socket: Arc<RawSocket>,
     drone_id: u8,
     // #16: Use [u16; 16] instead of Vec<u16> — fixed size, no heap allocation
-    channels: Arc<std::sync::Mutex<[u16; 16]>>,
+    channels: Arc<arc_swap::ArcSwap<[u16; 16]>>,
     gamepad: Option<GamepadInput>,
     l2_seq: u32,
     running: Arc<AtomicBool>,
@@ -224,10 +224,10 @@ impl RCTx {
             // This is correct for "no gamepad" — throttle must be zero.
             // The failsafe issue (#2) is in fc.rs, not here — the FC writer
             // should check if any real RC data has EVER been received.
-            channels: Arc::new(std::sync::Mutex::new({
+            channels: Arc::new(arc_swap::ArcSwap::from({
                 let mut ch = [RC_MID; 16];
-                ch[2] = RC_MIN; // Throttle at zero when no gamepad
-                ch
+                ch[2] = RC_MIN;
+                Arc::new(ch)
             })),
             gamepad,
             l2_seq: 0,
@@ -235,7 +235,7 @@ impl RCTx {
         }
     }
 
-    pub fn channels(&self) -> Arc<std::sync::Mutex<[u16; 16]>> {
+    pub fn channels(&self) -> Arc<arc_swap::ArcSwap<[u16; 16]>> {
         Arc::clone(&self.channels)
     }
 
@@ -289,19 +289,18 @@ impl RCTx {
             if let Some(ref mut gp) = self.gamepad {
                 let mut channel_buf = [0u16; 16];
                 gp.read_input(&mut channel_buf);
-                // #9: Single lock acquisition — merge gamepad update + read
-                let mut channels = self.channels.lock().unwrap();
-                *channels = channel_buf;
+                // Store via ArcSwap — lock-free write
+                self.channels.store(Arc::new(channel_buf));
             }
 
-            // #9, #16: Single lock, copy array by value (no heap alloc)
-            let channels = *self.channels.lock().unwrap();
+            // Load channels via ArcSwap — lock-free read
+            let channels: [u16; 16] = **self.channels.load();
 
             // #16: Reuse payload buffer — no per-cycle allocation
             payload_buf.clear();
             let count = channels.len() as u32;
             payload_buf.extend_from_slice(&count.to_le_bytes());
-            for &ch in &channels {
+            for &ch in channels.iter() {
                 payload_buf.extend_from_slice(&ch.to_le_bytes());
             }
 

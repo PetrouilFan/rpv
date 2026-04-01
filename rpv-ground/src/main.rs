@@ -379,7 +379,7 @@ pub struct AppState {
     pub telemetry: Arc<ArcSwap<Telemetry>>,
     pub running: Arc<AtomicBool>,
     pub rssi: Arc<AtomicI8>,
-    pub channels: Arc<Mutex<[u16; 16]>>,
+    pub channels: Arc<ArcSwap<[u16; 16]>>,
 }
 
 pub struct RpvApp {
@@ -399,7 +399,7 @@ impl RpvApp {
         running: Arc<AtomicBool>,
         link_state: LinkStateHandle,
         rssi: Arc<AtomicI8>,
-        channels: Arc<Mutex<[u16; 16]>>,
+        channels: Arc<ArcSwap<[u16; 16]>>,
     ) -> Self {
         Self {
             state: AppState {
@@ -806,7 +806,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     );
 
     // ── Center-bottom: RC channel bars ──
-    let channels = state.channels.lock().unwrap().clone();
+    let channels = **state.channels.load();
     let bar_width = 20.0;
     let bar_height = 30.0;
     let bar_gap = 4.0;

@@ -452,22 +452,17 @@ pub fn run(
 /// #20: Shared helper — find the next start code position in a byte slice.
 /// Returns the byte offset of the start code (00 00 01 or 00 00 00 01).
 fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
-    let mut pos = from;
-    while pos < data.len().saturating_sub(2) {
-        let zero = match memchr::memchr(0x00, &data[pos..]) {
-            Some(p) => pos + p,
-            None => return None,
-        };
-        if zero + 2 < data.len() && data[zero + 1] == 0 && data[zero + 2] == 1 {
-            // Check for 4-byte start code (00 00 00 01)
-            if zero > 0 && data[zero - 1] == 0 {
-                return Some(zero - 1);
-            }
-            return Some(zero);
-        }
-        pos = zero + 1;
+    let search = &data[from..];
+    // SIMD-accelerated search for 3-byte start code
+    let Some(rel) = memchr::memmem::find(search, b"\x00\x00\x01") else {
+        return None;
+    };
+    let pos = from + rel;
+    // Check for 4-byte start code (00 00 00 01)
+    if pos > 0 && data[pos - 1] == 0 {
+        return Some(pos - 1);
     }
-    None
+    Some(pos)
 }
 
 fn extract_next_nal_cursor(data: &[u8]) -> Option<(&[u8], usize)> {
@@ -524,11 +519,15 @@ fn send_fec_group_arena(
     hp_rx: &Option<crossbeam_channel::Receiver<Vec<u8>>>,
     fec_shards: &mut Vec<Vec<u8>>,
 ) -> Result<(), bool> {
-    // Determine max shard size for RS encoding
+    // Use actual fragment lengths from slot_frag_lens (not padded slot_filled)
     let mut shard_lens = [0usize; DATA_SHARDS];
     let mut max_shard_size = 0usize;
     for i in 0..DATA_SHARDS {
-        shard_lens[i] = slot_filled[i];
+        shard_lens[i] = if _slot_frag_lens[i] > 0 {
+            _slot_frag_lens[i]
+        } else {
+            slot_filled[i]
+        };
         max_shard_size = max_shard_size.max(slot_filled[i]);
     }
 
@@ -540,14 +539,13 @@ fn send_fec_group_arena(
     for i in 0..DATA_SHARDS {
         // Zero-pad slot tail so stale bytes don't corrupt RS parity
         arena.pad_slot(i, slot_filled[i]);
-        fec_shards[i].resize(max_shard_size, 0);
-        fec_shards[i].fill(0);
         let copy_len = slot_filled[i].min(max_shard_size);
-        fec_shards[i][..copy_len].copy_from_slice(&arena.slots[i][..copy_len]);
+        fec_shards[i].clear();
+        fec_shards[i].extend_from_slice(&arena.slots[i][..copy_len]);
+        fec_shards[i].resize(max_shard_size, 0);
     }
     for i in DATA_SHARDS..TOTAL_SHARDS {
         fec_shards[i].resize(max_shard_size, 0);
-        fec_shards[i].fill(0);
     }
 
     if let Err(e) = rs.encode(&mut *fec_shards) {
@@ -591,26 +589,24 @@ fn send_fec_group_arena(
             );
         }
 
-        // Build video header dynamically
-        video_payload_buf.clear();
-        video_payload_buf.reserve(VIDEO_HDR_LEN + send_data.len());
-        video_payload_buf.extend_from_slice(&fec_block_seq.to_le_bytes());
-        video_payload_buf.push(i as u8);
-        video_payload_buf.push(TOTAL_SHARDS as u8);
-        video_payload_buf.push(DATA_SHARDS as u8);
-        video_payload_buf.push(0u8); // pad
-                                     // [u16; DATA_SHARDS] shard length array
+        // Build L2 frame directly into l2_frame_buf (eliminate intermediate copy)
+        l2_frame_buf.clear();
+        // L2 header: magic + drone_id + type + seq
+        l2_frame_buf.extend_from_slice(&link::MAGIC);
+        l2_frame_buf.push(drone_id);
+        l2_frame_buf.push(link::PAYLOAD_VIDEO);
+        l2_frame_buf.extend_from_slice(&l2_pkt_seq.to_le_bytes());
+        // Video header
+        l2_frame_buf.extend_from_slice(&fec_block_seq.to_le_bytes());
+        l2_frame_buf.push(i as u8);
+        l2_frame_buf.push(TOTAL_SHARDS as u8);
+        l2_frame_buf.push(DATA_SHARDS as u8);
+        l2_frame_buf.push(0u8);
         for &len in &shard_lens {
-            video_payload_buf.extend_from_slice(&(len as u16).to_le_bytes());
+            l2_frame_buf.extend_from_slice(&(len as u16).to_le_bytes());
         }
-        video_payload_buf.extend_from_slice(send_data);
-
-        let header = link::L2Header {
-            drone_id,
-            payload_type: link::PAYLOAD_VIDEO,
-            seq: *l2_pkt_seq,
-        };
-        header.encode_into(video_payload_buf, l2_frame_buf);
+        // Shard data
+        l2_frame_buf.extend_from_slice(send_data);
 
         match socket.send_with_buf(l2_frame_buf, send_buf) {
             Ok(_) => {
