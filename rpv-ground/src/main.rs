@@ -55,7 +55,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     let y = 1.0 - f32((idx & 2u) << 1u);
     var out: VertexOutput;
     out.position = vec4<f32>(x, y, 0.0, 1.0);
-    out.uv = vec2<f32>(x * 0.5 + 0.5, y * 0.5 + 0.5);
+    out.uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
     return out;
 }
 
@@ -476,6 +476,8 @@ impl RpvApp {
                     );
                     drop(res);
                     self.yuv_gpu = None;
+                    self.state.config.video_width = frame.width;
+                    self.state.config.video_height = frame.height;
                     self.has_ever_had_frame = false;
                     self.needs_repaint = true;
                     return false;
@@ -946,7 +948,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_fullscreen(true)
             .with_title("rpv ground station"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             device_descriptor: std::sync::Arc::new(|_adapter| {
                 let limits = wgpu::Limits {
                     max_texture_dimension_1d: 4096,

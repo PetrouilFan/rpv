@@ -123,15 +123,20 @@ impl GamepadInput {
             }
         }
 
-        let axis_x = Self::get_axis_value(&self.device, 0x00);
-        let axis_y = Self::get_axis_value(&self.device, 0x01);
-        let throttle = Self::get_axis_value(&self.device, 0x02);
-        let axis_rz = Self::get_axis_value(&self.device, 0x03);
+        // Mode 2 mapping (standard gamepad):
+        // ABS_X  (0x00) -> Left Stick X  -> Yaw
+        // ABS_Y  (0x01) -> Left Stick Y  -> Throttle
+        // ABS_RX (0x03) -> Right Stick X -> Roll
+        // ABS_RY (0x04) -> Right Stick Y -> Pitch
+        let axis_yaw = Self::get_axis_value(&self.device, 0x00);
+        let axis_thr = Self::get_axis_value(&self.device, 0x01);
+        let axis_rol = Self::get_axis_value(&self.device, 0x03);
+        let axis_pit = Self::get_axis_value(&self.device, 0x04);
 
-        channels[0] = Self::axis_to_rc(axis_x, false, false);
-        channels[1] = Self::axis_to_rc(axis_y, true, false);
-        channels[2] = Self::axis_to_rc(throttle, false, true);
-        channels[3] = Self::axis_to_rc(axis_rz, false, false);
+        channels[0] = Self::axis_to_rc(axis_rol, false, false); // Roll
+        channels[1] = Self::axis_to_rc(axis_pit, true, false); // Pitch (up=1000)
+        channels[2] = Self::axis_to_rc(axis_thr, true, true); // Throttle (up=2000)
+        channels[3] = Self::axis_to_rc(axis_yaw, false, false); // Yaw
 
         let keys = match self.device.cached_state().key_vals() {
             Some(k) => k,

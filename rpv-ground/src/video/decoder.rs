@@ -194,6 +194,13 @@ fn decode_loop_libavcodec(
             return;
         }
 
+        // Low-latency: disable B-frame reordering and frame threading
+        unsafe {
+            (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*codec_ctx).thread_count = 1;
+            (*codec_ctx).thread_type = 0;
+        }
+
         let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
         if ret < 0 {
             error!("libavcodec: failed to open h264 decoder (err {})", ret);
