@@ -102,23 +102,36 @@ fn process_decoded_frame(
         );
     }
 
-    let w = width as usize;
-    let h = height as usize;
+    // Use actual decoded frame dimensions, not config dimensions
+    let w = fw;
+    let h = fh;
 
-    // Zero-fill pre-allocated buffers and copy Y plane
-    y_buf.fill(0);
-    let copy_w = fw.min(w).min(linesize0);
-    let copy_h = fh.min(h);
-    for row in 0..copy_h {
-        let src = unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), copy_w) };
-        y_buf[row * w..row * w + copy_w].copy_from_slice(src);
+    // Resize buffers if actual frame is larger than current allocation
+    let y_size = w * h;
+    let uv_size = (w / 2) * (h / 2);
+    if y_buf.len() < y_size {
+        y_buf.resize(y_size, 0);
+    }
+    if u_buf.len() < uv_size {
+        u_buf.resize(uv_size, 0);
+    }
+    if v_buf.len() < uv_size {
+        v_buf.resize(uv_size, 0);
+    }
+
+    // Zero-fill and copy Y plane
+    y_buf[..y_size].fill(0);
+    for row in 0..h {
+        let src =
+            unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), w.min(linesize0)) };
+        y_buf[row * w..row * w + w.min(linesize0)].copy_from_slice(src);
     }
 
     // U/V planes
     let uv_w = w / 2;
     let uv_h = h / 2;
-    u_buf.fill(0);
-    v_buf.fill(0);
+    u_buf[..uv_size].fill(0);
+    v_buf[..uv_size].fill(0);
     let uv_copy_w = (fw / 2).min(uv_w).min(linesize1);
     let uv_v_copy_w = (fw / 2).min(uv_w).min(linesize2);
 
@@ -152,11 +165,11 @@ fn process_decoded_frame(
     }
 
     let decoded = DecodedFrame {
-        y_data: y_buf.clone(),
-        u_data: u_buf.clone(),
-        v_data: v_buf.clone(),
-        width,
-        height,
+        y_data: y_buf[..w * h].to_vec(),
+        u_data: u_buf[..uv_size].to_vec(),
+        v_data: v_buf[..uv_size].to_vec(),
+        width: fw as u32,
+        height: fh as u32,
         send_ts_us: None,
         recv_time: Some(std::time::Instant::now()),
     };
