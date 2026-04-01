@@ -131,6 +131,8 @@ pub fn run(
                 &framerate_s,
                 "--bitrate",
                 &bitrate_s,
+                "--libav-video-codec-opts",
+                "slices=4",
             ]);
             if !rpicam_options.is_empty() {
                 for opt in rpicam_options.split_whitespace() {
@@ -527,7 +529,7 @@ fn send_fec_group_arena(
     }
 
     if max_shard_size == 0 {
-        return;
+        return Ok(());
     }
 
     // Reuse pre-allocated shard Vecs (resize + zero-fill instead of new allocs)
