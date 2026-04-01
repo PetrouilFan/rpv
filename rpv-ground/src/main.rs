@@ -69,9 +69,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
     let u_val = textureSample(t_u, s, in.uv).r * 255.0 - 128.0;
     let v_val = textureSample(t_v, s, in.uv).r * 255.0 - 128.0;
-    let r = (298.0 * y_val + 409.0 * v_val + 128.0) / 256.0;
-    let g = (298.0 * y_val - 100.0 * u_val - 208.0 * v_val + 128.0) / 256.0;
-    let b = (298.0 * y_val + 517.0 * u_val + 128.0) / 256.0;
+    // BT.709 YCbCr -> RGB (matches rpicam-vid output metadata)
+    let r = (298.0 * y_val + 459.0 * v_val + 128.0) / 256.0;
+    let g = (298.0 * y_val - 55.0 * u_val - 137.0 * v_val + 128.0) / 256.0;
+    let b = (298.0 * y_val + 541.0 * u_val + 128.0) / 256.0;
     return vec4<f32>(
         clamp(r / 255.0, 0.0, 1.0),
         clamp(g / 255.0, 0.0, 1.0),
