@@ -10,17 +10,16 @@ use std::io;
 /// #9: QoS Data frames enable HT/VHT MCS rates instead of legacy 1-6 Mbps.
 const IEEE80211_HDR_LEN: usize = 26;
 /// 11-byte radiotap with MCS field to force HT20 rate (MCS7 = 65 Mbps)
-const RADIOTAP_LEN: usize = 11;
-const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 37 bytes
+const RADIOTAP_LEN: usize = 9;
+const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 35 bytes
 
-/// Static radiotap header with MCS rate field to enable HT20 transmission
+/// Static radiotap header with TX rate for AR9271 (ath9k_htc).
+/// Present bit 2 (Rate) set. Rate byte: 0x30 = 48 * 500kbps = 24 Mbps.
 static RADIOTAP: [u8; RADIOTAP_LEN] = [
     0x00, 0x00, // version=0, pad=0
-    0x0b, 0x00, // hdr_len=11 (LE)
-    0x00, 0x00, 0x08, 0x00, // present=0x00080000 (bit 19 = MCS field)
-    0x07, // MCS known: bandwidth(0) + MCS index(1) + GI(2) = 0x07
-    0x00, // MCS flags: 20 MHz, long GI
-    0x07, // MCS index 7 → 65 Mbps @ HT20
+    0x09, 0x00, // hdr_len=9 (LE)
+    0x04, 0x00, 0x00, 0x00, // present: bit 2 (Rate)
+    0x30, // Rate: 24 Mbps (48 * 500kbps)
 ];
 
 /// Static 802.11 QoS Data broadcast header (pre-computed).

@@ -7,11 +7,16 @@
 use std::io;
 
 const IEEE80211_HDR_LEN: usize = 26; // #9: QoS Data (26 bytes)
-const RADIOTAP_LEN: usize = 8;
-const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 34 bytes
+const RADIOTAP_LEN: usize = 9;
+const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 35 bytes
 
-/// Static radiotap header (version=0, pad=0, hdr_len=8, present=0)
-static RADIOTAP: [u8; RADIOTAP_LEN] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// Static radiotap header with TX rate for AR9271 (ath9k_htc).
+/// Present bit 2 (Rate) set. Rate byte: 0x30 = 24 Mbps.
+static RADIOTAP: [u8; RADIOTAP_LEN] = [
+    0x00, 0x00, 0x09, 0x00, // version=0, pad=0, hdr_len=9
+    0x04, 0x00, 0x00, 0x00, // present: bit 2 (Rate)
+    0x30, // Rate: 24 Mbps
+];
 
 /// #9: Static 802.11 QoS Data broadcast header (enables HT/VHT rates)
 static DATA_FRAME_HDR: [u8; IEEE80211_HDR_LEN] = {

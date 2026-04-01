@@ -346,7 +346,7 @@ pub fn run(
                             slot_filled[slot] += nal_data.len();
                             shards_in_group += 1;
                             if shards_in_group == DATA_SHARDS {
-                                send_fec_group_arena(
+                                match send_fec_group_arena(
                                     &socket,
                                     &rs,
                                     &mut arena,
@@ -361,7 +361,13 @@ pub fn run(
                                     &mut video_payload_buf,
                                     &hp_rx,
                                     &mut fec_shards,
-                                );
+                                ) {
+                                    Err(true) => {
+                                        // ENXIO — socket dead, restart the loop
+                                        break;
+                                    }
+                                    _ => {}
+                                }
                                 total_groups += 1;
                                 shards_in_group = 0;
                                 slot_filled = [0; DATA_SHARDS];
@@ -384,7 +390,7 @@ pub fn run(
                                 slot_filled[slot] += chunk.len();
                                 shards_in_group += 1;
                                 if shards_in_group == DATA_SHARDS {
-                                    send_fec_group_arena(
+                                    let _ = send_fec_group_arena(
                                         &socket,
                                         &rs,
                                         &mut arena,
@@ -511,7 +517,7 @@ fn send_fec_group_arena(
     video_payload_buf: &mut Vec<u8>,
     hp_rx: &Option<crossbeam_channel::Receiver<Vec<u8>>>,
     fec_shards: &mut Vec<Vec<u8>>,
-) {
+) -> Result<(), bool> {
     // Determine max shard size for RS encoding
     let mut shard_lens = [0usize; DATA_SHARDS];
     let mut max_shard_size = 0usize;
@@ -540,7 +546,7 @@ fn send_fec_group_arena(
 
     if let Err(e) = rs.encode(&mut *fec_shards) {
         tracing::warn!("Reed-Solomon encode error: {:?}", e);
-        return;
+        return Ok(());
     }
 
     let mut group_ok = true;
@@ -605,6 +611,11 @@ fn send_fec_group_arena(
             }
             Err(e) => {
                 group_ok = false;
+                // ENXIO/ENODEV means AR9271 firmware reset — caller must reopen socket
+                if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::ENODEV) {
+                    tracing::warn!("AR9271 firmware reset (ENXIO). Caller should reopen socket.");
+                    return Err(true);
+                }
                 *fail_count = fail_count.saturating_add(1);
                 if *fail_count <= 5 {
                     tracing::warn!("Video send error: {}", e);
@@ -612,7 +623,7 @@ fn send_fec_group_arena(
                 if *fail_count > 30 {
                     tracing::warn!("Too many send failures, retrying...");
                     *fail_count = 0;
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -622,4 +633,5 @@ fn send_fec_group_arena(
     if group_ok {
         *fail_count = 0;
     }
+    Ok(())
 }
