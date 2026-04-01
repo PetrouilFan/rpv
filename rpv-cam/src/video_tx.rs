@@ -285,6 +285,10 @@ pub fn run(
             .map(|_| Vec::with_capacity(MAX_SHARD_DATA))
             .collect();
 
+        let mut shards_in_group: usize = 0;
+        let mut slot_filled = [0usize; DATA_SHARDS];
+        let mut slot_frag_lens: [usize; DATA_SHARDS] = [0; DATA_SHARDS];
+
         while running.load(Ordering::SeqCst) {
             match stdout.read(&mut read_buf) {
                 Ok(0) => {
@@ -293,136 +297,66 @@ pub fn run(
                 }
                 Ok(n) => {
                     total_bytes += n as u64;
+                    total_nals += 1;
+                    VIDEO_HEALTHY.store(true, Ordering::Relaxed);
+                    last_nal_time = std::time::Instant::now();
 
-                    // Per-read shard tracking
-                    let mut shards_in_group: usize = 0;
-                    let mut slot_filled = [0usize; DATA_SHARDS];
-                    let mut slot_frag_lens: [usize; DATA_SHARDS] = [0; DATA_SHARDS];
-
-                    // Buffer raw bytes and extract complete NALs
-                    if nal_buf.len() + n > MAX_NAL_BUF {
-                        if let Some(next_sc) = find_start_code(&nal_buf, nal_buf.len() / 4) {
-                            nal_buf.advance(next_sc);
-                        } else {
-                            nal_buf.clear();
-                        }
-                    }
-                    nal_buf.extend_from_slice(&read_buf[..n]);
-
-                    if last_nal_time.elapsed() > nal_watchdog_interval {
-                        VIDEO_HEALTHY.store(false, Ordering::Relaxed);
-                    }
-
-                    loop {
-                        let (nal_data, consumed) = match extract_next_nal_cursor(&nal_buf) {
-                            Some((nal, consumed)) => (nal.to_vec(), consumed),
-                            None => break,
-                        };
-                        nal_buf.advance(consumed);
-                        total_nals += 1;
-                        VIDEO_HEALTHY.store(true, Ordering::Relaxed);
-                        last_nal_time = std::time::Instant::now();
-
-                        if last_stats.elapsed().as_secs() >= 5 {
-                            tracing::info!(
-                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s",
-                                total_bytes as f64 / 1_048_576.0,
-                                total_nals,
-                                total_groups,
-                                last_stats.elapsed().as_secs(),
-                            );
-                            last_stats = std::time::Instant::now();
-                        }
-
-                        // Pack NAL into shard(s). With MAX_SHARD_DATA ~2180,
-                        // most NALs (SPS, PPS, SEI, small slices) fit in one shard.
-                        // Large IDR slices may need multiple shards → multiple FEC groups.
-                        let mut nal_off = 0;
-                        while nal_off < nal_data.len() {
-                            let slot = shards_in_group % DATA_SHARDS;
-                            let space = MAX_SHARD_DATA - slot_filled[slot];
-                            if space == 0 {
-                                // Slot full, send this group
-                                shards_in_group += 1;
-                                if shards_in_group == DATA_SHARDS {
-                                    send_fec_group_arena(
-                                        &socket,
-                                        &rs,
-                                        &mut arena,
-                                        &slot_filled,
-                                        &slot_frag_lens,
-                                        drone_id,
-                                        &mut fec_block_seq,
-                                        &mut l2_pkt_seq,
-                                        &mut fail_count,
-                                        &mut l2_frame_buf,
-                                        &mut send_buf,
-                                        &mut video_payload_buf,
-                                        &hp_rx,
-                                        &mut fec_shards,
-                                    );
-                                    total_groups += 1;
-                                    shards_in_group = 0;
-                                    slot_filled = [0; DATA_SHARDS];
-                                    slot_frag_lens = [0; DATA_SHARDS];
-                                }
-                                continue;
-                            }
-                            let chunk_len = (nal_data.len() - nal_off).min(space);
-                            arena.write_frag(
-                                slot,
-                                slot_filled[slot],
-                                &nal_data[nal_off..nal_off + chunk_len],
-                            );
-                            slot_filled[slot] += chunk_len;
-                            nal_off += chunk_len;
-
-                            if slot_filled[slot] >= MAX_SHARD_DATA {
-                                shards_in_group += 1;
-                                if shards_in_group == DATA_SHARDS {
-                                    send_fec_group_arena(
-                                        &socket,
-                                        &rs,
-                                        &mut arena,
-                                        &slot_filled,
-                                        &slot_frag_lens,
-                                        drone_id,
-                                        &mut fec_block_seq,
-                                        &mut l2_pkt_seq,
-                                        &mut fail_count,
-                                        &mut l2_frame_buf,
-                                        &mut send_buf,
-                                        &mut video_payload_buf,
-                                        &hp_rx,
-                                        &mut fec_shards,
-                                    );
-                                    total_groups += 1;
-                                    shards_in_group = 0;
-                                    slot_filled = [0; DATA_SHARDS];
-                                    slot_frag_lens = [0; DATA_SHARDS];
-                                }
-                            }
-                        }
-                    }
-
-                    // Flush remaining partial group
-                    if shards_in_group > 0 {
-                        send_fec_group_arena(
-                            &socket,
-                            &rs,
-                            &mut arena,
-                            &slot_filled,
-                            &slot_frag_lens,
-                            drone_id,
-                            &mut fec_block_seq,
-                            &mut l2_pkt_seq,
-                            &mut fail_count,
-                            &mut l2_frame_buf,
-                            &mut send_buf,
-                            &mut video_payload_buf,
-                            &hp_rx,
-                            &mut fec_shards,
+                    if last_stats.elapsed().as_secs() >= 5 {
+                        tracing::info!(
+                            "Video stats: {:.1} MB, {} chunks, {} FEC groups in {}s",
+                            total_bytes as f64 / 1_048_576.0,
+                            total_nals,
+                            total_groups,
+                            last_stats.elapsed().as_secs(),
                         );
+                        last_stats = std::time::Instant::now();
+                    }
+
+                    // Send raw byte stream chunk — one FEC group per read().
+                    // The receiver's av_parser_parse2 handles NAL extraction
+                    // from arbitrary chunk boundaries.
+                    let mut offset = 0;
+                    while offset < n {
+                        let slot = shards_in_group % DATA_SHARDS;
+                        let space = MAX_SHARD_DATA - slot_filled[slot];
+                        if space == 0 {
+                            shards_in_group += 1;
+                            if shards_in_group == DATA_SHARDS {
+                                send_fec_group_arena(&socket, &rs, &mut arena, &slot_filled, &slot_frag_lens, drone_id, &mut fec_block_seq, &mut l2_pkt_seq, &mut fail_count, &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf, &hp_rx, &mut fec_shards);
+                                total_groups += 1;
+                                shards_in_group = 0;
+                                slot_filled = [0; DATA_SHARDS];
+                                slot_frag_lens = [0; DATA_SHARDS];
+                            }
+                            continue;
+                        }
+                        let chunk_len = (n - offset).min(space);
+                        arena.write_frag(slot, slot_filled[slot], &read_buf[offset..offset + chunk_len]);
+                        slot_filled[slot] += chunk_len;
+                        offset += chunk_len;
+
+                        if slot_filled[slot] >= MAX_SHARD_DATA {
+                            shards_in_group += 1;
+                            if shards_in_group == DATA_SHARDS {
+                                send_fec_group_arena(&socket, &rs, &mut arena, &slot_filled, &slot_frag_lens, drone_id, &mut fec_block_seq, &mut l2_pkt_seq, &mut fail_count, &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf, &hp_rx, &mut fec_shards);
+                                total_groups += 1;
+                                shards_in_group = 0;
+                                slot_filled = [0; DATA_SHARDS];
+                                slot_frag_lens = [0; DATA_SHARDS];
+                            }
+                        }
+                    }
+
+                    // Flush partial shard as a group
+                    if slot_filled.iter().any(|&f| f > 0) {
+                        shards_in_group += 1;
+                        if shards_in_group == DATA_SHARDS {
+                            send_fec_group_arena(&socket, &rs, &mut arena, &slot_filled, &slot_frag_lens, drone_id, &mut fec_block_seq, &mut l2_pkt_seq, &mut fail_count, &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf, &hp_rx, &mut fec_shards);
+                            total_groups += 1;
+                            shards_in_group = 0;
+                            slot_filled = [0; DATA_SHARDS];
+                            slot_frag_lens = [0; DATA_SHARDS];
+                        }
                     }
                 }
                 Err(e) => {
