@@ -31,7 +31,7 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(width: u32, height: u32) -> Self {
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(4);
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(2);
         Self {
             frame_tx,
             frame_rx,
