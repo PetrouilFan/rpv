@@ -16,8 +16,8 @@ pub const PAYLOAD_RC: u8 = 0x03;
 pub const PAYLOAD_HEARTBEAT: u8 = 0x04;
 
 /// Maximum safe payload size for 802.11 frame without fragmentation.
-/// Conservative limit: ~1400 bytes after accounting for L2 headers.
-pub const MAX_PAYLOAD: usize = 1400;
+/// Increased limit for larger NAL support. WiFi MTU ~2304 minus overhead.
+pub const MAX_PAYLOAD: usize = 2200;
 
 #[derive(Debug, Clone, Copy)]
 pub struct L2Header {

@@ -294,15 +294,13 @@ pub fn run(
                 Ok(n) => {
                     total_bytes += n as u64;
 
-                    // Per-read shard tracking (reinitialized each read)
+                    // Per-read shard tracking
                     let mut shards_in_group: usize = 0;
                     let mut slot_filled = [0usize; DATA_SHARDS];
                     let mut slot_frag_lens: [usize; DATA_SHARDS] = [0; DATA_SHARDS];
 
-                    // #9: Append new data
+                    // Buffer raw bytes and extract complete NALs
                     if nal_buf.len() + n > MAX_NAL_BUF {
-                        // #27: Scan to next start code instead of blindly discarding half
-                        // This prevents splitting a NAL in the middle
                         if let Some(next_sc) = find_start_code(&nal_buf, nal_buf.len() / 4) {
                             nal_buf.advance(next_sc);
                         } else {
@@ -311,73 +309,99 @@ pub fn run(
                     }
                     nal_buf.extend_from_slice(&read_buf[..n]);
 
-                    // #4: Check NAL watchdog — encoder deadlock detection
                     if last_nal_time.elapsed() > nal_watchdog_interval {
                         VIDEO_HEALTHY.store(false, Ordering::Relaxed);
                     }
 
-                    // Track NAL extraction
-                    let mut extracted_any = false;
                     loop {
                         let (nal_data, consumed) = match extract_next_nal_cursor(&nal_buf) {
                             Some((nal, consumed)) => (nal.to_vec(), consumed),
                             None => break,
                         };
-                        // #9: O(1) advance — just bumps the read pointer, no memcpy
                         nal_buf.advance(consumed);
-                        extracted_any = true;
                         total_nals += 1;
-                        // #30: Signal video health to telemetry
                         VIDEO_HEALTHY.store(true, Ordering::Relaxed);
-                        let inter_nal_ms = last_nal_time.elapsed().as_millis();
                         last_nal_time = std::time::Instant::now();
 
                         if last_stats.elapsed().as_secs() >= 5 {
                             tracing::info!(
-                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s, last NAL inter-arrival: {}ms",
+                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s",
                                 total_bytes as f64 / 1_048_576.0,
                                 total_nals,
                                 total_groups,
                                 last_stats.elapsed().as_secs(),
-                                inter_nal_ms
                             );
                             last_stats = std::time::Instant::now();
                         }
 
-                        // Only send NALs that fit in a single shard to avoid
-                        // fragmentation across FEC groups (receiver can't reassemble)
-                        if nal_data.len() > MAX_SHARD_DATA {
-                            continue;
-                        }
-
-                        let slot = shards_in_group % DATA_SHARDS;
-                        let arena_offset = slot_filled[slot];
-                        let written = arena.write_frag(slot, arena_offset, &nal_data);
-                        slot_filled[slot] += written;
-                        shards_in_group += 1;
-
-                        if shards_in_group == DATA_SHARDS {
-                            send_fec_group_arena(
-                                &socket,
-                                &rs,
-                                &mut arena,
-                                &slot_filled,
-                                &slot_frag_lens,
-                                drone_id,
-                                &mut fec_block_seq,
-                                &mut l2_pkt_seq,
-                                &mut fail_count,
-                                &mut l2_frame_buf,
-                                &mut send_buf,
-                                &mut video_payload_buf,
-                                &hp_rx,
-                                &mut fec_shards,
+                        // Pack NAL into shard(s). With MAX_SHARD_DATA ~2180,
+                        // most NALs (SPS, PPS, SEI, small slices) fit in one shard.
+                        // Large IDR slices may need multiple shards → multiple FEC groups.
+                        let mut nal_off = 0;
+                        while nal_off < nal_data.len() {
+                            let slot = shards_in_group % DATA_SHARDS;
+                            let space = MAX_SHARD_DATA - slot_filled[slot];
+                            if space == 0 {
+                                // Slot full, send this group
+                                shards_in_group += 1;
+                                if shards_in_group == DATA_SHARDS {
+                                    send_fec_group_arena(
+                                        &socket,
+                                        &rs,
+                                        &mut arena,
+                                        &slot_filled,
+                                        &slot_frag_lens,
+                                        drone_id,
+                                        &mut fec_block_seq,
+                                        &mut l2_pkt_seq,
+                                        &mut fail_count,
+                                        &mut l2_frame_buf,
+                                        &mut send_buf,
+                                        &mut video_payload_buf,
+                                        &hp_rx,
+                                        &mut fec_shards,
+                                    );
+                                    total_groups += 1;
+                                    shards_in_group = 0;
+                                    slot_filled = [0; DATA_SHARDS];
+                                    slot_frag_lens = [0; DATA_SHARDS];
+                                }
+                                continue;
+                            }
+                            let chunk_len = (nal_data.len() - nal_off).min(space);
+                            arena.write_frag(
+                                slot,
+                                slot_filled[slot],
+                                &nal_data[nal_off..nal_off + chunk_len],
                             );
-                            total_groups += 1;
-                            // Reset arena state
-                            shards_in_group = 0;
-                            slot_filled = [0; DATA_SHARDS];
-                            slot_frag_lens = [0; DATA_SHARDS];
+                            slot_filled[slot] += chunk_len;
+                            nal_off += chunk_len;
+
+                            if slot_filled[slot] >= MAX_SHARD_DATA {
+                                shards_in_group += 1;
+                                if shards_in_group == DATA_SHARDS {
+                                    send_fec_group_arena(
+                                        &socket,
+                                        &rs,
+                                        &mut arena,
+                                        &slot_filled,
+                                        &slot_frag_lens,
+                                        drone_id,
+                                        &mut fec_block_seq,
+                                        &mut l2_pkt_seq,
+                                        &mut fail_count,
+                                        &mut l2_frame_buf,
+                                        &mut send_buf,
+                                        &mut video_payload_buf,
+                                        &hp_rx,
+                                        &mut fec_shards,
+                                    );
+                                    total_groups += 1;
+                                    shards_in_group = 0;
+                                    slot_filled = [0; DATA_SHARDS];
+                                    slot_frag_lens = [0; DATA_SHARDS];
+                                }
+                            }
                         }
                     }
 
@@ -399,24 +423,6 @@ pub fn run(
                             &hp_rx,
                             &mut fec_shards,
                         );
-                    }
-
-                    // #9: No manual compaction needed — BytesMut::advance() handles it
-                    if nal_buf.is_empty() {
-                        nal_idle_cycles = 0;
-                    } else if extracted_any {
-                        nal_idle_cycles = 0;
-                    } else if nal_buf.len() > MAX_NAL_BUF / 2 {
-                        nal_idle_cycles += 1;
-                        if nal_idle_cycles >= NAL_IDLE_LIMIT {
-                            tracing::warn!(
-                                "NAL buffer idle reset ({} cycles, {}B unparseable)",
-                                nal_idle_cycles,
-                                nal_buf.len()
-                            );
-                            nal_buf.clear();
-                            nal_idle_cycles = 0;
-                        }
                     }
                 }
                 Err(e) => {

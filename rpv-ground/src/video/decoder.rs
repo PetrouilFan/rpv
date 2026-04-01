@@ -1,104 +1,18 @@
 use std::ffi::CString;
 use tracing::{error, info, warn};
 
-// ── Minimal libavcodec FFI (FFmpeg 6.x layout) ─────────────────────
+use ffmpeg_sys_next as ffi;
 
-/// Opaque codec context
-#[repr(C)]
-struct AvCodecContext {
-    _private: [u8; 0],
-}
-
-/// Opaque codec descriptor
-#[repr(C)]
-struct AvCodec {
-    _private: [u8; 0],
-}
-
-/// Opaque parser context
-#[repr(C)]
-struct AvCodecParserContext {
-    _private: [u8; 0],
-}
-
-/// AVPacket — fields must match FFmpeg 7.x AVPacket struct layout exactly.
-/// Offsets verified against libavcodec 61.19 on aarch64.
-/// We only touch data/size; the rest are zeroed by av_packet_alloc.
-#[repr(C)]
-struct AvPacket {
-    _buf: *mut u8,         // offset 0
-    pts: i64,              // offset 8
-    dts: i64,              // offset 16
-    data: *mut u8,         // offset 24
-    size: i32,             // offset 32
-    _stream_index: i32,    // offset 36
-    flags: i32,            // offset 40
-    _pad44: [u8; 4],       // offset 44 (padding)
-    _side_data: *mut u8,   // offset 48
-    _side_data_elems: i32, // offset 56
-    _pad60: [u8; 4],       // offset 60 (padding)
-    duration: i64,         // offset 64
-    pos: i64,              // offset 72
-    _opaque: *mut u8,      // offset 80
-    _opaque_ref: *mut u8,  // offset 88
-    _time_base_num: i32,   // offset 96
-    _time_base_den: i32,   // offset 100
-} // sizeof = 104
-
-/// AVFrame — fields must match FFmpeg 7.x AVFrame struct layout exactly.
-/// Offsets verified against libavutil 59.39 on aarch64.
-#[repr(C)]
-struct AvFrame {
-    data: [*mut u8; 8], // offset 0,   64 bytes
-    linesize: [i32; 8], // offset 64,  32 bytes
-    _pad96: [u8; 8],    // offset 96,   8 bytes (extended_data ptr)
-    width: i32,         // offset 104
-    height: i32,        // offset 108
-    _pad112: [u8; 4],   // offset 112,  4 bytes (nb_samples)
-    format: i32,        // offset 116
-    _pad120: [u8; 16],  // offset 120, 16 bytes (key_frame, pict_type, SAR)
-    pts: i64,           // offset 136
-    _pad144: [u8; 24],  // offset 144, 24 bytes (pkt_dts, time_base, quality)
-    _pad168: [u8; 272], // offset 168, 272 bytes (rest of struct)
-} // sizeof = 440
-
-// FFmpeg extern declarations
-extern "C" {
-    fn avcodec_alloc_context3(codec: *const AvCodec) -> *mut AvCodecContext;
-    fn avcodec_free_context(ctx: *mut *mut AvCodecContext);
-    fn avcodec_find_decoder_by_name(name: *const u8) -> *const AvCodec;
-    fn avcodec_open2(ctx: *mut AvCodecContext, codec: *const AvCodec, options: *mut u8) -> i32;
-    fn av_parser_init(codec_id: i32) -> *mut AvCodecParserContext;
-    fn av_parser_close(parser: *mut AvCodecParserContext);
-    fn av_parser_parse2(
-        parser: *mut AvCodecParserContext,
-        ctx: *mut AvCodecContext,
-        poutbuf: *mut *mut u8,
-        poutbuf_size: *mut i32,
-        buf: *const u8,
-        buf_size: i32,
-        pts: i64,
-        dts: i64,
-        pos: i64,
-    ) -> i32;
-    fn avcodec_send_packet(ctx: *mut AvCodecContext, pkt: *const AvPacket) -> i32;
-    fn avcodec_receive_frame(ctx: *mut AvCodecContext, frame: *mut AvFrame) -> i32;
-    fn av_packet_alloc() -> *mut AvPacket;
-    fn av_packet_free(pkt: *mut *mut AvPacket);
-    fn av_packet_unref(pkt: *mut AvPacket);
-    fn av_frame_alloc() -> *mut AvFrame;
-    fn av_frame_free(frame: *mut *mut AvFrame);
-}
-
+// FFmpeg constants
+const AV_PIX_FMT_NV12: i32 = 23;
 const AV_CODEC_ID_H264: i32 = 27;
-const AVERROR_EOF: i32 = -541478725; // FFERRTAG('E','O','F',' ')
+const AVERROR_EOF: i32 = -0x5445_4f46; // FFERRTAG('E','O','F',' ')
 const AVERROR_EAGAIN: i32 = -11;
 
 // ── Public types ────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct DecodedFrame {
-    /// #11: Separate Y/U/V planes — no CPU interleaving, GPU does conversion
     pub y_data: Vec<u8>,
     pub u_data: Vec<u8>,
     pub v_data: Vec<u8>,
@@ -135,7 +49,6 @@ impl VideoDecoder {
         let width = self.width;
         let height = self.height;
         std::thread::spawn(move || {
-            // #24: Pin decoder to core 2 for consistent decode latency
             unsafe {
                 let mut set: libc::cpu_set_t = std::mem::zeroed();
                 libc::CPU_ZERO(&mut set);
@@ -147,34 +60,35 @@ impl VideoDecoder {
     }
 }
 
-// ── In-process libavcodec decode loop ──────────────────────────────
+// ── Frame processing ────────────────────────────────────────────────
 
-/// Process a decoded AVFrame into separate Y/U/V planes and send it.
-/// #11: No CPU interleaving — output planar YUV for direct GPU upload.
 fn process_decoded_frame(
-    frame: *mut AvFrame,
-    frame_tx: crossbeam_channel::Sender<DecodedFrame>,
+    frame: *mut ffi::AVFrame,
+    frame_tx: &crossbeam_channel::Sender<DecodedFrame>,
     width: u32,
     height: u32,
     frame_count: &mut u64,
 ) {
+    let fw = unsafe { (*frame).width } as usize;
+    let fh = unsafe { (*frame).height } as usize;
+    let pix_fmt = unsafe { (*frame).format };
     let linesize0 = unsafe { (*frame).linesize[0] } as usize;
     let linesize1 = unsafe { (*frame).linesize[1] } as usize;
     let linesize2 = unsafe { (*frame).linesize[2] } as usize;
     let data0 = unsafe { (*frame).data[0] };
     let data1 = unsafe { (*frame).data[1] };
     let data2 = unsafe { (*frame).data[2] };
-    let fw = unsafe { (*frame).width } as usize;
-    let fh = unsafe { (*frame).height } as usize;
-    let pix_fmt = unsafe { (*frame).format };
 
     if data0.is_null() || data1.is_null() {
+        return;
+    }
+    if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2 {
         return;
     }
 
     if *frame_count == 0 {
         info!(
-            "Decoded frame: {}x{}, format={}, linesize=[{},{},{}], data2_null={}",
+            "Decoded frame: {}x{}, fmt={}, ls=[{},{},{}], d2_null={}",
             fw,
             fh,
             pix_fmt,
@@ -185,14 +99,10 @@ fn process_decoded_frame(
         );
     }
 
-    if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2 {
-        return;
-    }
-
     let w = width as usize;
     let h = height as usize;
 
-    // Copy Y plane — row by row if linesize != width
+    // Y plane
     let mut y_data = vec![0u8; w * h];
     let copy_w = fw.min(w).min(linesize0);
     let copy_h = fh.min(h);
@@ -201,24 +111,16 @@ fn process_decoded_frame(
         y_data[row * w..row * w + copy_w].copy_from_slice(src);
     }
 
-    // Copy U and V planes — separate planes, no interleaving
+    // U/V planes
     let uv_w = w / 2;
     let uv_h = h / 2;
-    let uv_src_h = if pix_fmt == 1 || pix_fmt == 13 {
-        fh
-    } else {
-        fh / 2
-    };
-    let uv_copy_h = uv_src_h.min(uv_h);
-    let uv_copy_w = (fw / 2).min(uv_w).min(linesize1);
-    let step = if uv_src_h > uv_h { 2 } else { 1 };
-
     let mut u_data = vec![0u8; uv_w * uv_h];
     let mut v_data = vec![0u8; uv_w * uv_h];
+    let uv_copy_w = (fw / 2).min(uv_w).min(linesize1);
 
-    if pix_fmt == 23 {
-        // NV12 input: UV is interleaved (U,V,U,V...) — deinterleave into separate planes
+    if pix_fmt == AV_PIX_FMT_NV12 as i32 {
         let uv_interleaved_w = fw.min(linesize1);
+        let uv_copy_h = fh.min(uv_h);
         for row in 0..uv_copy_h {
             let src =
                 unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_interleaved_w) };
@@ -228,20 +130,19 @@ fn process_decoded_frame(
             }
         }
     } else {
-        // YUV420P/YUV422P: U and V are in separate planes
-        for out_row in 0..uv_copy_h {
-            let src_row = out_row * step;
-            if src_row * linesize1 < fw * fh {
-                let u_src = unsafe {
-                    std::slice::from_raw_parts(data1.add(src_row * linesize1), uv_copy_w)
-                };
-                u_data[out_row * uv_w..out_row * uv_w + uv_copy_w].copy_from_slice(u_src);
+        // YUV420P or similar planar
+        let uv_src_h = fh / 2;
+        let uv_copy_h = uv_src_h.min(uv_h);
+        for row in 0..uv_copy_h {
+            if !data1.is_null() {
+                let u_src =
+                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
+                u_data[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
             }
-            if !data2.is_null() && src_row * linesize2 < fw * fh {
-                let v_src = unsafe {
-                    std::slice::from_raw_parts(data2.add(src_row * linesize2), uv_copy_w)
-                };
-                v_data[out_row * uv_w..out_row * uv_w + uv_copy_w].copy_from_slice(v_src);
+            if !data2.is_null() {
+                let v_src =
+                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_copy_w) };
+                v_data[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(v_src);
             }
         }
     }
@@ -256,13 +157,15 @@ fn process_decoded_frame(
         recv_time: Some(std::time::Instant::now()),
     };
 
-    if frame_tx.try_send(decoded).is_err() {}
+    let _ = frame_tx.try_send(decoded);
 
     *frame_count += 1;
     if *frame_count % 30 == 0 {
         info!("Decoded {} frames (planar YUV, libavcodec)", *frame_count);
     }
 }
+
+// ── Decode loop ─────────────────────────────────────────────────────
 
 fn decode_loop_libavcodec(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
@@ -276,35 +179,37 @@ fn decode_loop_libavcodec(
     );
 
     loop {
-        let codec_name = CString::new("h264").unwrap();
-        let codec = unsafe { avcodec_find_decoder_by_name(codec_name.as_ptr() as *const u8) };
+        let codec = unsafe {
+            let name = CString::new("h264").unwrap();
+            ffi::avcodec_find_decoder_by_name(name.as_ptr() as *const _)
+        };
         if codec.is_null() {
             error!("libavcodec: h264 decoder not found");
             return;
         }
 
-        let codec_ctx = unsafe { avcodec_alloc_context3(codec) };
+        let codec_ctx = unsafe { ffi::avcodec_alloc_context3(codec) };
         if codec_ctx.is_null() {
             error!("libavcodec: failed to alloc context");
             return;
         }
 
-        let ret = unsafe { avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
+        let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
         if ret < 0 {
             error!("libavcodec: failed to open h264 decoder (err {})", ret);
-            unsafe { avcodec_free_context(&mut { codec_ctx }) };
+            unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
             return;
         }
 
-        let mut parser = unsafe { av_parser_init(AV_CODEC_ID_H264) };
+        let mut parser = unsafe { ffi::av_parser_init(AV_CODEC_ID_H264) };
         if parser.is_null() {
             error!("libavcodec: failed to init H.264 parser");
-            unsafe { avcodec_free_context(&mut { codec_ctx }) };
+            unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
             return;
         }
 
-        let pkt = unsafe { av_packet_alloc() };
-        let frame = unsafe { av_frame_alloc() };
+        let pkt = unsafe { ffi::av_packet_alloc() };
+        let frame = unsafe { ffi::av_frame_alloc() };
 
         info!(
             "libavcodec H.264 decoder started: {}x{} planar YUV",
@@ -312,7 +217,6 @@ fn decode_loop_libavcodec(
         );
 
         let mut frame_count: u64 = 0;
-        let mut _decode_err_count: u32 = 0;
         let mut nal_recv_count: u64 = 0;
 
         'decode_loop: loop {
@@ -325,9 +229,9 @@ fn decode_loop_libavcodec(
             };
 
             nal_recv_count += 1;
-            if nal_recv_count <= 3 {
+            if nal_recv_count <= 5 {
                 info!(
-                    "DECODER NAL #{}: {} bytes, first8={:02x?}",
+                    "DECODER chunk #{}: {} bytes, first8={:02x?}",
                     nal_recv_count,
                     nal_data.len(),
                     &nal_data[..8.min(nal_data.len())]
@@ -340,30 +244,44 @@ fn decode_loop_libavcodec(
                 let mut out_size: i32 = 0;
 
                 let consumed = unsafe {
-                    av_parser_parse2(
+                    ffi::av_parser_parse2(
                         parser,
                         codec_ctx,
                         &mut out_buf,
                         &mut out_size,
                         nal_data[parse_offset..].as_ptr(),
                         (nal_data.len() - parse_offset) as i32,
+                        ffi::AV_NOPTS_VALUE as _,
+                        ffi::AV_NOPTS_VALUE as _,
                         -1,
-                        -1,
-                        0,
                     )
                 };
 
+                if nal_recv_count <= 5 && (consumed != 0 || out_size != 0) {
+                    info!(
+                        "PARSE: consumed={}, out_size={}, in_len={}",
+                        consumed,
+                        out_size,
+                        nal_data.len() - parse_offset
+                    );
+                }
+
                 if consumed < 0 {
-                    warn!("libavcodec: parser error {}, resetting parser", consumed);
-                    unsafe { av_parser_close(parser) };
-                    parser = unsafe { av_parser_init(AV_CODEC_ID_H264) };
+                    warn!("libavcodec: parser error {}, resetting", consumed);
+                    unsafe { ffi::av_parser_close(parser) };
+                    parser = unsafe { ffi::av_parser_init(AV_CODEC_ID_H264) };
                     if parser.is_null() {
-                        error!("libavcodec: failed to re-init H.264 parser");
+                        error!("libavcodec: failed to re-init parser");
                         break 'decode_loop;
                     }
-                    // Skip remaining bytes in this NAL, get fresh data from channel
                     break;
                 }
+
+                if consumed == 0 && out_size == 0 {
+                    // Parser needs more data
+                    break;
+                }
+
                 parse_offset += consumed as usize;
 
                 if out_size > 0 && !out_buf.is_null() {
@@ -372,82 +290,57 @@ fn decode_loop_libavcodec(
                         (*pkt).size = out_size;
                     }
 
-                    let send_ret = unsafe { avcodec_send_packet(codec_ctx, pkt) };
+                    let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
                     if send_ret < 0 {
-                        // #16: EAGAIN means decoder buffer is full — drain frames, then retry
                         if send_ret == AVERROR_EAGAIN {
-                            // Drain all available frames before retrying
+                            // Drain frames, then retry
                             loop {
-                                let recv_ret = unsafe { avcodec_receive_frame(codec_ctx, frame) };
-                                if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
+                                let r = unsafe { ffi::avcodec_receive_frame(codec_ctx, frame) };
+                                if r == AVERROR_EAGAIN || r == AVERROR_EOF || r < 0 {
                                     break;
                                 }
-                                if recv_ret < 0 {
-                                    break;
-                                }
-                                // Process the drained frame (same as below)
                                 process_decoded_frame(
                                     frame,
-                                    frame_tx.clone(),
+                                    &frame_tx,
                                     width,
                                     height,
                                     &mut frame_count,
                                 );
                             }
-                            // Retry sending the same packet now that buffer is drained
-                            let retry_ret = unsafe { avcodec_send_packet(codec_ctx, pkt) };
-                            if retry_ret < 0 {
-                                _decode_err_count += 1;
-                                if _decode_err_count <= 5 {
-                                    warn!("libavcodec: send_packet retry error {}", retry_ret);
-                                }
+                            let retry = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
+                            if retry < 0 {
                                 continue;
                             }
                         } else {
-                            _decode_err_count += 1;
-                            if _decode_err_count <= 5 {
-                                warn!("libavcodec: send_packet error {}", send_ret);
-                            }
                             continue;
                         }
                     }
 
-                    // Drain all available frames
+                    // Drain decoded frames
                     loop {
-                        let recv_ret = unsafe { avcodec_receive_frame(codec_ctx, frame) };
+                        let recv_ret = unsafe { ffi::avcodec_receive_frame(codec_ctx, frame) };
                         if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
                             break;
                         }
                         if recv_ret < 0 {
-                            _decode_err_count += 1;
-                            if _decode_err_count <= 5 {
-                                warn!("libavcodec: receive_frame error {}", recv_ret);
-                            }
                             break;
                         }
-
-                        process_decoded_frame(
-                            frame,
-                            frame_tx.clone(),
-                            width,
-                            height,
-                            &mut frame_count,
-                        );
+                        process_decoded_frame(frame, &frame_tx, width, height, &mut frame_count);
                     }
 
                     unsafe {
-                        av_packet_unref(pkt);
+                        ffi::av_packet_unref(pkt);
                     }
                 }
             }
         }
 
-        // Cleanup
+        // Cleanup and restart
         unsafe {
-            av_parser_close(parser);
-            avcodec_free_context(&mut { codec_ctx });
-            av_packet_free(&mut { pkt });
-            av_frame_free(&mut { frame });
+            ffi::av_parser_close(parser);
+            ffi::avcodec_free_context(&mut { codec_ctx });
+            ffi::av_packet_free(&mut { pkt });
+            ffi::av_frame_free(&mut { frame });
         }
 
         info!(
