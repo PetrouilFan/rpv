@@ -3,12 +3,12 @@ use tracing::{info, warn};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-const DATA_SHARDS: usize = 1;
+const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 /// #13: Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
 const RING_SIZE: usize = 256;
-/// Only need 1 shard (data shard) — parity shard allows recovery of lost data
+/// 4 data shards + 1 parity shard for 25% FEC overhead
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
 ///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
 ///   [2B * DATA_SHARDS shard_len_array]

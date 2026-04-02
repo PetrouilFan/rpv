@@ -15,7 +15,7 @@ use reed_solomon_erasure::ReedSolomon;
 use crate::link;
 use crate::rawsock::RawSocket;
 
-const DATA_SHARDS: usize = 1;
+const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 1;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
