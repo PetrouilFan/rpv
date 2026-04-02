@@ -556,6 +556,9 @@ fn send_fec_group_arena(
     let mut group_ok = true;
 
     for (i, shard) in fec_shards.iter().enumerate() {
+        // Rate limit: sleep between shard sends to avoid AR9271 TX ring overflow
+        std::thread::sleep(std::time::Duration::from_micros(300));
+
         // Drain high-priority packets (telemetry, RC, heartbeat) before each shard
         // to reduce channel contention
         if i % 2 == 0 {
@@ -614,10 +617,19 @@ fn send_fec_group_arena(
             }
             Err(e) => {
                 group_ok = false;
-                // ENXIO/ENODEV means AR9271 firmware reset — caller must reopen socket
                 if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::ENODEV) {
                     tracing::warn!("AR9271 firmware reset (ENXIO). Caller should reopen socket.");
                     return Err(true);
+                }
+                if e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::EWOULDBLOCK)
+                {
+                    // TX ring full — sleep briefly and retry once
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                    if socket.send_with_buf(l2_frame_buf, send_buf).is_ok() {
+                        *l2_pkt_seq = l2_pkt_seq.wrapping_add(1);
+                        group_ok = true;
+                    }
                 }
                 *fail_count = fail_count.saturating_add(1);
                 if *fail_count <= 5 {

@@ -9,16 +9,14 @@ use std::io;
 /// Fixed 802.11 QoS Data header size (26 bytes with QoS Control field).
 /// #9: QoS Data frames enable HT/VHT MCS rates instead of legacy 1-6 Mbps.
 const IEEE80211_HDR_LEN: usize = 26;
-/// 11-byte radiotap with MCS field to force HT20 rate (MCS7 = 65 Mbps)
+/// 9-byte radiotap: Rate (bit 2) only. ath9k_htc should use default TX flags.
 const RADIOTAP_LEN: usize = 9;
 const HEADER_TOTAL: usize = RADIOTAP_LEN + IEEE80211_HDR_LEN; // 35 bytes
 
-/// Static radiotap header with TX rate for AR9271 (ath9k_htc).
-/// Present bit 2 (Rate) set. Rate byte: 0x30 = 48 * 500kbps = 24 Mbps.
 static RADIOTAP: [u8; RADIOTAP_LEN] = [
     0x00, 0x00, // version=0, pad=0
     0x09, 0x00, // hdr_len=9 (LE)
-    0x04, 0x00, 0x00, 0x00, // present: bit 2 (Rate)
+    0x04, 0x00, 0x00, 0x00, // present: Rate (bit 2)
     0x30, // Rate: 24 Mbps (48 * 500kbps)
 ];
 
@@ -90,8 +88,8 @@ impl RawSocket {
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_protocol = (libc::ETH_P_ALL.to_be()) as u16;
         addr.sll_ifindex = ifindex as i32;
-        // #8: Set hardware type for monitor mode radiotap
-        addr.sll_hatype = libc::ARPHRD_IEEE80211_RADIOTAP as u16;
+        // Use ARPHRD_IEEE80211 (not RADIOTAP) for TX on ath9k_htc
+        addr.sll_hatype = libc::ARPHRD_IEEE80211 as u16;
 
         let ret = unsafe {
             libc::bind(
@@ -196,6 +194,12 @@ impl RawSocket {
         let ret = unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
         if ret < 0 {
             let e = io::Error::last_os_error();
+            static SEND_ERR_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let cnt = SEND_ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cnt < 5 {
+                tracing::warn!("send() returned error: {} (code={:?})", e, e.raw_os_error());
+            }
             if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
             {
                 return Ok(0);

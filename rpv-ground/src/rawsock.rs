@@ -423,9 +423,32 @@ pub fn ieee80211_hdr_len(frame: &[u8]) -> Option<usize> {
 
 /// Strip Radiotap + 802.11 header, returning the L2 payload and optional RSSI (dBm).
 pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Option<i8>)> {
+    // Debug: log first 3 raw frames to diagnose AR9271 radiotap format
+    static DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let count = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 3 {
+        tracing::info!(
+            "RADIOTAP raw: len={}, first16={:02x?}",
+            frame.len(),
+            &frame[..16.min(frame.len())]
+        );
+    }
+
     let rssi = parse_radiotap_rssi(frame);
-    let after_radiotap = strip_radiotap(frame)?;
-    let hdr_len = ieee80211_hdr_len(after_radiotap)?;
+    let hdr_len = radiotap_hdr_len(frame)?;
+
+    let after_radiotap = &frame[hdr_len..];
+    let ieee_hdr_len = ieee80211_hdr_len(after_radiotap)?;
+
+    if count < 3 {
+        tracing::info!(
+            "AFTER_RT: len={}, fc={:02x?}, ieee_hdr_len={}, payload_start={:02x?}",
+            after_radiotap.len(),
+            &after_radiotap[..2.min(after_radiotap.len())],
+            ieee_hdr_len,
+            &after_radiotap[ieee_hdr_len..(ieee_hdr_len + 8).min(after_radiotap.len())]
+        );
+    }
     let after_80211 = &after_radiotap[hdr_len..];
 
     // LLC/SNAP header: DSAP=0xAA, SSAP=0xAA, Control=0x03
