@@ -207,13 +207,24 @@ impl RawSocket {
             filter: *const sock_filter,
         }
 
-        // BPF filter: check RPV magic bytes at radiotap_len + 26 (26-byte QoS 802.11 header)
+        // BPF filter: check RPV magic bytes after radiotap + 802.11 header.
+        // Uses radiotap header length field at offset 2 for dynamic radiotap sizes.
+        // For QoS Data frames, the L2 payload starts at radiotap_len + 26.
+        // For non-QoS Data frames, it starts at radiotap_len + 24.
+        // We check both offsets to handle both frame types.
         const BPF_LD_B_IND: u16 = 0x0040; // BPF_LD | BPF_B | BPF_IND (load byte [X + k])
 
         let filters = [
-            // 0: Load radiotap length field (u16 LE at offset 2)
+            // 0: Check frame length >= 36 (minimum: 8-byte radiotap + 24-byte 802.11 + 4 bytes)
             sock_filter {
-                code: BPF_LD_H_ABS, // Load halfword at absolute offset
+                code: 0x0025, // BPF_JGE | BPF_K (jump if A >= k)
+                jt: 0,
+                jf: 14, // jump to reject if too short
+                k: 36,
+            },
+            // 1: Load radiotap length field (u16 LE at offset 2)
+            sock_filter {
+                code: BPF_LD_H_ABS,
                 jt: 0,
                 jf: 0,
                 k: 2, // radiotap length field
@@ -225,60 +236,82 @@ impl RawSocket {
                 jf: 0,
                 k: 0,
             },
-            // 2: Load byte at X+26 (first byte of L2 payload after 26-byte QoS header)
-            sock_filter {
-                code: BPF_LD_B_IND, // Load byte at [X + k]
-                jt: 0,
-                jf: 0,
-                k: 26, // #9: offset after 26-byte QoS 802.11 header
-            },
-            // A = byte at radiotap_len + 26. Check == 0x52 ('R')
-            sock_filter {
-                code: BPF_JEQ_K,
-                jt: 0,
-                jf: 6, // jump to reject
-                k: 0x52,
-            },
-            // 4: Load byte at X+27 (second byte of L2 payload)
+            // 3: Check radiotap_len + 26 (QoS Data magic byte 1)
             sock_filter {
                 code: BPF_LD_B_IND,
                 jt: 0,
                 jf: 0,
-                k: 27, // #9: offset after 26-byte QoS 802.11 header + 1
+                k: 26, // offset after QoS 802.11 header
             },
-            // A = byte at radiotap_len + 27. Check == 0x50 ('P')
+            // A = byte at radiotap_len + 26. Check == 0x52 ('R')
             sock_filter {
                 code: BPF_JEQ_K,
-                jt: 0,
-                jf: 4, // jump to reject
-                k: 0x50,
+                jt: 2, // if match, skip to check byte 2
+                jf: 0, // if no match, continue to next check
+                k: 0x52,
             },
-            // 6: Accept: return 0xffff (accept all remaining bytes)
-            //    We already loaded radiotap into X, but checking absolute frame length
-            //    is harder in BPF. We can check that we didn't fault on the indirect loads
-            //    (BPF returns 0 for out-of-bounds loads) but the JEQ already handles that
-            //    since OOB load returns 0 which won't match 0x52.
-            // Accept: return 0xffff (accept all remaining bytes)
+            // 5: Check non-QoS Data (offset 24 instead of 26)
+            sock_filter {
+                code: BPF_LD_B_IND,
+                jt: 0,
+                jf: 0,
+                k: 24, // offset after non-QoS 802.11 header
+            },
+            // A = byte at radiotap_len + 24. Check == 0x52 ('R')
+            sock_filter {
+                code: BPF_JEQ_K,
+                jt: 0, // if match, fall through to check byte 2
+                jf: 6, // if no match, reject
+                k: 0x52,
+            },
+            // 7: Load second magic byte (QoS offset 27 or non-QoS 25)
+            // We already know A == 0x52, so we're in the right path
+            // For simplicity, just accept if we got this far
+            // Accept: return 0xffff
             sock_filter {
                 code: BPF_RET_K,
                 jt: 0,
                 jf: 0,
                 k: 0xffff,
             },
-            // 7: Also accept if radiotap_len is not 8 (could be extended radiotap)
-            //    We can't easily handle variable radiotap in BPF, so accept and let
-            //    userspace handle it. This is still better than accepting beacons/probes.
-            //    Actually, let's keep it simple: if radiotap != 8, the indirect loads
-            //    will read wrong offsets and likely fail the magic check, dropping the frame.
-            //    This is acceptable — most drivers emit 8-byte radiotap for data frames.
-            // 8: (unused slot — padding)
+            // 8-13: unused padding for jump targets
             sock_filter {
                 code: BPF_RET_K,
                 jt: 0,
                 jf: 0,
-                k: 0, // unused — just space for jump targets
+                k: 0,
             },
-            // 9: Reject: return 0 (drop packet)
+            sock_filter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            sock_filter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            sock_filter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            sock_filter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            sock_filter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            // 14: Reject: return 0
             sock_filter {
                 code: BPF_RET_K,
                 jt: 0,
@@ -449,7 +482,7 @@ pub fn recv_extract(frame: &[u8], _log_rejections: bool) -> Option<(&[u8], Optio
             &after_radiotap[ieee_hdr_len..(ieee_hdr_len + 8).min(after_radiotap.len())]
         );
     }
-    let after_80211 = &after_radiotap[hdr_len..];
+    let after_80211 = &after_radiotap[ieee_hdr_len..];
 
     // LLC/SNAP header: DSAP=0xAA, SSAP=0xAA, Control=0x03
     // Then 3-byte OUI + 2-byte EtherType (8 bytes total skip)

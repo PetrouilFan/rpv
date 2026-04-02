@@ -1017,6 +1017,24 @@ fn rx_dispatcher(
             }
         };
 
+        // Quick pre-filter: reject non-QoS-Data frames before full parsing
+        // AR9271 RX radiotap is 36 bytes, FC is at bytes 36-37
+        if len < 40 {
+            continue;
+        }
+        // Read radiotap header length
+        let rt_len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        if rt_len >= len || rt_len + 2 > len {
+            continue;
+        }
+        // Check FC field: QoS Data = 0x88, Data = 0x08
+        let fc0 = buf[rt_len];
+        if fc0 != 0x88 && fc0 != 0x08 {
+            // Not a data frame — skip full parsing
+            reject_count += 1;
+            continue;
+        }
+
         let (payload, frame_rssi) = match rawsock::recv_extract(&buf[..len], reject_count < 10) {
             Some(p) => p,
             None => {
