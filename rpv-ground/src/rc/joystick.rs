@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::link;
-use crate::rawsock::RawSocket;
+use crate::SocketTrait;
 
 const RC_MIN: u16 = 1000;
 const RC_MID: u16 = 1500;
@@ -196,9 +196,8 @@ impl GamepadInput {
 }
 
 pub struct RCTx {
-    socket: Arc<RawSocket>,
+    socket: Arc<dyn crate::SocketTrait>,
     drone_id: u8,
-    // #16: Use [u16; 16] instead of Vec<u16> — fixed size, no heap allocation
     channels: Arc<arc_swap::ArcSwap<[u16; 16]>>,
     gamepad: Option<GamepadInput>,
     l2_seq: u32,
@@ -206,7 +205,11 @@ pub struct RCTx {
 }
 
 impl RCTx {
-    pub fn new(socket: Arc<RawSocket>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        socket: Arc<dyn crate::SocketTrait>,
+        drone_id: u8,
+        running: Arc<AtomicBool>,
+    ) -> Self {
         let gamepad = GamepadInput::auto_detect();
 
         if gamepad.is_some() {

@@ -3,10 +3,7 @@
 /// Layout (8 bytes fixed header):
 ///   [0..2]  Magic: 0x52 0x50 ("RP")
 ///   [2]     Drone ID: filters frames from other swarms
-///   [3]     Payload Type: 0x01=Video, 0x02=Telemetry, 0x03=RC, 0x04=Heartbeat
-///   [4..8]  Sequence number (u32 LE)
-///   [8..]   Payload
-
+///   [3]     Payload Type: 0x01=Video, 0x02=Telemetry, 0x03=RC, 0x04=Heartbeat, 0x05=MAVLink
 pub const MAGIC: [u8; 2] = [0x52, 0x50];
 pub const HEADER_LEN: usize = 8;
 
@@ -14,6 +11,7 @@ pub const PAYLOAD_VIDEO: u8 = 0x01;
 pub const PAYLOAD_TELEMETRY: u8 = 0x02;
 pub const PAYLOAD_RC: u8 = 0x03;
 pub const PAYLOAD_HEARTBEAT: u8 = 0x04;
+pub const PAYLOAD_MAVLINK: u8 = 0x05;
 
 /// Maximum safe payload size for 802.11 frame without fragmentation.
 pub const MAX_PAYLOAD: usize = 1400;

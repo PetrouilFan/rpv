@@ -13,7 +13,7 @@ use crate::VIDEO_HEALTHY;
 use reed_solomon_erasure::ReedSolomon;
 
 use crate::link;
-use crate::rawsock::RawSocket;
+use crate::SocketTrait;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 1;
@@ -64,7 +64,7 @@ impl ShardArena {
 /// Run the video capture and streaming loop.
 pub fn run(
     running: Arc<AtomicBool>,
-    socket: Arc<RawSocket>,
+    socket: Arc<dyn SocketTrait>,
     drone_id: u8,
     bitrate: u32,
     intra: u32,
@@ -76,7 +76,7 @@ pub fn run(
     camera_type: &str,
     rpicam_options: &str,
 ) {
-    let is_csi = camera_type == "csi";
+    let is_csi = camera_type == "csi" || camera_type == "rpicam";
     tracing::info!(
         "Video sender ready (FEC {}+{}, L2 broadcast, device={}, type={})",
         DATA_SHARDS,
@@ -114,32 +114,20 @@ pub fn run(
         let bufsize_s = format!("{}k", (bitrate / framerate).max(1) / 1000);
 
         let mut child = if is_csi {
-            let mut cmd = Command::new("rpicam-vid");
-            cmd.args(&[
-                "-t",
-                "0",
-                "--inline",
-                "-o",
-                "pipe:1",
-                "--libav-format",
-                "h264",
-                "--width",
-                &video_width.to_string(),
-                "--height",
-                &video_height.to_string(),
-                "--framerate",
-                &framerate_s,
-                "--bitrate",
-                &bitrate_s,
-                "--libav-video-codec-opts",
-                "slices=4",
-            ]);
-            if !rpicam_options.is_empty() {
-                for opt in rpicam_options.split_whitespace() {
-                    cmd.arg(opt);
-                }
-            }
-            // --tune may not be available on all rpicam-vid versions
+            // rpicam-vid on this Pi 5 was built without libav support, so we pipe
+            // raw YUV420 into ffmpeg for H.264 encoding via libx264 (software)
+            // The Pi 5 has no h264_v4l2m2m hardware encoder like the Pi 4
+            let shell_cmd = format!(
+                "rpicam-vid -t 0 --codec yuv420 -o - --width {} --height {} --framerate {} {} | \
+                 ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt yuv420p -s {} -r {} -i pipe:0 \
+                 -c:v libx264 -b:v {} -g {} -preset veryfast -tune zerolatency -crf 28 \
+                 -x264-params rc-lookahead=0:sync-lookahead=0:sliced-threads=1:repeat-headers=1 \
+                 -f h264 pipe:1",
+                video_width, video_height, framerate_s, rpicam_options,
+                video_size_s, framerate_s, bitrate_s, gop_s,
+            );
+            let mut cmd = Command::new("sh");
+            cmd.args(&["-c", &shell_cmd]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd
         } else {
@@ -349,7 +337,7 @@ pub fn run(
                             shards_in_group += 1;
                             if shards_in_group == DATA_SHARDS {
                                 match send_fec_group_arena(
-                                    &socket,
+                                    socket.as_ref(),
                                     &rs,
                                     &mut arena,
                                     &slot_filled,
@@ -393,7 +381,7 @@ pub fn run(
                                 shards_in_group += 1;
                                 if shards_in_group == DATA_SHARDS {
                                     let _ = send_fec_group_arena(
-                                        &socket,
+                                        socket.as_ref(),
                                         &rs,
                                         &mut arena,
                                         &slot_filled,
@@ -504,7 +492,7 @@ fn extract_next_nal_cursor(data: &[u8]) -> Option<(&[u8], usize)> {
 /// Send an FEC group from pre-allocated arena slots (zero-alloc padding).
 /// Drains high-priority channel (telemetry/RC/heartbeat) before each shard send.
 fn send_fec_group_arena(
-    socket: &RawSocket,
+    socket: &dyn SocketTrait,
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
     arena: &mut ShardArena,
     slot_filled: &[usize; DATA_SHARDS],

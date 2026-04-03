@@ -1,0 +1,8 @@
+transport = "udp"
+interface = "wlp0s20f0u4"
+drone_id = 0
+udp_port = 9001
+ap_ssid = "rpv-link"
+ap_channel = 6
+video_width = 960
+video_height = 540

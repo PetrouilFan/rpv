@@ -1,68 +1,63 @@
 #!/bin/bash
 set -e
 
-IFACE="${RPV_IFACE:-wlan1}"   # RTL8821AU USB adapter
+IFACE="${RPV_IFACE:-wlan1}"
+SSID="${RPV_SSID:-rpv-link}"
+CHANNEL="${RPV_CHANNEL:-6}"
 
-# Prevent NetworkManager from reclaiming the interface
-NM_CONF="/etc/NetworkManager/conf.d/99-rpv.conf"
-if [ -d "$(dirname "$NM_CONF")" ]; then
-    IFACE_MAC=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || echo "")
-    if [ -n "$IFACE_MAC" ]; then
-        mkdir -p "$(dirname "$NM_CONF")"
-        echo -e "[keyfile]\nunmanaged-devices=mac:$IFACE_MAC" > "$NM_CONF"
-        systemctl reload NetworkManager 2>/dev/null || true
-    fi
-fi
-
-# Idempotent teardown of any existing WiFi state
-pkill hostapd 2>/dev/null || true
+# ── Force disconnect: kill anything using the interface ──
 pkill wpa_supplicant 2>/dev/null || true
-# #25: Mask wpa_supplicant so systemd doesn't restart it mid-flight
-systemctl mask wpa_supplicant@${IFACE}.service 2>/dev/null || true
-systemctl mask wpa_supplicant.service 2>/dev/null || true
+systemctl stop NetworkManager 2>/dev/null || true
 ip link set "$IFACE" down 2>/dev/null || true
 ip addr flush dev "$IFACE" 2>/dev/null || true
-ip link set "$IFACE" nomacaddr 2>/dev/null || true
 sleep 0.5
 
-# Put interface into monitor mode
-iw dev "$IFACE" set type monitor
+# ── Kill any existing hostapd/dnsmasq ──
+pkill hostapd 2>/dev/null || true
+pkill dnsmasq 2>/dev/null || true
+sleep 0.3
+
+# ── Generate hostapd config (open network) ──
+HOSTAPD_CONF="/tmp/rpv-hostapd.conf"
+cat > "$HOSTAPD_CONF" <<EOF
+interface=$IFACE
+driver=nl80211
+ssid=$SSID
+hw_mode=g
+channel=$CHANNEL
+wmm_enabled=0
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+EOF
+
+# ── Start hostapd ──
+hostapd "$HOSTAPD_CONF" -B
+sleep 1
+
+# ── Set static IP ──
+ip addr add 10.42.0.1/24 dev "$IFACE"
 ip link set "$IFACE" up
 
-# Set target frequency — 2.4 GHz channel 6 (2437 MHz) for better penetration/range
-# Override with RPV_FREQ env var (e.g., RPV_FREQ=2412 for ch1, RPV_FREQ=2462 for ch11)
-FREQ="${RPV_FREQ:-2437}"
-iw dev "$IFACE" set freq "$FREQ" HT20 2>/dev/null || iw dev "$IFACE" set freq "$FREQ"
+# ── Start dnsmasq for DHCP ──
+DNSMASQ_CONF="/tmp/rpv-dnsmasq.conf"
+cat > "$DNSMASQ_CONF" <<EOF
+interface=$IFACE
+dhcp-range=10.42.0.10,10.42.0.50,12h
+dhcp-option=3,10.42.0.1
+dhcp-option=6,8.8.8.8
+EOF
 
-# Max out TX power (fixed 3000 = 30 dBm) - retry multiple times
-for i in 1 2 3; do
-    iw dev "$IFACE" set txpower fixed 3000 2>/dev/null && break
-    sleep 0.5
-done
+dnsmasq -C "$DNSMASQ_CONF" --no-daemon &
+sleep 0.5
 
-# Disable power save — critical for latency
+# ── Performance tuning ──
 iw dev "$IFACE" set power_save off 2>/dev/null || true
-
-# Bypass Linux socket buffer doubling: set hard ceiling to 8 MB
 sysctl -w net.core.rmem_max=8388608 2>/dev/null || true
 sysctl -w net.core.wmem_max=8388608 2>/dev/null || true
 
-# #4: Set CPU governor to performance (handles pstate driver too)
 for gov in /sys/devices/system/cpu/*/cpufreq/scaling_governor; do
     echo performance > "$gov" 2>/dev/null || true
 done
-# Also try intel_pstate path
-for gov in /sys/devices/system/cpu/*/cpufreq/energy_performance_preference; do
-    echo performance > "$gov" 2>/dev/null || true
-done
 
-# #20: For true zero-jitter RF, add isolcpus=0,1 to /boot/firmware/cmdline.txt
-# This hides cores 0 and 1 from the kernel scheduler entirely.
-
-# Final TX power setting with retries
-for i in 1 2 3 4 5; do
-    iw dev "$IFACE" set txpower fixed 3000 2>/dev/null && break
-    sleep 0.2
-done
-
-echo "Monitor mode ready on $IFACE @ 2437 MHz (2.4 GHz ch6)"
+echo "AP ready: $IFACE -> $SSID (ch $CHANNEL), IP 10.42.0.1/24"

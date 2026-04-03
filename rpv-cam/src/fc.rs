@@ -50,6 +50,12 @@ pub struct FcLink {
     pub telem_rx: mpsc::Receiver<FcTelemetry>,
     /// Send RC channels to the FC (written by rc_receiver)
     pub rc_tx: mpsc::SyncSender<Vec<u16>>,
+    /// Raw MAVLink frame bytes captured from the FC serial stream (downlink).
+    /// Consumed by the mavlink_forwarder thread in main.rs.
+    pub raw_downlink_rx: mpsc::Receiver<Vec<u8>>,
+    /// Raw MAVLink frame bytes received from ground to be written to FC (uplink).
+    /// Written by rx_dispatcher in main.rs.
+    pub raw_uplink_tx: mpsc::SyncSender<Vec<u8>>,
 }
 
 /// Start the MAVLink serial link.
@@ -84,8 +90,12 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
     let (telem_tx, telem_rx) = mpsc::channel::<FcTelemetry>();
     let (rc_tx, rc_rx) = mpsc::sync_channel::<Vec<u16>>(2);
 
+    let (raw_downlink_tx, raw_downlink_rx) = mpsc::sync_channel::<Vec<u8>>(64);
+    let (raw_uplink_tx, raw_uplink_rx) = mpsc::sync_channel::<Vec<u8>>(64);
+
     // --- Reader thread: parse MAVLink from FC, update telemetry ---
     let reader_running = running.clone();
+    let reader_dl_tx = raw_downlink_tx;
     thread::spawn(move || {
         let mut fc = FcTelemetry::default();
         let mut last_telem_send = Instant::now();
@@ -125,6 +135,10 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
                     {
                         Ok((_header, msg)) => {
                             drop(peek);
+                            let consumed = cursor.position() as usize;
+
+                            let _ = reader_dl_tx.try_send(acc[..consumed].to_vec());
+
                             match msg {
                                 MavMessage::SYS_STATUS(s) => {
                                     if s.voltage_battery != u16::MAX {
@@ -190,6 +204,7 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
 
     // --- Writer thread: RC_CHANNELS_OVERRIDE to FC + GCS heartbeat ---
     let writer_running = running.clone();
+    let writer_ul_rx = raw_uplink_rx;
     thread::spawn(move || {
         let mut header = MavHeader {
             sequence: 0,
@@ -250,11 +265,30 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+
+            while let Ok(frame) = writer_ul_rx.try_recv() {
+                match writer_port.write_all(&frame) {
+                    Ok(()) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        tracing::debug!(
+                            "MAVLink uplink write timeout — FC RX buffer full, dropping"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("MAVLink uplink write error: {}", e);
+                    }
+                }
+            }
         }
         tracing::info!("FC writer thread exiting");
     });
 
-    Some(FcLink { telem_rx, rc_tx })
+    Some(FcLink {
+        telem_rx,
+        rc_tx,
+        raw_downlink_rx,
+        raw_uplink_tx,
+    })
 }
 
 /// Convert 16-bit channel values (from UDP RC) to RC_CHANNELS_OVERRIDE.

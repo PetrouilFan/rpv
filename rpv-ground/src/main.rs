@@ -1,8 +1,10 @@
 mod config;
+mod discovery;
 mod link;
 mod link_state;
 mod rawsock;
 mod telemetry;
+mod udpsock;
 mod video {
     pub mod decoder;
     pub mod receiver;
@@ -22,8 +24,32 @@ use crate::config::Config;
 use crate::link_state::{LinkStateHandle, LinkStatus};
 use crate::rawsock::RawSocket;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
+use crate::udpsock::UdpSocket;
 use crate::video::decoder::{DecodedFrame as DecodedYUV, VideoDecoder};
 use crate::video::receiver::VideoReceiver;
+
+pub trait SocketTrait: Send + Sync {
+    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize>;
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+impl SocketTrait for RawSocket {
+    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        RawSocket::send_with_buf(self, payload, buf)
+    }
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        RawSocket::recv(self, buf)
+    }
+}
+
+impl SocketTrait for UdpSocket {
+    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        UdpSocket::send_with_buf(self, payload, buf)
+    }
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        UdpSocket::recv(self, buf)
+    }
+}
 
 /// #24: Pin current thread to core + optional SCHED_FIFO
 fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
@@ -846,10 +872,9 @@ fn main() -> Result<(), eframe::Error> {
         .with_target(false)
         .init();
 
-    tracing::info!("rpv ground station starting (Pi 5, monitor mode)");
-
     let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
+    tracing::info!("rpv ground station starting ({} mode)", config.transport);
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -859,14 +884,67 @@ fn main() -> Result<(), eframe::Error> {
     })
     .expect("Failed to set ctrl+c handler");
 
-    let socket = match RawSocket::new(&config.interface) {
-        Ok(s) => {
-            tracing::info!("Raw socket bound to {} (monitor mode)", config.interface);
-            Arc::new(s)
+    let is_udp = config.transport == "udp";
+
+    let socket: Arc<dyn SocketTrait> = if is_udp {
+        let (_discovery, peer_addr) =
+            discovery::Discovery::spawn(0x02, config.drone_id, config.udp_port).unwrap_or_else(
+                |e| {
+                    tracing::error!("Failed to start discovery: {}", e);
+                    std::process::exit(1);
+                },
+            );
+
+        // Wait for camera to discover us
+        let mut waited = std::time::Duration::ZERO;
+        let wait_timeout = std::time::Duration::from_secs(30);
+        while peer_addr.load().is_none() && waited < wait_timeout {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            waited += std::time::Duration::from_millis(200);
+            if (waited.as_millis() as u64) % 2000 < 200 {
+                tracing::info!("Searching for camera... ({}s elapsed)", waited.as_secs());
+            }
         }
-        Err(e) => {
-            tracing::error!("Failed to open raw socket on {}: {}", config.interface, e);
-            std::process::exit(1);
+
+        if peer_addr.load().is_none() {
+            tracing::warn!(
+                "No camera discovered after {}s — continuing anyway, will connect when found",
+                wait_timeout.as_secs()
+            );
+        } else {
+            let addr = peer_addr.load();
+            tracing::info!("Camera discovered at {}", addr.as_ref().unwrap());
+        }
+
+        let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", config.udp_port))
+            .map_err(|e| {
+                tracing::error!("Failed to bind UDP socket: {}", e);
+                std::process::exit(1);
+            })
+            .unwrap();
+        std_socket.set_broadcast(true).unwrap();
+        std_socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let std_socket = Arc::new(std_socket);
+
+        match UdpSocket::new(std_socket, peer_addr) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::error!("Failed to create UDP socket: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match RawSocket::new(&config.interface) {
+            Ok(s) => {
+                tracing::info!("Raw socket bound to {} (monitor mode)", config.interface);
+                Arc::new(s)
+            }
+            Err(e) => {
+                tracing::error!("Failed to open raw socket on {}: {}", config.interface, e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -875,6 +953,20 @@ fn main() -> Result<(), eframe::Error> {
     let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+
+    // QGC UDP bridge — receives MAVLink downlink from radio, forwards to QGC on 14550
+    // Receives MAVLink uplink from QGC on 14551, injects back over radio link
+    use std::net::UdpSocket as StdUdpSocket;
+    let gcs_bridge_sock = StdUdpSocket::bind(format!("127.0.0.1:{}", config.gcs_uplink_port))
+        .expect("Failed to bind QGC bridge socket");
+    gcs_bridge_sock
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .expect("set_read_timeout failed");
+    let gcs_qgc_addr: std::net::SocketAddr = format!("127.0.0.1:{}", config.gcs_downlink_port)
+        .parse()
+        .unwrap();
+
+    let (mavlink_down_tx, mavlink_down_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
 
     let decoder = VideoDecoder::new(config.video_width, config.video_height);
     let ui_frame_rx = decoder.get_rx();
@@ -900,6 +992,7 @@ fn main() -> Result<(), eframe::Error> {
     let rx_drone_id = config.drone_id;
     let rx_last_hb = Arc::clone(&last_heartbeat);
     let rx_rssi = Arc::clone(&rssi_shared);
+    let rx_mavlink_tx = mavlink_down_tx.clone();
     let _rx_handle = std::thread::spawn(move || {
         // #24: Pin RX dispatcher to core 0, SCHED_FIFO for socket I/O latency
         pin_thread_to_core(0, Some(50));
@@ -911,6 +1004,7 @@ fn main() -> Result<(), eframe::Error> {
             rx_telem_tx,
             rx_last_hb,
             rx_rssi,
+            rx_mavlink_tx,
         );
     });
 
@@ -946,6 +1040,71 @@ fn main() -> Result<(), eframe::Error> {
         heartbeat_monitor(hm_running, hm_last, hm_link_state);
     });
 
+    // MAVLink bridge — downlink: radio → QGC on 127.0.0.1:14550
+    let bridge_down_sock = gcs_bridge_sock
+        .try_clone()
+        .expect("Failed to clone GCS bridge socket for downlink");
+    let bridge_down_running = running.clone();
+    let mavlink_down_handle = std::thread::spawn(move || {
+        tracing::info!(
+            "MAVLink bridge ready → UDP 127.0.0.1:{} (QGC downlink)",
+            config.gcs_downlink_port
+        );
+        while bridge_down_running.load(Ordering::SeqCst) {
+            match mavlink_down_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(frame_bytes) => {
+                    if let Err(e) = bridge_down_sock.send_to(&frame_bytes, gcs_qgc_addr) {
+                        if e.raw_os_error() != Some(libc::ECONNREFUSED) {
+                            tracing::warn!("MAVLink bridge sendto error: {}", e);
+                        }
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        tracing::info!("MAVLink bridge downlink thread exiting");
+    });
+
+    // MAVLink bridge — uplink: QGC on 127.0.0.1:14551 → radio
+    let bridge_up_sock = gcs_bridge_sock;
+    let bridge_up_running = running.clone();
+    let bridge_up_socket = Arc::clone(&socket);
+    let bridge_up_drone_id = config.drone_id;
+    let mavlink_up_handle = std::thread::spawn(move || {
+        tracing::info!(
+            "MAVLink bridge ready ← UDP 127.0.0.1:{} (QGC uplink)",
+            config.gcs_uplink_port
+        );
+        let mut recv_buf = [0u8; 1400];
+        let mut l2_seq: u32 = 0;
+        let mut l2_buf = Vec::with_capacity(link::MAX_PAYLOAD);
+        let mut send_buf = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
+
+        while bridge_up_running.load(Ordering::SeqCst) {
+            match bridge_up_sock.recv_from(&mut recv_buf) {
+                Ok((len, _src)) if len > 0 => {
+                    let header = link::L2Header {
+                        drone_id: bridge_up_drone_id,
+                        payload_type: link::PAYLOAD_MAVLINK,
+                        seq: l2_seq,
+                    };
+                    header.encode_into(&recv_buf[..len], &mut l2_buf);
+                    let _ = bridge_up_socket.send_with_buf(&l2_buf, &mut send_buf);
+                    l2_seq = l2_seq.wrapping_add(1);
+                }
+                Ok(_) => {}
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    tracing::warn!("MAVLink uplink recv error: {}", e);
+                }
+            }
+        }
+        tracing::info!("MAVLink bridge uplink thread exiting");
+    });
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
@@ -972,7 +1131,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     let app_running = running.clone();
-    eframe::run_native(
+    let result = eframe::run_native(
         "rpv ground station",
         native_options,
         Box::new(|_cc| {
@@ -986,24 +1145,31 @@ fn main() -> Result<(), eframe::Error> {
                 channels_shared,
             )))
         }),
-    )
+    );
+
+    mavlink_down_handle.join().ok();
+    mavlink_up_handle.join().ok();
+
+    result
 }
 
 fn rx_dispatcher(
     running: Arc<AtomicBool>,
-    socket: Arc<RawSocket>,
+    socket: Arc<dyn SocketTrait>,
     drone_id: u8,
     video_tx: crossbeam_channel::Sender<Vec<u8>>,
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
     last_heartbeat: Arc<AtomicU64>,
     rssi: Arc<AtomicI8>,
+    mavlink_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) {
-    tracing::info!("RX dispatcher started (raw socket)");
+    tracing::info!("RX dispatcher started");
     let mut buf = vec![0u8; 65536];
     let mut reject_count: u64 = 0;
     let mut video_count: u64 = 0;
     let mut telemetry_count: u64 = 0;
     let mut heartbeat_count: u64 = 0;
+    let mut mavlink_count: u64 = 0;
     let mut total_frames: u64 = 0;
     let mut _self_filtered: u64 = 0;
 
@@ -1017,49 +1183,12 @@ fn rx_dispatcher(
             }
         };
 
-        // Quick pre-filter: reject non-QoS-Data frames before full parsing
-        // AR9271 RX radiotap is 36 bytes, FC is at bytes 36-37
-        if len < 40 {
-            continue;
-        }
-        // Read radiotap header length
-        let rt_len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-        if rt_len >= len || rt_len + 2 > len {
-            continue;
-        }
-        // Check FC field: QoS Data = 0x88, Data = 0x08
-        let fc0 = buf[rt_len];
-        if fc0 != 0x88 && fc0 != 0x08 {
-            // Not a data frame — skip full parsing
-            reject_count += 1;
-            continue;
-        }
-
-        let (payload, frame_rssi) = match rawsock::recv_extract(&buf[..len], reject_count < 10) {
-            Some(p) => p,
-            None => {
-                reject_count += 1;
-                if reject_count <= 10 || reject_count % 500 == 0 {
-                    tracing::warn!(
-                        "RX: rejected frame #{} ({}B), first 16 bytes: {:02x?}",
-                        reject_count,
-                        len,
-                        &buf[..16.min(len)]
-                    );
-                }
-                continue;
-            }
-        };
-
-        // #17: AtomicI8 write — no lock contention on the hot RX path
-        if let Some(rssi_val) = frame_rssi {
-            rssi.store(rssi_val, Ordering::Relaxed);
-        }
+        let payload = &buf[..len];
 
         if !link::L2Header::matches_magic(payload) {
             reject_count += 1;
             if reject_count <= 10 || reject_count % 500 == 0 {
-                tracing::warn!(
+                tracing::debug!(
                     "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
                     reject_count,
                     &payload[..16.min(payload.len())]
@@ -1076,8 +1205,6 @@ fn rx_dispatcher(
             continue;
         }
 
-        // Self-transmission filter: ground sends HEARTBEAT and RC.
-        // In monitor mode we receive our own frames back — drop RC.
         if header.payload_type == link::PAYLOAD_RC {
             _self_filtered += 1;
             continue;
@@ -1086,11 +1213,12 @@ fn rx_dispatcher(
         total_frames += 1;
         if total_frames % 500 == 0 {
             tracing::info!(
-                "RX stats: total={} video={} telem={} hb={} rejected={}",
+                "RX stats: total={} video={} telem={} hb={} mavlink={} rejected={}",
                 total_frames,
                 video_count,
                 telemetry_count,
                 heartbeat_count,
+                mavlink_count,
                 reject_count
             );
         }
@@ -1101,7 +1229,6 @@ fn rx_dispatcher(
                 if video_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Video queue dropped (backpressure)");
                 }
-                // Any valid frame from camera = link alive
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1113,7 +1240,6 @@ fn rx_dispatcher(
                 if telem_tx.try_send(data.to_vec()).is_err() {
                     tracing::warn!("Telemetry queue dropped");
                 }
-                // Any valid frame from camera = link alive
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1127,6 +1253,12 @@ fn rx_dispatcher(
                     .unwrap_or_default()
                     .as_millis() as u64;
                 last_heartbeat.store(now_ms, Ordering::Relaxed);
+            }
+            link::PAYLOAD_MAVLINK => {
+                mavlink_count += 1;
+                if mavlink_tx.try_send(data.to_vec()).is_err() {
+                    tracing::warn!("MAVLink downlink queue full — frame dropped");
+                }
             }
             _ => {
                 tracing::debug!("RX: unknown payload type 0x{:02x}", header.payload_type);
@@ -1167,7 +1299,7 @@ fn heartbeat_monitor(
     }
 }
 
-fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<RawSocket>, drone_id: u8) {
+fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<dyn SocketTrait>, drone_id: u8) {
     tracing::info!("Heartbeat sender ready (L2 broadcast, 10Hz)");
     let mut l2_seq: u32 = 0;
     let mut payload_buf: Vec<u8> = Vec::with_capacity(19);
