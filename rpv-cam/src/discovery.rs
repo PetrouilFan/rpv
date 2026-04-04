@@ -15,7 +15,7 @@ const VERSION: u16 = 1;
 const BEACON_INTERVAL: Duration = Duration::from_millis(500);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
-const BROADCAST_ADDR: &str = "10.42.0.255";
+const BROADCAST_ADDR: &str = "255.255.255.255";
 const CAMERA_IP: &str = "10.42.0.1";
 const DISCOVERY_PORT: u16 = 9002;
 
