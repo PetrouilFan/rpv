@@ -16,9 +16,10 @@ use crate::link;
 use crate::SocketTrait;
 
 const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 1;
+const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
+const NAL_START_CODE: [u8; 3] = [0x00, 0x00, 0x01];
 
 /// Video header: [4B block_seq][1B idx][1B total][1B data][1B pad][2B*DATA_SHARDS shard_lens]
 const VIDEO_HDR_FIXED: usize = 8;
@@ -323,17 +324,23 @@ pub fn run(
                             last_stats = std::time::Instant::now();
                         }
 
+                        // Prepend H.264 start code so the decoder can parse NAL boundaries
+                        let nal_with_sc: Vec<u8> =
+                            [NAL_START_CODE.as_ref(), nal_data.as_slice()].concat();
+
                         // Send NAL with fragment header: [type:1][data...]
                         // type 0 = fits in one shard, type 1 = first fragment,
                         // type 2 = continuation, type 3 = last fragment
                         let max_data = MAX_SHARD_DATA - 1; // reserve 1 byte for frag header
-                        if nal_data.len() <= max_data {
+                        if nal_with_sc.len() <= max_data {
                             // Fits in one shard
                             let slot = shards_in_group % DATA_SHARDS;
+                            let frag_start = slot_filled[slot];
                             arena.write_frag(slot, slot_filled[slot], &[0x00]);
                             slot_filled[slot] += 1;
-                            arena.write_frag(slot, slot_filled[slot], &nal_data);
-                            slot_filled[slot] += nal_data.len();
+                            arena.write_frag(slot, slot_filled[slot], &nal_with_sc);
+                            slot_filled[slot] += nal_with_sc.len();
+                            slot_frag_lens[slot] = slot_filled[slot] - frag_start;
                             shards_in_group += 1;
                             if shards_in_group == DATA_SHARDS {
                                 match send_fec_group_arena(
@@ -367,17 +374,24 @@ pub fn run(
                             // Multi-shard NAL
                             let mut off = 0;
                             let mut frag_num: u8 = 1; // 1=first, 2=cont, 3=last
-                            while off < nal_data.len() {
+                            while off < nal_with_sc.len() {
                                 let slot = shards_in_group % DATA_SHARDS;
-                                let chunk = &nal_data[off..nal_data.len().min(off + max_data)];
+                                let frag_start = slot_filled[slot];
+                                let chunk =
+                                    &nal_with_sc[off..nal_with_sc.len().min(off + max_data)];
                                 off += chunk.len();
 
-                                let frag_type = if off >= nal_data.len() { 3u8 } else { frag_num };
+                                let frag_type = if off >= nal_with_sc.len() {
+                                    3u8
+                                } else {
+                                    frag_num
+                                };
                                 frag_num = 2;
                                 arena.write_frag(slot, slot_filled[slot], &[frag_type]);
                                 slot_filled[slot] += 1;
                                 arena.write_frag(slot, slot_filled[slot], chunk);
                                 slot_filled[slot] += chunk.len();
+                                slot_frag_lens[slot] = slot_filled[slot] - frag_start;
                                 shards_in_group += 1;
                                 if shards_in_group == DATA_SHARDS {
                                     let _ = send_fec_group_arena(
@@ -496,7 +510,7 @@ fn send_fec_group_arena(
     rs: &reed_solomon_erasure::galois_8::ReedSolomon,
     arena: &mut ShardArena,
     slot_filled: &[usize; DATA_SHARDS],
-    _slot_frag_lens: &[usize; DATA_SHARDS],
+    slot_frag_lens: &[usize; DATA_SHARDS],
     drone_id: u8,
     fec_block_seq: &mut u32,
     l2_pkt_seq: &mut u32,
@@ -511,8 +525,8 @@ fn send_fec_group_arena(
     let mut shard_lens = [0usize; DATA_SHARDS];
     let mut max_shard_size = 0usize;
     for i in 0..DATA_SHARDS {
-        shard_lens[i] = if _slot_frag_lens[i] > 0 {
-            _slot_frag_lens[i]
+        shard_lens[i] = if slot_frag_lens[i] > 0 {
+            slot_frag_lens[i]
         } else {
             slot_filled[i]
         };

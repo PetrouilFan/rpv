@@ -4,7 +4,7 @@ use tracing::{info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 const DATA_SHARDS: usize = 4;
-const PARITY_SHARDS: usize = 1;
+const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 /// #13: Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
 const RING_SIZE: usize = 256;

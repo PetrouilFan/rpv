@@ -950,7 +950,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let link_state = LinkStateHandle::new();
 
-    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
     let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
@@ -1326,6 +1326,6 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<dyn SocketTrait>, dron
         let _ = socket.send_with_buf(&l2_buf, &mut send_buf);
 
         l2_seq = l2_seq.wrapping_add(1);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
