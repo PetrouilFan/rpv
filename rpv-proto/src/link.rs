@@ -51,8 +51,10 @@ impl L2Header {
         Some((header, &frame[HEADER_LEN..]))
     }
 
-    /// Check if a buffer starts with the RPV magic bytes (fast filter).
+    /// Fast magic check — avoids full HEADER_LEN check since rawsock
+    /// already verified frame size. Full decode() enforces the 8-byte minimum.
+    #[inline]
     pub fn matches_magic(frame: &[u8]) -> bool {
-        frame.len() >= HEADER_LEN && frame[0] == MAGIC[0] && frame[1] == MAGIC[1]
+        frame.len() >= 2 && frame[0] == MAGIC[0] && frame[1] == MAGIC[1]
     }
 }

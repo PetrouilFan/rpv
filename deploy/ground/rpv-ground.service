@@ -6,7 +6,7 @@ Wants=graphical.target
 [Service]
 Type=simple
 ExecStartPre=/usr/local/bin/rpv-net-setup-pre.sh
-ExecStartPost=/bin/bash -c 'for i in 1 2 3 4 5; do iw dev wlan1 set txpower fixed 3000 2>/dev/null && break; sleep 0.2; done'
+ExecStartPost=/bin/bash -c 'IFACE=$(cat /tmp/rpv-iface 2>/dev/null || echo wlan0); for i in 1 2 3 4 5; do iw dev $IFACE set txpower fixed 3000 2>/dev/null && break; sleep 0.2; done'
 ExecStart=/usr/local/bin/rpv-ground
 ExecStopPost=/usr/local/bin/rpv-net-teardown.sh
 Restart=always

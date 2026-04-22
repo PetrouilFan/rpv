@@ -16,7 +16,6 @@ const BEACON_INTERVAL: Duration = Duration::from_millis(500);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 const BROADCAST_ADDR: &str = "255.255.255.255";
-const CAMERA_IP: &str = "10.42.0.1";
 const DISCOVERY_PORT: u16 = 9002;
 
 /// Beacon format (14 bytes):
@@ -28,7 +27,9 @@ const DISCOVERY_PORT: u16 = 9002;
 /// [8..14] Reserved
 
 pub struct Discovery {
+    #[allow(dead_code)]
     peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
+    #[allow(dead_code)]
     last_seen: Arc<AtomicU64>,
 }
 
@@ -49,9 +50,6 @@ impl Discovery {
         let broadcast_target: SocketAddr = format!("{}:{}", BROADCAST_ADDR, DISCOVERY_PORT)
             .parse()
             .unwrap();
-        let camera_target: SocketAddr =
-            format!("{}:{}", CAMERA_IP, DISCOVERY_PORT).parse().unwrap();
-        let is_ground = role == ROLE_GROUND;
 
         let peer_addr_clone = Arc::clone(&peer_addr);
         let last_seen_clone = Arc::clone(&last_seen);
@@ -61,8 +59,6 @@ impl Discovery {
                 sock,
                 beacon,
                 broadcast_target,
-                camera_target,
-                is_ground,
                 data_port,
                 peer_addr_clone,
                 last_seen_clone,
@@ -74,18 +70,6 @@ impl Discovery {
             last_seen: Arc::clone(&last_seen),
         };
         Ok((disc, peer_addr))
-    }
-
-    pub fn peer_addr(&self) -> Arc<ArcSwap<Option<SocketAddr>>> {
-        Arc::clone(&self.peer_addr)
-    }
-
-    pub fn mark_data_received(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_seen.store(now, Ordering::Relaxed);
     }
 }
 
@@ -104,9 +88,7 @@ fn discovery_loop(
     socket: StdUdpSocket,
     beacon: [u8; 14],
     broadcast_target: SocketAddr,
-    camera_target: SocketAddr,
-    is_ground: bool,
-    my_data_port: u16,
+    _my_data_port: u16,
     peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
     last_seen: Arc<AtomicU64>,
 ) {
@@ -117,12 +99,7 @@ fn discovery_loop(
 
     loop {
         if last_beacon.elapsed() >= BEACON_INTERVAL {
-            if is_ground {
-                let _ = socket.send_to(&beacon, broadcast_target);
-                let _ = socket.send_to(&beacon, camera_target);
-            } else {
-                let _ = socket.send_to(&beacon, broadcast_target);
-            }
+            let _ = socket.send_to(&beacon, broadcast_target);
             last_beacon = Instant::now();
         }
 
@@ -132,7 +109,7 @@ fn discovery_loop(
                 if pkt[0] == MAGIC[0] && pkt[1] == MAGIC[1] {
                     let peer_role = pkt[2];
                     let peer_data_port = u16::from_le_bytes([pkt[6], pkt[7]]);
-                    let expected_role = if is_ground { ROLE_CAMERA } else { ROLE_GROUND };
+                    let expected_role = if pkt[2] == 0x02 { ROLE_CAMERA } else { ROLE_GROUND };
                     if peer_role == expected_role {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

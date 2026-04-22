@@ -1,10 +1,7 @@
 mod config;
-mod discovery;
-mod link;
 mod link_state;
 mod rawsock;
 mod telemetry;
-mod udpsock;
 mod video {
     pub mod decoder;
     pub mod receiver;
@@ -20,36 +17,19 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use egui::Vec2;
 
+use rpv_proto::discovery;
+use rpv_proto::link;
+use rpv_proto::socket_trait::SocketTrait;
+use rpv_proto::udpsock::UdpSocket;
+
 use crate::config::Config;
 use crate::link_state::{LinkStateHandle, LinkStatus};
 use crate::rawsock::RawSocket;
 use crate::telemetry::{Telemetry, TelemetryReceiver};
-use crate::udpsock::UdpSocket;
 use crate::video::decoder::{DecodedFrame as DecodedYUV, VideoDecoder};
 use crate::video::receiver::VideoReceiver;
 
-pub trait SocketTrait: Send + Sync {
-    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize>;
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
-}
-
-impl SocketTrait for RawSocket {
-    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        RawSocket::send_with_buf(self, payload, buf)
-    }
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        RawSocket::recv(self, buf)
-    }
-}
-
-impl SocketTrait for UdpSocket {
-    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        UdpSocket::send_with_buf(self, payload, buf)
-    }
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        UdpSocket::recv(self, buf)
-    }
-}
+const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
 /// #24: Pin current thread to core + optional SCHED_FIFO
 fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
@@ -64,6 +44,17 @@ fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
             };
             libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
         }
+    }
+}
+
+fn write_link_status(status: &str) {
+    let _ = std::fs::write(STATUS_FILE, status);
+}
+
+fn join_log(name: &str, handle: std::thread::JoinHandle<()>) {
+    match handle.join() {
+        Ok(()) => {}
+        Err(e) => tracing::error!("Thread '{}' panicked: {:?}", name, e),
     }
 }
 
@@ -95,7 +86,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
     let u_val = textureSample(t_u, s, in.uv).r * 255.0 - 128.0;
     let v_val = textureSample(t_v, s, in.uv).r * 255.0 - 128.0;
-    // BT.709 YCbCr -> RGB (matches rpicam-vid output metadata)
+    // BT.709 YCbCr -> RGB
     let r = (298.0 * y_val + 459.0 * v_val + 128.0) / 256.0;
     let g = (298.0 * y_val - 55.0 * u_val - 137.0 * v_val + 128.0) / 256.0;
     let b = (298.0 * y_val + 541.0 * u_val + 128.0) / 256.0;
@@ -108,7 +99,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
-/// GPU resources for planar YUV→RGB rendering. #11: 3 separate textures, no CPU interleaving.
+/// GPU resources for planar YUV→RGB rendering.
 struct YuvGpuResources {
     #[allow(dead_code)]
     device: Arc<wgpu::Device>,
@@ -146,7 +137,6 @@ impl YuvGpuResources {
         });
         let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // #11: Separate U and V textures (planar YUV) — no interleaving needed
         let uv_extent = wgpu::Extent3d {
             width: video_width / 2,
             height: video_height / 2,
@@ -279,7 +269,6 @@ impl YuvGpuResources {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    // #17: REPLACE instead of ALPHA_BLENDING (H.264 has no alpha channel)
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -302,14 +291,12 @@ impl YuvGpuResources {
         }
     }
 
-    /// #11: Upload planar Y/U/V planes to GPU textures (no CPU interleaving)
     fn upload(&self, y_data: &[u8], u_data: &[u8], v_data: &[u8]) {
         let w = self.video_width as usize;
         let h = self.video_height as usize;
         let uv_w = w / 2;
         let uv_h = h / 2;
 
-        // Y plane — single write_texture call
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.y_texture,
@@ -330,7 +317,6 @@ impl YuvGpuResources {
             },
         );
 
-        // U plane — single write_texture call
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.u_texture,
@@ -351,7 +337,6 @@ impl YuvGpuResources {
             },
         );
 
-        // V plane — single write_texture call
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.v_texture,
@@ -457,14 +442,14 @@ impl RpvApp {
         if let Some(rs) = frame.wgpu_render_state() {
             tracing::info!(
                 "Initializing GPU YUV→RGB pipeline ({}x{})",
-                self.state.config.video_width,
-                self.state.config.video_height
+                self.state.config.common.video_width,
+                self.state.config.common.video_height
             );
             self.yuv_gpu = Some(Arc::new(Mutex::new(YuvGpuResources::new(
                 rs.device.clone(),
                 rs.queue.clone(),
-                self.state.config.video_width,
-                self.state.config.video_height,
+                self.state.config.common.video_width,
+                self.state.config.common.video_height,
                 rs.target_format,
             ))));
         } else {
@@ -481,16 +466,13 @@ impl RpvApp {
         }
 
         if recv_count > 0 {
-            if self.yuv_gpu.is_some() {
-                tracing::trace!("process_frames: received {} frames, GPU ready", recv_count);
-            } else {
-                tracing::warn!("process_frames: received {} frames but GPU resources NOT initialized (yuv_gpu=None)", recv_count);
+            if self.yuv_gpu.is_none() {
+                tracing::warn!("process_frames: received {} frames but GPU resources NOT initialized", recv_count);
             }
         }
 
         let mut had_frame = false;
         if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
-            // #21: Check if resolution changed — reinit GPU textures if needed
             {
                 let res = gpu.lock().unwrap();
                 if res.video_width != frame.width || res.video_height != frame.height {
@@ -503,8 +485,8 @@ impl RpvApp {
                     );
                     drop(res);
                     self.yuv_gpu = None;
-                    self.state.config.video_width = frame.width;
-                    self.state.config.video_height = frame.height;
+                    self.state.config.common.video_width = frame.width;
+                    self.state.config.common.video_height = frame.height;
                     self.state.frame_count = 0;
                     self.state.fps_timer = Instant::now();
                     self.has_ever_had_frame = false;
@@ -523,7 +505,6 @@ impl RpvApp {
                 }
             }
 
-            // #11: Upload planar Y/U/V directly — no stride packing, no interleaving
             let res = gpu.lock().unwrap();
             res.upload(&frame.y_data, &frame.u_data, &frame.v_data);
             drop(res);
@@ -600,15 +581,14 @@ impl eframe::App for RpvApp {
 
                 if self.has_ever_had_frame {
                     let tex_size = Vec2::new(
-                        self.state.config.video_width as f32,
-                        self.state.config.video_height as f32,
+                        self.state.config.common.video_width as f32,
+                        self.state.config.common.video_height as f32,
                     );
                     let scale_x = available.x / tex_size.x;
                     let scale_y = available.y / tex_size.y;
                     let scale = scale_x.min(scale_y);
                     let display_size = tex_size * scale;
 
-                    // #9: Use fixed absolute rect — prevents jitter from OSD text wrapping
                     let rect = egui::Rect::from_center_size(
                         ui.available_rect_before_wrap().center(),
                         display_size,
@@ -620,9 +600,6 @@ impl eframe::App for RpvApp {
                         egui::Color32::BLACK,
                     );
 
-                    // GPU YUV→RGB via egui PaintCallback
-                    // Draw directly in the CentralPanel (no Area wrapper) so the
-                    // video renders in the correct sequence relative to the OSD.
                     if let Some(ref gpu) = self.yuv_gpu {
                         let callback = YuvRenderCallback {
                             resources: gpu.clone(),
@@ -658,7 +635,6 @@ impl eframe::App for RpvApp {
 
 fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let screen = ui.available_rect_before_wrap();
-    // #18: ArcSwap load — lock-free read, returns Arc<Telemetry>
     let telem = state.telemetry.load();
     let p = ui.painter();
 
@@ -672,7 +648,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         LinkStatus::NoCamera => ("NO CAMERA", egui::Color32::from_rgb(255, 160, 0), false),
     };
 
-    // Blinking dot
     let dot_visible = if show_dot {
         true
     } else {
@@ -696,7 +671,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         LinkStatus::Connected => egui::Color32::from_gray(200),
         _ => egui::Color32::from_gray(100),
     };
-    // #28: Monospace font for all numeric telemetry — prevents layout jitter
     let mono = || egui::FontId::monospace(12.0);
     let mono_big = || egui::FontId::monospace(16.0);
     let mono_sm = || egui::FontId::monospace(11.0);
@@ -710,7 +684,6 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     );
     y += 16.0;
 
-    // #17: AtomicI8 read — no lock needed, -128 = "no signal" sentinel
     let rssi_raw = state.rssi.load(Ordering::Relaxed);
     let (rssi_text, rssi_color) = if rssi_raw == -128i8 {
         ("SIG: ---".to_string(), egui::Color32::from_gray(100))
@@ -744,13 +717,19 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
     let right_x = screen.max.x - 10.0;
     let mut y = 10.0;
 
-    let pct = telem.battery_pct as f32;
-    let bar_color = if pct > 30.0 {
-        egui::Color32::from_rgb(0, 200, 0)
-    } else if pct > 15.0 {
-        egui::Color32::YELLOW
-    } else {
-        egui::Color32::RED
+    let (pct, bar_color, pct_text) = match telem.battery_pct {
+        None => (0.0, egui::Color32::from_gray(80), "---%".to_string()),
+        Some(0) => (0.0, egui::Color32::RED, "0%".to_string()),
+        Some(p) => {
+            let bar_color = if p > 30 {
+                egui::Color32::from_rgb(0, 200, 0)
+            } else if p > 15 {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::RED
+            };
+            (p as f32, bar_color, format!("{}%", p))
+        }
     };
 
     let bar_width = 120.0;
@@ -760,15 +739,26 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         egui::vec2(bar_width, bar_height),
     );
     p.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(40));
-    let fill_width = (bar_width * pct / 100.0).max(0.0);
-    let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_width, bar_height));
-    p.rect_filled(fill_rect, 2.0, bar_color);
+    if telem.battery_pct.is_some() {
+        let fill_width = (bar_width * pct / 100.0).max(0.0);
+        let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_width, bar_height));
+        p.rect_filled(fill_rect, 2.0, bar_color);
+    } else {
+        // No battery data — show "N/A" text centered in bar
+        p.text(
+            bar_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "N/A",
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_gray(150),
+        );
+    }
     y += bar_height + 4.0;
 
     p.text(
         egui::pos2(right_x, y),
         egui::Align2::RIGHT_TOP,
-        format!("{:.1}V  {}%", telem.battery_v, telem.battery_pct),
+        format!("{:.1}V  {}", telem.battery_v, pct_text),
         mono(),
         egui::Color32::WHITE,
     );
@@ -874,7 +864,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
-    tracing::info!("rpv ground station starting ({} mode)", config.transport);
+    tracing::info!("rpv ground station starting ({} mode)", config.common.transport);
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -884,18 +874,17 @@ fn main() -> Result<(), eframe::Error> {
     })
     .expect("Failed to set ctrl+c handler");
 
-    let is_udp = config.transport == "udp";
+    let is_udp = config.common.transport == "udp";
 
     let socket: Arc<dyn SocketTrait> = if is_udp {
         let (_discovery, peer_addr) =
-            discovery::Discovery::spawn(0x02, config.drone_id, config.udp_port).unwrap_or_else(
+            discovery::Discovery::spawn(0x02, config.common.drone_id, config.common.udp_port).unwrap_or_else(
                 |e| {
                     tracing::error!("Failed to start discovery: {}", e);
                     std::process::exit(1);
                 },
             );
 
-        // Wait for camera to discover us
         let mut waited = std::time::Duration::ZERO;
         let wait_timeout = std::time::Duration::from_secs(30);
         while peer_addr.load().is_none() && waited < wait_timeout {
@@ -908,7 +897,7 @@ fn main() -> Result<(), eframe::Error> {
 
         if peer_addr.load().is_none() {
             tracing::warn!(
-                "No camera discovered after {}s — continuing anyway, will connect when found",
+                "No camera discovered after {}s — continuing anyway",
                 wait_timeout.as_secs()
             );
         } else {
@@ -916,7 +905,7 @@ fn main() -> Result<(), eframe::Error> {
             tracing::info!("Camera discovered at {}", addr.as_ref().unwrap());
         }
 
-        let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", config.udp_port))
+        let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", config.common.udp_port))
             .map_err(|e| {
                 tracing::error!("Failed to bind UDP socket: {}", e);
                 std::process::exit(1);
@@ -936,13 +925,13 @@ fn main() -> Result<(), eframe::Error> {
             }
         }
     } else {
-        match RawSocket::new(&config.interface) {
+        match RawSocket::new(&config.common.interface) {
             Ok(s) => {
-                tracing::info!("Raw socket bound to {} (monitor mode)", config.interface);
+                tracing::info!("Raw socket bound to {} (monitor mode)", config.common.interface);
                 Arc::new(s)
             }
             Err(e) => {
-                tracing::error!("Failed to open raw socket on {}: {}", config.interface, e);
+                tracing::error!("Failed to open raw socket on {}: {}", config.common.interface, e);
                 std::process::exit(1);
             }
         }
@@ -954,8 +943,7 @@ fn main() -> Result<(), eframe::Error> {
     let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
-    // QGC UDP bridge — receives MAVLink downlink from radio, forwards to QGC on 14550
-    // Receives MAVLink uplink from QGC on 14551, injects back over radio link
+    // QGC UDP bridge
     use std::net::UdpSocket as StdUdpSocket;
     let gcs_bridge_sock = StdUdpSocket::bind(format!("127.0.0.1:{}", config.gcs_uplink_port))
         .expect("Failed to bind QGC bridge socket");
@@ -968,7 +956,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let (mavlink_down_tx, mavlink_down_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
 
-    let decoder = VideoDecoder::new(config.video_width, config.video_height);
+    let decoder = VideoDecoder::new(config.common.video_width, config.common.video_height);
     let ui_frame_rx = decoder.get_rx();
     decoder.spawn(video_frame_rx_decoder);
 
@@ -979,22 +967,18 @@ fn main() -> Result<(), eframe::Error> {
         config.save();
     }
 
-    // #22: AtomicU64 for heartbeat — stores UNIX timestamp in milliseconds
-    // No lock needed for the hot-path read in heartbeat_monitor
     let last_heartbeat: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    // #17: AtomicI8 for RSSI — -128 sentinel = "no signal"
     let rssi_shared: Arc<AtomicI8> = Arc::new(AtomicI8::new(-128i8));
 
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
     let rx_video_tx = video_payload_tx;
     let rx_telem_tx = telem_payload_tx;
-    let rx_drone_id = config.drone_id;
+    let rx_drone_id = config.common.drone_id;
     let rx_last_hb = Arc::clone(&last_heartbeat);
     let rx_rssi = Arc::clone(&rssi_shared);
     let rx_mavlink_tx = mavlink_down_tx.clone();
-    let _rx_handle = std::thread::spawn(move || {
-        // #24: Pin RX dispatcher to core 0, SCHED_FIFO for socket I/O latency
+    let rx_handle = std::thread::spawn(move || {
         pin_thread_to_core(0, Some(50));
         rx_dispatcher(
             rx_running,
@@ -1009,38 +993,38 @@ fn main() -> Result<(), eframe::Error> {
     });
 
     let vr = VideoReceiver::new(video_frame_tx, video_payload_rx);
-    let _vr_handle = std::thread::spawn(move || {
+    let vr_handle = std::thread::spawn(move || {
         vr.run();
     });
 
-    let _telem_handle = std::thread::spawn(move || {
+    let telem_handle = std::thread::spawn(move || {
         telemetry.run();
     });
 
     let rc_socket = Arc::clone(&socket);
-    let rc_drone_id = config.drone_id;
+    let rc_drone_id = config.common.drone_id;
     let rc_running = running.clone();
     let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
     let channels_shared = rc.channels();
-    let _rc_handle = std::thread::spawn(move || {
+    let rc_handle = std::thread::spawn(move || {
         rc.run();
     });
 
     let hb_running = running.clone();
     let hb_socket = Arc::clone(&socket);
-    let hb_drone_id = config.drone_id;
-    let _hb_handle = std::thread::spawn(move || {
+    let hb_drone_id = config.common.drone_id;
+    let hb_handle = std::thread::spawn(move || {
         heartbeat_sender(hb_running, hb_socket, hb_drone_id);
     });
 
     let hm_running = running.clone();
     let hm_last = Arc::clone(&last_heartbeat);
     let hm_link_state = link_state.clone();
-    let _hm_handle = std::thread::spawn(move || {
+    let hm_handle = std::thread::spawn(move || {
         heartbeat_monitor(hm_running, hm_last, hm_link_state);
     });
 
-    // MAVLink bridge — downlink: radio → QGC on 127.0.0.1:14550
+    // MAVLink bridge — downlink: radio → QGC
     let bridge_down_sock = gcs_bridge_sock
         .try_clone()
         .expect("Failed to clone GCS bridge socket for downlink");
@@ -1066,11 +1050,11 @@ fn main() -> Result<(), eframe::Error> {
         tracing::info!("MAVLink bridge downlink thread exiting");
     });
 
-    // MAVLink bridge — uplink: QGC on 127.0.0.1:14551 → radio
+    // MAVLink bridge — uplink: QGC → radio
     let bridge_up_sock = gcs_bridge_sock;
     let bridge_up_running = running.clone();
     let bridge_up_socket = Arc::clone(&socket);
-    let bridge_up_drone_id = config.drone_id;
+    let bridge_up_drone_id = config.common.drone_id;
     let mavlink_up_handle = std::thread::spawn(move || {
         tracing::info!(
             "MAVLink bridge ready ← UDP 127.0.0.1:{} (QGC uplink)",
@@ -1147,8 +1131,16 @@ fn main() -> Result<(), eframe::Error> {
         }),
     );
 
-    mavlink_down_handle.join().ok();
-    mavlink_up_handle.join().ok();
+    write_link_status("disconnected");
+
+    join_log("rx_dispatcher", rx_handle);
+    join_log("video_receiver", vr_handle);
+    join_log("telemetry", telem_handle);
+    join_log("rc_joystick", rc_handle);
+    join_log("heartbeat_sender", hb_handle);
+    join_log("heartbeat_monitor", hm_handle);
+    join_log("mavlink_downlink", mavlink_down_handle);
+    join_log("mavlink_uplink", mavlink_up_handle);
 
     result
 }
@@ -1160,7 +1152,7 @@ fn rx_dispatcher(
     video_tx: crossbeam_channel::Sender<Vec<u8>>,
     telem_tx: crossbeam_channel::Sender<Vec<u8>>,
     last_heartbeat: Arc<AtomicU64>,
-    rssi: Arc<AtomicI8>,
+    _rssi: Arc<AtomicI8>,
     mavlink_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) {
     tracing::info!("RX dispatcher started");
@@ -1171,7 +1163,6 @@ fn rx_dispatcher(
     let mut heartbeat_count: u64 = 0;
     let mut mavlink_count: u64 = 0;
     let mut total_frames: u64 = 0;
-    let mut _self_filtered: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
@@ -1188,7 +1179,7 @@ fn rx_dispatcher(
         if !link::L2Header::matches_magic(payload) {
             reject_count += 1;
             if reject_count <= 10 || reject_count % 500 == 0 {
-                tracing::debug!(
+                tracing::warn!(
                     "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
                     reject_count,
                     &payload[..16.min(payload.len())]
@@ -1206,7 +1197,6 @@ fn rx_dispatcher(
         }
 
         if header.payload_type == link::PAYLOAD_RC {
-            _self_filtered += 1;
             continue;
         }
 
@@ -1280,7 +1270,6 @@ fn heartbeat_monitor(
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // #22: AtomicU64 read — no lock contention
         let last_ms = last_heartbeat.load(Ordering::Relaxed);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1291,10 +1280,12 @@ fn heartbeat_monitor(
         if last_ms == 0 || elapsed_ms > 5000 {
             if ever_connected {
                 link_state.heartbeat_lost();
+                write_link_status("signal_lost");
             }
         } else {
             ever_connected = true;
             link_state.heartbeat_restored();
+            write_link_status("connected");
         }
     }
 }

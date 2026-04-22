@@ -16,16 +16,6 @@ pub enum LinkStatus {
 }
 
 impl LinkStatus {
-    #[allow(dead_code)]
-    fn to_u8(self) -> u8 {
-        match self {
-            LinkStatus::Searching => SEARCHING,
-            LinkStatus::Connected => CONNECTED,
-            LinkStatus::SignalLost => SIGNAL_LOST,
-            LinkStatus::NoCamera => NO_CAMERA,
-        }
-    }
-
     fn from_u8(v: u8) -> Self {
         match v {
             SEARCHING => LinkStatus::Searching,

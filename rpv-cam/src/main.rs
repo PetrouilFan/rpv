@@ -1,9 +1,6 @@
 mod config;
-mod discovery;
 mod fc;
-mod link;
 mod rawsock;
-mod udpsock;
 mod video_tx;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,31 +8,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rpv_proto::discovery;
+use rpv_proto::link;
+use rpv_proto::socket_trait::SocketTrait;
+use rpv_proto::udpsock::UdpSocket;
+
 use rawsock::RawSocket;
-use udpsock::UdpSocket;
-
-pub trait SocketTrait: Send + Sync {
-    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize>;
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
-}
-
-impl SocketTrait for RawSocket {
-    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        RawSocket::send_with_buf(self, payload, buf)
-    }
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        RawSocket::recv(self, buf)
-    }
-}
-
-impl SocketTrait for UdpSocket {
-    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        UdpSocket::send_with_buf(self, payload, buf)
-    }
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        UdpSocket::recv(self, buf)
-    }
-}
 
 const STATUS_FILE: &str = "/tmp/rpv_link_status";
 
@@ -77,6 +55,13 @@ fn write_link_status(status: &str) {
     let _ = std::fs::write(STATUS_FILE, status);
 }
 
+fn join_log(name: &str, handle: std::thread::JoinHandle<()>) {
+    match handle.join() {
+        Ok(()) => {}
+        Err(e) => tracing::error!("Thread '{}' panicked: {:?}", name, e),
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
@@ -85,7 +70,7 @@ fn main() {
 
     let (cfg, _was_default) = config::Config::load();
     tracing::info!("Config: {:?}", cfg);
-    tracing::info!("rpv-cam starting (Pi 5, {} mode)", cfg.transport);
+    tracing::info!("rpv-cam starting (Pi 5, {} mode)", cfg.common.transport);
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -96,13 +81,13 @@ fn main() {
     })
     .ok();
 
-    let is_udp = cfg.transport == "udp";
+    let is_udp = cfg.common.transport == "udp";
 
     // UDP mode: separate sockets for discovery (port 9002) and data (port 9001)
     let socket: Arc<dyn SocketTrait> = if is_udp {
         write_link_status("searching");
 
-        let (_discovery, peer_addr) = discovery::Discovery::spawn(0x01, cfg.drone_id, cfg.udp_port)
+        let (_discovery, peer_addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
             .unwrap_or_else(|e| {
                 tracing::error!("Failed to start discovery: {}", e);
                 std::process::exit(1);
@@ -130,7 +115,7 @@ fn main() {
             write_link_status("connected");
         }
 
-        let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", cfg.udp_port))
+        let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", cfg.common.udp_port))
             .map_err(|e| {
                 tracing::error!("Failed to bind UDP socket: {}", e);
             })
@@ -149,16 +134,16 @@ fn main() {
             }
         }
     } else {
-        match RawSocket::new(&cfg.interface) {
+        match RawSocket::new(&cfg.common.interface) {
             Ok(s) => {
-                tracing::info!("Raw socket bound to {} (monitor mode)", cfg.interface);
+                tracing::info!("Raw socket bound to {} (monitor mode)", cfg.common.interface);
                 Arc::new(s)
             }
             Err(e) => {
-                tracing::error!("Failed to open raw socket on {}: {}", cfg.interface, e);
+                tracing::error!("Failed to open raw socket on {}: {}", cfg.common.interface, e);
                 tracing::error!(
                     "Make sure the interface is in monitor mode: iw dev {} set type monitor",
-                    cfg.interface
+                    cfg.common.interface
                 );
                 return;
             }
@@ -184,7 +169,7 @@ fn main() {
     let rx_running = running.clone();
     let rx_socket = Arc::clone(&socket);
     let rx_last_hb = Arc::clone(&last_heartbeat);
-    let rx_drone_id = cfg.drone_id;
+    let rx_drone_id = cfg.common.drone_id;
     let rx_rc_tx = fc_rc_tx.clone();
     let rx_raw_uplink_tx = fc_raw_uplink_tx.clone();
     let rx_handle = thread::spawn(move || {
@@ -208,8 +193,8 @@ fn main() {
     // Start video capture and streaming — #24: pin to core 1, SCHED_FIFO priority 50
     let video_running = running.clone();
     let video_socket = Arc::clone(&socket);
-    let video_width = cfg.video_width;
-    let video_height = cfg.video_height;
+    let video_width = cfg.common.video_width;
+    let video_height = cfg.common.video_height;
     let video_framerate = cfg.framerate;
     let video_bitrate = cfg.bitrate;
     let video_device = cfg.video_device.clone();
@@ -220,7 +205,7 @@ fn main() {
         video_tx::run(
             video_running,
             video_socket,
-            cfg.drone_id,
+            cfg.common.drone_id,
             video_bitrate,
             cfg.intra,
             Some(hp_rx),
@@ -241,7 +226,7 @@ fn main() {
         telemetry_sender(
             telem_running,
             telem_socket,
-            cfg.drone_id,
+            cfg.common.drone_id,
             fc_telem_rx,
             telem_hp_tx,
         );
@@ -258,13 +243,13 @@ fn main() {
     let hb_running = running.clone();
     let hb_socket = Arc::clone(&socket);
     let hb_handle = thread::spawn(move || {
-        heartbeat_sender(hb_running, hb_socket, cfg.drone_id);
+        heartbeat_sender(hb_running, hb_socket, cfg.common.drone_id);
     });
 
     // MAVLink downlink forwarder — forwards raw FC bytes to ground as PAYLOAD_MAVLINK
     let fwd_running = running.clone();
     let fwd_hp_tx = hp_tx.clone();
-    let fwd_drone_id = cfg.drone_id;
+    let fwd_drone_id = cfg.common.drone_id;
     let mavlink_fwd_handle = thread::spawn(move || {
         if let Some(rx) = fc_raw_downlink_rx {
             tracing::info!("MAVLink forwarder ready → L2 PAYLOAD_MAVLINK");
@@ -300,12 +285,14 @@ fn main() {
         thread::sleep(Duration::from_millis(500));
     }
 
-    rx_handle.join().ok();
-    video_handle.join().ok();
-    telem_handle.join().ok();
-    hm_handle.join().ok();
-    hb_handle.join().ok();
-    mavlink_fwd_handle.join().ok();
+    write_link_status("disconnected");
+
+    join_log("rx_dispatcher", rx_handle);
+    join_log("video_tx", video_handle);
+    join_log("telemetry_sender", telem_handle);
+    join_log("heartbeat_monitor", hm_handle);
+    join_log("heartbeat_sender", hb_handle);
+    join_log("mavlink_forwarder", mavlink_fwd_handle);
 
     tracing::info!("rpv-cam stopped");
 }
@@ -324,10 +311,7 @@ fn rx_dispatcher(
     let mut last_rc_time = Instant::now();
     let failsafe_timeout = Duration::from_secs(2);
     let mut failsafe_active = false;
-    let mut reject_count: u64 = 0;
     let mut magic_rejects: u64 = 0;
-
-    let mut _self_filtered: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
@@ -356,7 +340,6 @@ fn rx_dispatcher(
 
         if !link::L2Header::matches_magic(payload) {
             magic_rejects += 1;
-            reject_count += 1;
             if magic_rejects <= 5 {
                 tracing::debug!(
                     "RX: magic mismatch, payload first 8 bytes: {:02x?}",
@@ -377,7 +360,6 @@ fn rx_dispatcher(
         if header.payload_type == link::PAYLOAD_VIDEO
             || header.payload_type == link::PAYLOAD_TELEMETRY
         {
-            _self_filtered += 1;
             continue;
         }
 
@@ -465,7 +447,7 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<AtomicU64>) {
     }
 }
 
-/// #15: Check camera via sysfs (single stat() syscall, no subprocess spawn)
+/// Check camera via sysfs (single stat() syscall, no subprocess spawn)
 fn check_camera_available() -> bool {
     std::fs::read_dir("/dev/v4l")
         .map(|mut entries| entries.next().is_some())
@@ -474,12 +456,11 @@ fn check_camera_available() -> bool {
 
 fn telemetry_sender(
     running: Arc<AtomicBool>,
-    socket: Arc<dyn SocketTrait>,
+    _socket: Arc<dyn SocketTrait>,
     drone_id: u8,
     fc_telem_rx: Option<std::sync::mpsc::Receiver<fc::FcTelemetry>>,
     hp_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) {
-    let _ = socket;
     let has_fc = fc_telem_rx.is_some();
     if has_fc {
         tracing::info!("Telemetry sender ready (FC telemetry, L2 broadcast)");
@@ -510,6 +491,11 @@ fn telemetry_sender(
         }
 
         json_buf.clear();
+        let battery_pct_json = if fc_telem.battery_pct >= 0 {
+            serde_json::json!(fc_telem.battery_pct as u32)
+        } else {
+            serde_json::json!(null)
+        };
         let telem = serde_json::json!({
             "lat": fc_telem.lat,
             "lon": fc_telem.lon,
@@ -518,7 +504,7 @@ fn telemetry_sender(
             "speed": fc_telem.speed,
             "satellites": fc_telem.satellites as u32,
             "battery_v": fc_telem.battery_v,
-            "battery_pct": if fc_telem.battery_pct >= 0 { fc_telem.battery_pct as u32 } else { 0 },
+            "battery_pct": battery_pct_json,
             "mode": fc_telem.mode,
             "armed": fc_telem.armed,
             "camera_ok": camera_ok && VIDEO_HEALTHY.load(Ordering::Relaxed),

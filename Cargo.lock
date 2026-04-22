@@ -2962,7 +2962,6 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "rpv-cam"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "bytes",
  "crossbeam-channel",
  "ctrlc",
@@ -2970,6 +2969,7 @@ dependencies = [
  "mavlink",
  "memchr",
  "reed-solomon-erasure",
+ "rpv-proto",
  "serde",
  "serde_json",
  "serialport",
@@ -2993,12 +2993,25 @@ dependencies = [
  "libc",
  "pkg-config",
  "reed-solomon-erasure",
+ "rpv-proto",
  "serde",
  "serde_json",
  "toml",
  "tracing",
  "tracing-subscriber",
  "wgpu",
+]
+
+[[package]]
+name = "rpv-proto"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

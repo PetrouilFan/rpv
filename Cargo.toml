@@ -1,5 +1,5 @@
 [workspace]
-members = ["rpv-ground", "rpv-cam"]
+members = ["rpv-proto", "rpv-ground", "rpv-cam"]
 resolver = "2"
 
 [profile.release]

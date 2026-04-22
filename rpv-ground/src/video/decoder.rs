@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::CStr;
 use tracing::{error, info, warn};
 
 use ffmpeg_sys_next as ffi;
@@ -8,6 +8,9 @@ const AV_PIX_FMT_NV12: i32 = 23;
 const AV_CODEC_ID_H264: i32 = 27;
 const AVERROR_EOF: i32 = -0x5445_4f46; // FFERRTAG('E','O','F',' ')
 const AVERROR_EAGAIN: i32 = -11;
+
+/// Static CStr for H.264 codec name — avoids per-iteration CString allocation.
+static H264_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"h264\0") };
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -197,8 +200,7 @@ fn decode_loop_libavcodec(
 
     loop {
         let codec = unsafe {
-            let name = CString::new("h264").unwrap();
-            ffi::avcodec_find_decoder_by_name(name.as_ptr() as *const _)
+            ffi::avcodec_find_decoder_by_name(H264_CSTR.as_ptr() as *const _)
         };
         if codec.is_null() {
             error!("libavcodec: h264 decoder not found");
@@ -298,7 +300,7 @@ fn decode_loop_libavcodec(
                 }
 
                 if consumed < 0 {
-                    warn!("libavcodec: parser error {}, resetting", consumed);
+                    warn!("libavcodec: parser error {:#010x}, resetting", consumed);
                     unsafe { ffi::av_parser_close(parser) };
                     parser = unsafe { ffi::av_parser_init(AV_CODEC_ID_H264) };
                     if parser.is_null() {

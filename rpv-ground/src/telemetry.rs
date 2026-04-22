@@ -1,7 +1,6 @@
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::info;
 
 use crate::link_state::LinkStateHandle;
@@ -15,7 +14,7 @@ pub struct Telemetry {
     pub speed: f64,
     pub satellites: u32,
     pub battery_v: f64,
-    pub battery_pct: u32,
+    pub battery_pct: Option<u32>,
     pub mode: String,
     pub armed: bool,
     #[serde(default = "default_true")]
@@ -36,7 +35,7 @@ impl Default for Telemetry {
             speed: 0.0,
             satellites: 0,
             battery_v: 0.0,
-            battery_pct: 0,
+            battery_pct: None,
             mode: "UNKNOWN".to_string(),
             armed: false,
             camera_ok: true,
@@ -66,7 +65,6 @@ impl TelemetryReceiver {
     pub fn run(&self) {
         info!("Telemetry receiver ready (L2 payload channel)");
 
-        let mut last_telem_time = Instant::now();
         // #22: 100ms timeout — fast Ctrl+C shutdown (was 3s)
         let timeout = std::time::Duration::from_millis(100);
 
@@ -76,16 +74,10 @@ impl TelemetryReceiver {
                     // #3: Use from_slice directly — faster, no UTF-8 intermediate check
                     if let Ok(telem) = serde_json::from_slice::<Telemetry>(&payload) {
                         self.state.store(Arc::new(telem));
-                        last_telem_time = Instant::now();
                         self.link_state.telemetry_activity();
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // #22: Check running flag more frequently
-                    if last_telem_time.elapsed() > std::time::Duration::from_secs(3) {
-                        // No action needed; heartbeat_monitor is the authority.
-                    }
-                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     info!("Telemetry payload channel closed");
                     return;

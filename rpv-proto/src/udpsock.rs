@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
+use crate::socket_trait::SocketTrait;
+
 pub struct UdpSocket {
     socket: Arc<StdUdpSocket>,
     peer: Arc<ArcSwap<Option<SocketAddr>>>,
@@ -15,7 +17,7 @@ impl UdpSocket {
         socket: Arc<StdUdpSocket>,
         peer: Arc<ArcSwap<Option<SocketAddr>>>,
     ) -> io::Result<Self> {
-        let broadcast_addr: SocketAddr = "10.42.0.255:9001".parse().unwrap();
+        let broadcast_addr: SocketAddr = "255.255.255.255:9001".parse().unwrap();
 
         tracing::info!("UDP socket ready (shared with discovery)");
         Ok(Self {
@@ -36,7 +38,10 @@ impl UdpSocket {
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self.socket.recv_from(buf) {
-            Ok((n, _addr)) => Ok(n),
+            Ok((n, addr)) => {
+                tracing::trace!("UDP recv: {} bytes from {}", n, addr);
+                Ok(n)
+            }
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
@@ -44,5 +49,14 @@ impl UdpSocket {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+impl SocketTrait for UdpSocket {
+    fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {
+        UdpSocket::send_with_buf(self, payload, buf)
+    }
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        UdpSocket::recv(self, buf)
     }
 }

@@ -6,9 +6,8 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
-/// #13: Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
+/// Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
 const RING_SIZE: usize = 256;
-/// 4 data shards + 1 parity shard for 25% FEC overhead
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
 ///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
 ///   [2B * DATA_SHARDS shard_len_array]
@@ -50,6 +49,7 @@ impl VideoReceiver {
 
     fn check_stall(
         blocks: &mut [Option<RsBlock>; RING_SIZE],
+        processed_ring: &mut [Option<u32>; RING_SIZE],
         next_block: &mut Option<u32>,
         last_decode_time: &mut Instant,
         nal_buf: &mut Vec<u8>,
@@ -72,18 +72,12 @@ impl VideoReceiver {
                     nal_buf.clear();
                     *nal_started = false;
                 }
-                blocks[idx] = None;
-                // Jump to nearest available block in ring buffer
-                let mut next_seq = cur.wrapping_add(1);
-                for offset in 1..RING_SIZE {
-                    let check_seq = cur.wrapping_add(offset as u32);
-                    let check_idx = (check_seq as usize) % RING_SIZE;
-                    if blocks[check_idx].is_some() {
-                        next_seq = check_seq;
-                        break;
-                    }
+                // Clear ALL blocks and reset — full stall recovery
+                for i in 0..RING_SIZE {
+                    blocks[i] = None;
+                    processed_ring[i] = None;
                 }
-                *next_block = Some(next_seq);
+                *next_block = None;
                 *last_decode_time = Instant::now();
                 return true;
             }
@@ -95,10 +89,7 @@ impl VideoReceiver {
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 
-        // #13: Fixed-size ring buffer — O(1) zero-allocation lookups via seq % RING_SIZE
         let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
-        // #15: Ring buffer for processed sequence tracking — O(1) bitmap lookup
-        // Use Option<u32> so block_seq=0 isn't confused with empty slot
         let mut processed_ring: [Option<u32>; RING_SIZE] = [None; RING_SIZE];
         let mut next_block: Option<u32> = None;
         let mut last_decode_time = Instant::now();
@@ -119,6 +110,7 @@ impl VideoReceiver {
                     // No data buffered — check stall, then block until data arrives
                     Self::check_stall(
                         &mut blocks,
+                        &mut processed_ring,
                         &mut next_block,
                         &mut last_decode_time,
                         &mut nal_buf,
@@ -156,8 +148,6 @@ impl VideoReceiver {
             let total_shards = payload[5] as usize;
             let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
 
-            // Parse [u16; DATA_SHARDS] shard length array from this shard's header.
-            // Every shard (data + parity) carries the full shard_lens array.
             let mut parsed_shard_lens = [0usize; DATA_SHARDS];
             for i in 0..DATA_SHARDS {
                 let off = VIDEO_HDR_FIXED + i * 2;
@@ -178,7 +168,7 @@ impl VideoReceiver {
             }
             let shard_data = payload[DATA_START..].to_vec();
 
-            // #15: O(1) bitmap lookup — seq % RING_SIZE maps to slot
+            // O(1) dedup bitmap lookup
             let dedup_idx = (block_seq as usize) % RING_SIZE;
             if processed_ring[dedup_idx] == Some(block_seq) {
                 continue;
@@ -188,17 +178,16 @@ impl VideoReceiver {
                 next_block = Some(block_seq);
             }
 
-            // #13: O(1) ring buffer lookup — no HashMap allocation or hashing
             let idx = (block_seq as usize) % RING_SIZE;
 
             // Clear stale slot if it contains a different block_seq
             if let Some(ref existing) = blocks[idx] {
                 if existing.block_seq != block_seq {
                     blocks[idx] = None;
+                    processed_ring[idx] = None;
                 }
             }
 
-            // #13: Direct array access instead of HashMap entry API
             if blocks[idx].is_none() {
                 blocks[idx] = Some(RsBlock {
                     block_seq,
@@ -217,17 +206,9 @@ impl VideoReceiver {
             }
             block.shards[shard_index] = Some(shard_data);
 
-            // #13: Scan ring buffer for blocks with enough shards
-            let mut ready_slots: Vec<usize> = Vec::new();
-            for slot in 0..RING_SIZE {
-                if let Some(ref block) = blocks[slot] {
-                    if block.received >= DATA_SHARDS {
-                        ready_slots.push(slot);
-                    }
-                }
-            }
-            for slot in ready_slots {
-                let block = blocks[slot].take().unwrap();
+            // O(1) ready-block check: only check the specific block that just received a shard
+            if block.received >= DATA_SHARDS {
+                let block = blocks[idx].take().unwrap();
                 let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
                 if let Some(data_shards) = reconstructed {
                     fec_recovered += 1;
@@ -237,12 +218,12 @@ impl VideoReceiver {
                             fec_recovered, fec_dropped
                         );
                     }
-                    for (idx, shard_data) in data_shards
+                    for (sidx, shard_data) in data_shards
                         .iter()
                         .take(block.actual_data_shards)
                         .enumerate()
                     {
-                        let orig_len = block.shard_lens.get(idx).copied().unwrap_or(0);
+                        let orig_len = block.shard_lens.get(sidx).copied().unwrap_or(0);
                         let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
                             &shard_data[..orig_len]
                         } else {
@@ -252,7 +233,6 @@ impl VideoReceiver {
                             continue;
                         }
 
-                        // Fragment header: first byte is fragment type
                         let frag_type = trimmed[0];
                         let frag_data = &trimmed[1..];
 
@@ -266,25 +246,21 @@ impl VideoReceiver {
 
                         match frag_type {
                             0x00 => {
-                                // Complete NAL — send directly
                                 if let Err(e) = self.tx.send(frag_data.to_vec()) {
                                     warn!("Video frame channel closed: {}", e);
                                 }
                             }
                             0x01 => {
-                                // First fragment — reset buffer and mark started
                                 nal_buf.clear();
                                 nal_buf.extend_from_slice(frag_data);
                                 nal_started = true;
                             }
                             0x02 => {
-                                // Continuation — append only if we have a start
                                 if nal_started {
                                     nal_buf.extend_from_slice(frag_data);
                                 }
                             }
                             0x03 => {
-                                // Last fragment — send only if we have preceding parts
                                 if nal_started {
                                     nal_buf.extend_from_slice(frag_data);
                                     if let Err(e) = self.tx.send(nal_buf.clone()) {
@@ -298,8 +274,6 @@ impl VideoReceiver {
                         }
                     }
                     _block_count += 1;
-                    // #15: Mark as processed in O(1) bitmap
-                    let dedup_idx = (block_seq as usize) % RING_SIZE;
                     processed_ring[dedup_idx] = Some(block_seq);
                     if let Some(nb) = next_block {
                         if block_seq >= nb {
@@ -309,8 +283,6 @@ impl VideoReceiver {
                     last_decode_time = Instant::now();
                 } else {
                     fec_dropped += 1;
-                    // #15: Mark as processed in O(1) bitmap
-                    let dedup_idx = (block_seq as usize) % RING_SIZE;
                     processed_ring[dedup_idx] = Some(block_seq);
                     if nal_started {
                         nal_buf.clear();
@@ -326,13 +298,12 @@ impl VideoReceiver {
 
             Self::check_stall(
                 &mut blocks,
+                &mut processed_ring,
                 &mut next_block,
                 &mut last_decode_time,
                 &mut nal_buf,
                 &mut nal_started,
             );
-
-            // #15: Ring buffer handles cleanup automatically — no periodic retain needed
         }
     }
 }

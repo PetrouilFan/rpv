@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
-use crate::link;
-use crate::SocketTrait;
+use rpv_proto::link;
+use rpv_proto::socket_trait::SocketTrait;
 
 const RC_MIN: u16 = 1000;
 const RC_MID: u16 = 1500;
@@ -196,7 +196,7 @@ impl GamepadInput {
 }
 
 pub struct RCTx {
-    socket: Arc<dyn crate::SocketTrait>,
+    socket: Arc<dyn SocketTrait>,
     drone_id: u8,
     channels: Arc<arc_swap::ArcSwap<[u16; 16]>>,
     gamepad: Option<GamepadInput>,
@@ -206,7 +206,7 @@ pub struct RCTx {
 
 impl RCTx {
     pub fn new(
-        socket: Arc<dyn crate::SocketTrait>,
+        socket: Arc<dyn SocketTrait>,
         drone_id: u8,
         running: Arc<AtomicBool>,
     ) -> Self {

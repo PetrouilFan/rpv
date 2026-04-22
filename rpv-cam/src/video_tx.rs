@@ -12,8 +12,8 @@ use crate::VIDEO_HEALTHY;
 
 use reed_solomon_erasure::ReedSolomon;
 
-use crate::link;
-use crate::SocketTrait;
+use rpv_proto::link;
+use rpv_proto::socket_trait::SocketTrait;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -259,9 +259,7 @@ pub fn run(
         let mut last_stats = std::time::Instant::now();
         // #9: BytesMut ring buffer — O(1) advance instead of copy_within memory shifts
         let mut nal_buf = BytesMut::with_capacity(MAX_NAL_BUF);
-        let mut nal_idle_cycles: u32 = 0;
-        // #7: Lower threshold — 20 cycles instead of 200 (stuck encoder detection)
-        const NAL_IDLE_LIMIT: u32 = 20;
+        let _nal_idle_cycles: u32 = 0;
         // #4: NAL watchdog — if no NALs within 2x frame interval, mark unhealthy
         let nal_watchdog_interval = Duration::from_millis(2 * (1000 / framerate.max(1)) as u64);
         let mut last_nal_time = std::time::Instant::now();
@@ -517,7 +515,7 @@ fn send_fec_group_arena(
     fail_count: &mut u32,
     l2_frame_buf: &mut Vec<u8>,
     send_buf: &mut Vec<u8>,
-    video_payload_buf: &mut Vec<u8>,
+    _video_payload_buf: &mut Vec<u8>,
     hp_rx: &Option<crossbeam_channel::Receiver<Vec<u8>>>,
     fec_shards: &mut Vec<Vec<u8>>,
 ) -> Result<(), bool> {
