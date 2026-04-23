@@ -22,3 +22,4 @@ mavlink = { version = "0.17", features = ["common"] }
 serialport = { version = "4", default-features = false }
 memchr = "2"
 bytes = "1"
+arc-swap = "1"

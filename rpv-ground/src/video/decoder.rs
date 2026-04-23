@@ -1,16 +1,11 @@
-use std::ffi::CStr;
 use tracing::{error, info, warn};
 
 use ffmpeg_sys_next as ffi;
 
 // FFmpeg constants
 const AV_PIX_FMT_NV12: i32 = 23;
-const AV_CODEC_ID_H264: i32 = 27;
 const AVERROR_EOF: i32 = -0x5445_4f46; // FFERRTAG('E','O','F',' ')
 const AVERROR_EAGAIN: i32 = -11;
-
-/// Static CStr for H.264 codec name — avoids per-iteration CString allocation.
-static H264_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"h264\0") };
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -167,10 +162,38 @@ fn process_decoded_frame(
         }
     }
 
+    // Create output frames, transferring ownership of the YUV data
+    // without extra copying. We use Vec::from_raw_parts to take the existing
+    // allocation and leave a new buffer for reuse.
+    let y_data = {
+        let old_y = std::mem::replace(&mut *y_buf, Vec::new());
+        let ptr = old_y.as_ptr() as *mut u8;
+        let len = y_size;
+        let cap = old_y.capacity();
+        std::mem::forget(old_y);
+        unsafe { Vec::from_raw_parts(ptr, len, cap) }
+    };
+    let u_data = {
+        let old_u = std::mem::replace(&mut *u_buf, Vec::new());
+        let ptr = old_u.as_ptr() as *mut u8;
+        let len = uv_size;
+        let cap = old_u.capacity();
+        std::mem::forget(old_u);
+        unsafe { Vec::from_raw_parts(ptr, len, cap) }
+    };
+    let v_data = {
+        let old_v = std::mem::replace(&mut *v_buf, Vec::new());
+        let ptr = old_v.as_ptr() as *mut u8;
+        let len = uv_size;
+        let cap = old_v.capacity();
+        std::mem::forget(old_v);
+        unsafe { Vec::from_raw_parts(ptr, len, cap) }
+    };
+
     let decoded = DecodedFrame {
-        y_data: y_buf[..w * h].to_vec(),
-        u_data: u_buf[..uv_size].to_vec(),
-        v_data: v_buf[..uv_size].to_vec(),
+        y_data,
+        u_data,
+        v_data,
         width: fw as u32,
         height: fh as u32,
         send_ts_us: None,
@@ -178,6 +201,17 @@ fn process_decoded_frame(
     };
 
     let _ = frame_tx.try_send(decoded);
+
+    // Buffers are now empty. Restore capacity for next frame.
+    if y_buf.capacity() < y_size {
+        y_buf.reserve(y_size);
+    }
+    if u_buf.capacity() < uv_size {
+        u_buf.reserve(uv_size);
+    }
+    if v_buf.capacity() < uv_size {
+        v_buf.reserve(uv_size);
+    }
 
     *frame_count += 1;
     if *frame_count % 30 == 0 {
@@ -197,218 +231,166 @@ fn decode_loop_libavcodec(
         "libavcodec H.264 decoder initialized: {}x{} planar YUV",
         width, height
     );
+    let codec_name = std::ffi::CString::new("h264").unwrap();
+    let codec = unsafe { ffi::avcodec_find_decoder_by_name(codec_name.as_ptr() as *const _) };
+    if codec.is_null() {
+        error!("libavcodec: h264 decoder not found");
+        return;
+    }
+
+    let codec_ctx = unsafe { ffi::avcodec_alloc_context3(codec) };
+    if codec_ctx.is_null() {
+        error!("libavcodec: failed to alloc context");
+        return;
+    }
+    unsafe {
+        (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+        (*codec_ctx).thread_count = 1;
+        (*codec_ctx).thread_type = 0;
+    }
+
+    let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
+    if ret < 0 {
+        error!("libavcodec: failed to open h264 decoder (err {})", ret);
+        unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
+        return;
+    }
+
+    let pkt = unsafe { ffi::av_packet_alloc() };
+    let frame = unsafe { ffi::av_frame_alloc() };
+
+    info!(
+        "libavcodec H.264 decoder started: {}x{} planar YUV",
+        width, height
+    );
+
+    let mut frame_count: u64 = 0;
+    let mut nal_recv_count: u64 = 0;
+
+    let w = width as usize;
+    let h = height as usize;
+    let mut y_buf = vec![0u8; w * h];
+    let mut u_buf = vec![0u8; (w / 2) * (h / 2)];
+    let mut v_buf = vec![0u8; (w / 2) * (h / 2)];
 
     loop {
-        let codec = unsafe {
-            ffi::avcodec_find_decoder_by_name(H264_CSTR.as_ptr() as *const _)
-        };
-        if codec.is_null() {
-            error!("libavcodec: h264 decoder not found");
-            return;
-        }
-
-        let codec_ctx = unsafe { ffi::avcodec_alloc_context3(codec) };
-        if codec_ctx.is_null() {
-            error!("libavcodec: failed to alloc context");
-            return;
-        }
-
-        // Low-latency: disable B-frame reordering and frame threading
-        unsafe {
-            (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-            (*codec_ctx).thread_count = 1;
-            (*codec_ctx).thread_type = 0;
-        }
-
-        let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
-        if ret < 0 {
-            error!("libavcodec: failed to open h264 decoder (err {})", ret);
-            unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
-            return;
-        }
-
-        let mut parser = unsafe { ffi::av_parser_init(AV_CODEC_ID_H264) };
-        if parser.is_null() {
-            error!("libavcodec: failed to init H.264 parser");
-            unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
-            return;
-        }
-
-        let pkt = unsafe { ffi::av_packet_alloc() };
-        let frame = unsafe { ffi::av_frame_alloc() };
-
-        info!(
-            "libavcodec H.264 decoder started: {}x{} planar YUV",
-            width, height
-        );
-
-        let mut frame_count: u64 = 0;
-        let mut nal_recv_count: u64 = 0;
-
-        // Pre-allocate YUV buffers to avoid 3 allocations per frame at 30fps
-        let w = width as usize;
-        let h = height as usize;
-        let mut y_buf = vec![0u8; w * h];
-        let mut u_buf = vec![0u8; (w / 2) * (h / 2)];
-        let mut v_buf = vec![0u8; (w / 2) * (h / 2)];
-
-        'decode_loop: loop {
-            let nal_data = match rx.recv() {
-                Ok(d) => d,
-                Err(_) => {
-                    info!("Decoder input channel closed");
-                    break 'decode_loop;
-                }
-            };
-
-            nal_recv_count += 1;
-            if nal_recv_count <= 5 {
-                info!(
-                    "DECODER chunk #{}: {} bytes, first8={:02x?}",
-                    nal_recv_count,
-                    nal_data.len(),
-                    &nal_data[..8.min(nal_data.len())]
-                );
+        let mut nal_data = match rx.recv() {
+            Ok(d) => d,
+            Err(_) => {
+                info!("Decoder input channel closed");
+                break;
             }
+        };
 
-            let mut parse_offset = 0usize;
-            while parse_offset < nal_data.len() {
-                let mut out_buf: *mut u8 = std::ptr::null_mut();
-                let mut out_size: i32 = 0;
+        let mut nal_start = 0usize;
+        for i in 0..nal_data.len().saturating_sub(3) {
+            if nal_data[i] == 0x00 && nal_data[i + 1] == 0x00 {
+                if i + 2 < nal_data.len() && nal_data[i + 2] == 0x01 {
+                    nal_start = i;
+                    break;
+                } else if i + 3 < nal_data.len()
+                    && nal_data[i + 2] == 0x00
+                    && nal_data[i + 3] == 0x01
+                {
+                    nal_start = i;
+                    break;
+                }
+            }
+        }
+        if nal_start > 0 {
+            nal_data = nal_data[nal_start..].to_vec();
+        }
 
-                let consumed = unsafe {
-                    ffi::av_parser_parse2(
-                        parser,
-                        codec_ctx,
-                        &mut out_buf,
-                        &mut out_size,
-                        nal_data[parse_offset..].as_ptr(),
-                        (nal_data.len() - parse_offset) as i32,
-                        ffi::AV_NOPTS_VALUE as _,
-                        ffi::AV_NOPTS_VALUE as _,
-                        -1,
-                    )
-                };
+        nal_recv_count += 1;
+        if nal_recv_count <= 5 {
+            info!(
+                "DECODER chunk #{}: {} bytes, first8={:02x?}",
+                nal_recv_count,
+                nal_data.len(),
+                &nal_data[..8.min(nal_data.len())]
+            );
+        }
 
-                if nal_recv_count <= 5 && (consumed != 0 || out_size != 0) {
-                    info!(
-                        "PARSE: consumed={}, out_size={}, in_len={}",
-                        consumed,
-                        out_size,
-                        nal_data.len() - parse_offset
+        unsafe {
+            ffi::av_packet_unref(pkt);
+            ffi::av_new_packet(pkt, nal_data.len() as i32);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(nal_data.as_ptr(), (*pkt).data, nal_data.len());
+            (*pkt).size = nal_data.len() as i32;
+        }
+
+        let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
+        if send_ret < 0 {
+            if send_ret == AVERROR_EAGAIN {
+                loop {
+                    let r = unsafe { ffi::avcodec_receive_frame(codec_ctx, frame) };
+                    if r == AVERROR_EAGAIN || r == AVERROR_EOF || r < 0 {
+                        break;
+                    }
+                    process_decoded_frame(
+                        frame,
+                        &frame_tx,
+                        width,
+                        height,
+                        &mut frame_count,
+                        &mut y_buf,
+                        &mut u_buf,
+                        &mut v_buf,
                     );
-                }
-
-                if consumed < 0 {
-                    warn!("libavcodec: parser error {:#010x}, resetting", consumed);
-                    unsafe { ffi::av_parser_close(parser) };
-                    parser = unsafe { ffi::av_parser_init(AV_CODEC_ID_H264) };
-                    if parser.is_null() {
-                        error!("libavcodec: failed to re-init parser");
-                        break 'decode_loop;
-                    }
-                    break;
-                }
-
-                if consumed == 0 && out_size == 0 {
-                    // Parser needs more data
-                    break;
-                }
-
-                parse_offset += consumed as usize;
-
-                if out_size > 0 && !out_buf.is_null() {
                     unsafe {
-                        (*pkt).data = out_buf;
-                        (*pkt).size = out_size;
+                        ffi::av_frame_unref(frame);
                     }
-
-                    if nal_recv_count <= 5 {
-                        info!(
-                            "SEND pkt: size={}, out_buf_null={}",
-                            out_size,
-                            out_buf.is_null()
-                        );
-                    }
-
-                    let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
-                    if send_ret < 0 {
-                        if send_ret == AVERROR_EAGAIN {
-                            // Drain frames, then retry
-                            loop {
-                                let r = unsafe { ffi::avcodec_receive_frame(codec_ctx, frame) };
-                                if r == AVERROR_EAGAIN || r == AVERROR_EOF || r < 0 {
-                                    break;
-                                }
-                                process_decoded_frame(
-                                    frame,
-                                    &frame_tx,
-                                    width,
-                                    height,
-                                    &mut frame_count,
-                                    &mut y_buf,
-                                    &mut u_buf,
-                                    &mut v_buf,
-                                );
-                            }
-                            let retry = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
-                            if retry < 0 {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-
-                    // Drain decoded frames
-                    loop {
-                        let recv_ret = unsafe { ffi::avcodec_receive_frame(codec_ctx, frame) };
-                        if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
-                            break;
-                        }
-                        if recv_ret < 0 {
-                            warn!("libavcodec: receive_frame error {}", recv_ret);
-                            break;
-                        }
-                        if nal_recv_count <= 5 {
-                            info!(
-                                "RECV frame: ret={}, width={}, height={}",
-                                recv_ret,
-                                unsafe { (*frame).width },
-                                unsafe { (*frame).height }
-                            );
-                        }
-                        process_decoded_frame(
-                            frame,
-                            &frame_tx,
-                            width,
-                            height,
-                            &mut frame_count,
-                            &mut y_buf,
-                            &mut u_buf,
-                            &mut v_buf,
-                        );
-                    }
-
+                }
+                let retry = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
+                if retry < 0 {
                     unsafe {
                         ffi::av_packet_unref(pkt);
                     }
+                    continue;
                 }
+            } else {
+                unsafe {
+                    ffi::av_packet_unref(pkt);
+                }
+                continue;
             }
         }
 
-        // Cleanup and restart
-        unsafe {
-            ffi::av_parser_close(parser);
-            ffi::avcodec_free_context(&mut { codec_ctx });
-            ffi::av_packet_free(&mut { pkt });
-            ffi::av_frame_free(&mut { frame });
+        loop {
+            let recv_ret = unsafe { ffi::avcodec_receive_frame(codec_ctx, frame) };
+            if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
+                break;
+            }
+            if recv_ret < 0 {
+                warn!("libavcodec: receive_frame error {}", recv_ret);
+                break;
+            }
+            process_decoded_frame(
+                frame,
+                &frame_tx,
+                width,
+                height,
+                &mut frame_count,
+                &mut y_buf,
+                &mut u_buf,
+                &mut v_buf,
+            );
+            unsafe {
+                ffi::av_frame_unref(frame);
+            }
         }
 
-        info!(
-            "libavcodec decoder stopped after {} frames, restarting...",
-            frame_count
-        );
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        unsafe {
+            ffi::av_packet_unref(pkt);
+        }
     }
+
+    unsafe {
+        ffi::avcodec_free_context(&mut { codec_ctx });
+        ffi::av_packet_free(&mut { pkt });
+        ffi::av_frame_free(&mut { frame });
+    }
+
+    info!("libavcodec decoder stopped after {} frames", frame_count);
 }

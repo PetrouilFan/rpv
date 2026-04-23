@@ -37,7 +37,11 @@ impl Config {
             match toml::from_str(&data) {
                 Ok(cfg) => (cfg, false),
                 Err(e) => {
-                    tracing::warn!("Config parse error in {}: {}, using defaults", config_path.display(), e);
+                    tracing::warn!(
+                        "Config parse error in {}: {}, using defaults",
+                        config_path.display(),
+                        e
+                    );
                     (Self::default(), true)
                 }
             }

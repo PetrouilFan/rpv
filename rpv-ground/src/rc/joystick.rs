@@ -205,11 +205,7 @@ pub struct RCTx {
 }
 
 impl RCTx {
-    pub fn new(
-        socket: Arc<dyn SocketTrait>,
-        drone_id: u8,
-        running: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(socket: Arc<dyn SocketTrait>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
         let gamepad = GamepadInput::auto_detect();
 
         if gamepad.is_some() {

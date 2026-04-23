@@ -83,36 +83,47 @@ fn main() {
 
     let is_udp = cfg.common.transport == "udp";
 
+    // Pre-declare peer_addr so it's in scope for UdpSocket::new below
+    let peer_addr: std::sync::Arc<arc_swap::ArcSwap<Option<std::net::SocketAddr>>> =
+        std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
+
     // UDP mode: separate sockets for discovery (port 9002) and data (port 9001)
     let socket: Arc<dyn SocketTrait> = if is_udp {
         write_link_status("searching");
 
-        let (_discovery, peer_addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to start discovery: {}", e);
+        if let Some(ref peer) = cfg.common.peer_addr {
+            // Use pre-configured peer address, skip discovery
+            let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| {
+                tracing::error!("Invalid peer_addr '{}': {}", peer, e);
                 std::process::exit(1);
             });
-
-        // Wait for ground station to discover us
-        let mut waited = Duration::ZERO;
-        let wait_timeout = Duration::from_secs(30);
-        while peer_addr.load().is_none() && waited < wait_timeout {
-            thread::sleep(Duration::from_millis(200));
-            waited += Duration::from_millis(200);
-            if (waited.as_millis() as u64) % 2000 < 200 {
-                tracing::info!(
-                    "Waiting for ground station... ({}s elapsed)",
-                    waited.as_secs()
-                );
-            }
-        }
-
-        if peer_addr.load().is_none() {
-            tracing::warn!("No ground station discovered after {}s — continuing anyway, will connect when found", wait_timeout.as_secs());
+            tracing::info!("Using configured peer address: {}", addr);
+            peer_addr.store(std::sync::Arc::new(Some(addr)));
         } else {
-            let addr = peer_addr.load();
-            tracing::info!("Ground station discovered at {}", addr.as_ref().unwrap());
-            write_link_status("connected");
+            let (_disc, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
+                .unwrap_or_else(|e| {
+                    tracing::error!("Failed to start discovery: {}", e);
+                    std::process::exit(1);
+                });
+
+            // Wait for ground station to discover us
+            let mut waited = Duration::ZERO;
+            let wait_timeout = Duration::from_secs(30);
+            while addr.load().is_none() && waited < wait_timeout {
+                thread::sleep(Duration::from_millis(200));
+                waited += Duration::from_millis(200);
+                if (waited.as_millis() as u64) % 2000 < 200 {
+                    tracing::info!("Waiting for ground station... ({}s elapsed)", waited.as_secs());
+                }
+            }
+
+            if addr.load().is_none() {
+                tracing::warn!("No ground station discovered after {}s — continuing anyway, will connect when found", wait_timeout.as_secs());
+            } else {
+                tracing::info!("Ground station discovered at {}", addr.load().as_ref().unwrap());
+                write_link_status("connected");
+            }
+            peer_addr.store(Arc::clone(&*addr.load()));
         }
 
         let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", cfg.common.udp_port))
@@ -272,8 +283,8 @@ fn main() {
                         }
                         l2_seq = l2_seq.wrapping_add(1);
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
             }
             tracing::info!("MAVLink forwarder thread exiting");
@@ -302,8 +313,8 @@ fn rx_dispatcher(
     socket: Arc<dyn SocketTrait>,
     drone_id: u8,
     last_heartbeat: Arc<AtomicU64>,
-    rc_tx: Option<std::sync::mpsc::SyncSender<Vec<u16>>>,
-    raw_uplink_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    rc_tx: Option<crossbeam_channel::Sender<Vec<u16>>>,
+    raw_uplink_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
 ) {
     tracing::info!("RX dispatcher started");
     let mut buf = vec![0u8; 65536];
@@ -449,8 +460,24 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<AtomicU64>) {
 
 /// Check camera via sysfs (single stat() syscall, no subprocess spawn)
 fn check_camera_available() -> bool {
-    std::fs::read_dir("/dev/v4l")
+    // /dev/v4l/by-id or /dev/v4l/by-path may contain symlinks on some systems
+    let v4l_ok = std::fs::read_dir("/dev/v4l")
         .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if v4l_ok {
+        return true;
+    }
+    // Fallback: check for /dev/video* devices (standard V4L2)
+    std::fs::read_dir("/dev")
+        .map(|entries| {
+            entries.filter_map(|e| e.ok())
+                .any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|s| s.starts_with("video"))
+                        .unwrap_or(false)
+                })
+        })
         .unwrap_or(false)
 }
 
@@ -458,7 +485,7 @@ fn telemetry_sender(
     running: Arc<AtomicBool>,
     _socket: Arc<dyn SocketTrait>,
     drone_id: u8,
-    fc_telem_rx: Option<std::sync::mpsc::Receiver<fc::FcTelemetry>>,
+    fc_telem_rx: Option<crossbeam_channel::Receiver<fc::FcTelemetry>>,
     hp_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) {
     let has_fc = fc_telem_rx.is_some();

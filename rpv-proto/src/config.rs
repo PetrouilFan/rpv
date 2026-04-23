@@ -19,6 +19,9 @@ pub struct CommonConfig {
     pub video_width: u32,
     #[serde(default = "default_video_height")]
     pub video_height: u32,
+    /// Pre-configured peer address (IP:port). If set, skip discovery and use this directly.
+    #[serde(default)]
+    pub peer_addr: Option<String>,
 }
 
 fn default_interface() -> String {
@@ -57,6 +60,7 @@ impl Default for CommonConfig {
             ap_channel: default_ap_channel(),
             video_width: default_video_width(),
             video_height: default_video_height(),
+            peer_addr: None,
         }
     }
 }

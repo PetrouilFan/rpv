@@ -12,8 +12,8 @@ use crate::VIDEO_HEALTHY;
 
 use reed_solomon_erasure::ReedSolomon;
 
-use rpv_proto::link;
-use rpv_proto::socket_trait::SocketTrait;
+use crate::link;
+use crate::SocketTrait;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -307,24 +307,9 @@ pub fn run(
                             None => break,
                         };
                         nal_buf.advance(consumed);
-                        total_nals += 1;
-                        VIDEO_HEALTHY.store(true, Ordering::Relaxed);
-                        last_nal_time = std::time::Instant::now();
-
-                        if last_stats.elapsed().as_secs() >= 5 {
-                            tracing::info!(
-                                "Video stats: {:.1} MB, {} NALs, {} FEC groups in {}s",
-                                total_bytes as f64 / 1_048_576.0,
-                                total_nals,
-                                total_groups,
-                                last_stats.elapsed().as_secs(),
-                            );
-                            last_stats = std::time::Instant::now();
-                        }
-
-                        // Prepend H.264 start code so the decoder can parse NAL boundaries
-                        let nal_with_sc: Vec<u8> =
-                            [NAL_START_CODE.as_ref(), nal_data.as_slice()].concat();
+                        
+                        // nal_data already has start code from extract_next_nal_cursor()
+                        let nal_with_sc = nal_data.clone();
 
                         // Send NAL with fragment header: [type:1][data...]
                         // type 0 = fits in one shard, type 1 = first fragment,

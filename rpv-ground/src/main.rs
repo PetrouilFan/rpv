@@ -81,22 +81,23 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 @group(0) @binding(2) var t_v: texture_2d<f32>;
 @group(0) @binding(3) var s: sampler;
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
-    let u_val = textureSample(t_u, s, in.uv).r * 255.0 - 128.0;
-    let v_val = textureSample(t_v, s, in.uv).r * 255.0 - 128.0;
-    // BT.709 YCbCr -> RGB
-    let r = (298.0 * y_val + 459.0 * v_val + 128.0) / 256.0;
-    let g = (298.0 * y_val - 55.0 * u_val - 137.0 * v_val + 128.0) / 256.0;
-    let b = (298.0 * y_val + 541.0 * u_val + 128.0) / 256.0;
-    return vec4<f32>(
-        clamp(r / 255.0, 0.0, 1.0),
-        clamp(g / 255.0, 0.0, 1.0),
-        clamp(b / 255.0, 0.0, 1.0),
-        1.0
-    );
-}
+    @fragment
+    fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+        let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
+        let u_val = textureSample(t_u, s, in.uv).r * 255.0 - 128.0;
+        let v_val = textureSample(t_v, s, in.uv).r * 255.0 - 128.0;
+        // BT.601 YCbCr (limited range) -> RGB
+        // Standard coefficients with U/V correctly assigned
+        let r = (298.0 * y_val + 409.0 * v_val + 128.0) / 256.0;
+        let g = (298.0 * y_val - 100.0 * u_val - 208.0 * v_val + 128.0) / 256.0;
+        let b = (298.0 * y_val + 516.0 * u_val + 128.0) / 256.0;
+        return vec4<f32>(
+            clamp(r / 255.0, 0.0, 1.0),
+            clamp(g / 255.0, 0.0, 1.0),
+            clamp(b / 255.0, 0.0, 1.0),
+            1.0
+        );
+    }
 ";
 
 /// GPU resources for planar YUV→RGB rendering.
@@ -467,7 +468,10 @@ impl RpvApp {
 
         if recv_count > 0 {
             if self.yuv_gpu.is_none() {
-                tracing::warn!("process_frames: received {} frames but GPU resources NOT initialized", recv_count);
+                tracing::warn!(
+                    "process_frames: received {} frames but GPU resources NOT initialized",
+                    recv_count
+                );
             }
         }
 
@@ -864,7 +868,10 @@ fn main() -> Result<(), eframe::Error> {
 
     let (config, was_default) = Config::load();
     tracing::info!("Config: {:?}", config);
-    tracing::info!("rpv ground station starting ({} mode)", config.common.transport);
+    tracing::info!(
+        "rpv ground station starting ({} mode)",
+        config.common.transport
+    );
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -878,12 +885,11 @@ fn main() -> Result<(), eframe::Error> {
 
     let socket: Arc<dyn SocketTrait> = if is_udp {
         let (_discovery, peer_addr) =
-            discovery::Discovery::spawn(0x02, config.common.drone_id, config.common.udp_port).unwrap_or_else(
-                |e| {
+            discovery::Discovery::spawn(0x02, config.common.drone_id, config.common.udp_port)
+                .unwrap_or_else(|e| {
                     tracing::error!("Failed to start discovery: {}", e);
                     std::process::exit(1);
-                },
-            );
+                });
 
         let mut waited = std::time::Duration::ZERO;
         let wait_timeout = std::time::Duration::from_secs(30);
@@ -927,11 +933,18 @@ fn main() -> Result<(), eframe::Error> {
     } else {
         match RawSocket::new(&config.common.interface) {
             Ok(s) => {
-                tracing::info!("Raw socket bound to {} (monitor mode)", config.common.interface);
+                tracing::info!(
+                    "Raw socket bound to {} (monitor mode)",
+                    config.common.interface
+                );
                 Arc::new(s)
             }
             Err(e) => {
-                tracing::error!("Failed to open raw socket on {}: {}", config.common.interface, e);
+                tracing::error!(
+                    "Failed to open raw socket on {}: {}",
+                    config.common.interface,
+                    e
+                );
                 std::process::exit(1);
             }
         }

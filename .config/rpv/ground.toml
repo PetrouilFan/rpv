@@ -1,5 +1,5 @@
 transport = "udp"
-interface = "wlp0s20f0u2"
+interface = "wlp3s0f0u10"
 drone_id = 0
 udp_port = 9001
 ap_ssid = "rpv-link"

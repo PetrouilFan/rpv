@@ -7,7 +7,7 @@ const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 /// Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
-const RING_SIZE: usize = 256;
+const RING_SIZE: usize = 128;
 /// Video header layout (8 + 2*DATA_SHARDS bytes):
 ///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
 ///   [2B * DATA_SHARDS shard_len_array]
@@ -97,7 +97,7 @@ impl VideoReceiver {
         let mut fec_recovered: u64 = 0;
         let mut fec_dropped: u64 = 0;
         let mut payload_count: u64 = 0;
-        let mut nal_buf: Vec<u8> = Vec::with_capacity(65536);
+        let mut nal_buf: Vec<u8> = Vec::with_capacity(32768);
         let mut nal_started: bool = false;
 
         info!("VideoReceiver loop starting");
@@ -246,6 +246,13 @@ impl VideoReceiver {
 
                         match frag_type {
                             0x00 => {
+                                if frag_data.len() > 8 {
+                                    tracing::debug!(
+                                        "NAL single: len={}, first8={:02x?}",
+                                        frag_data.len(),
+                                        &frag_data[..8.min(frag_data.len())]
+                                    );
+                                }
                                 if let Err(e) = self.tx.send(frag_data.to_vec()) {
                                     warn!("Video frame channel closed: {}", e);
                                 }

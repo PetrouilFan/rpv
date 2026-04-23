@@ -73,6 +73,12 @@ impl TelemetryReceiver {
                 Ok(payload) => {
                     // #3: Use from_slice directly — faster, no UTF-8 intermediate check
                     if let Ok(telem) = serde_json::from_slice::<Telemetry>(&payload) {
+                        if !telem.camera_ok {
+                            tracing::debug!(
+                                "Telemetry camera_ok=false: {:?}",
+                                String::from_utf8_lossy(&payload).chars().take(100)
+                            );
+                        }
                         self.state.store(Arc::new(telem));
                         self.link_state.telemetry_activity();
                     }
