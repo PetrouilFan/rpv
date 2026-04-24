@@ -236,11 +236,15 @@ impl VideoReceiver {
                         let frag_type = trimmed[0];
                         let frag_data = &trimmed[1..];
 
-                        if fec_recovered <= 5 {
+                        // Compute checksum for data integrity verification
+                        let checksum: u32 = frag_data.iter().fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
+                        
+                        if fec_recovered <= 3 {
+                            let nalu_type = if frag_data.len() >= 5 { frag_data[4] & 0x1F } else { 99 };
                             info!(
-                                "FRAG #{} (seq={}): type={}, data_len={}, nal_buf_len={}, first4={:02x?}",
-                                fec_recovered, block.block_seq, frag_type, frag_data.len(), nal_buf.len(),
-                                &frag_data[..4.min(frag_data.len())]
+                                "NAL: seq={}, type=0x{:02x}, H264_nalu_type={}, len={}, checksum={:08x}, first5={:02x?}",
+                                block.block_seq, frag_type, nalu_type, frag_data.len(), checksum,
+                                &frag_data[..5.min(frag_data.len())]
                             );
                         }
 
