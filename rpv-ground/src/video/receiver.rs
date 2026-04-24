@@ -1,245 +1,298 @@
-use std::collections::HashMap;
-use std::os::unix::io::AsRawFd;
-use std::time::Instant;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
-
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use rpv_proto::link;
 
-const DATA_SHARDS: usize = 2;
-const PARITY_SHARDS: usize = 1;
+const DATA_SHARDS: usize = 4;
+const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+const RING_SIZE: usize = 128;
+const VIDEO_HDR_FIXED: usize = 8;
+const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
+const DATA_START: usize = VIDEO_HDR_LEN;
 
-#[derive(Clone)]
-pub struct VideoFrame {
-    pub data: Vec<u8>,
-    pub send_ts_us: Option<u64>,
-    pub recv_time: Instant,
-}
+const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 struct RsBlock {
+    block_seq: u32,
     shards: Vec<Option<Vec<u8>>>,
     shard_sizes: Vec<usize>,
     received: usize,
     actual_data_shards: usize,
-    first_recv: Instant,
+    shard_lens: [usize; DATA_SHARDS],
+}
+
+struct CompletedBlock {
+    block_seq: u32,
+    data_shards: Vec<Vec<u8>>,
+    shard_lens: [usize; DATA_SHARDS],
 }
 
 pub struct VideoReceiver {
-    tx: mpsc::Sender<VideoFrame>,
-    port: u16,
-    cam_ip: std::sync::Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+    tx: crossbeam_channel::Sender<Vec<u8>>,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
 }
 
 impl VideoReceiver {
-    pub async fn new(
-        port: u16,
-        tx: mpsc::Sender<VideoFrame>,
-        cam_ip: std::sync::Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
-    ) -> std::io::Result<Self> {
+    pub fn new(
+        tx: crossbeam_channel::Sender<Vec<u8>>,
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+    ) -> Self {
         info!(
-            "Video receiver (RS {}+{}) ready on port {}",
-            DATA_SHARDS,
-            PARITY_SHARDS,
-            port
+            "Video receiver (RS {}+{}) ready (strict in-order release)",
+            DATA_SHARDS, PARITY_SHARDS
         );
-        Ok(Self { tx, port, cam_ip })
+        Self { tx, rx }
     }
 
-    pub async fn run(&self) {
-        let bind_addr = format!("0.0.0.0:{}", self.port);
-        let socket = match UdpSocket::bind(&bind_addr).await {
-            Ok(s) => {
-                let fd = s.as_raw_fd();
-                let rcvbuf: libc::c_int = 4 * 1024 * 1024;
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_RCVBUF,
-                        &rcvbuf as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    );
-                }
-                s
-            }
-            Err(e) => {
-                warn!("Failed to bind video socket on {}: {}", bind_addr, e);
-                return;
-            }
-        };
-        info!("Video receiver listening on {}", bind_addr);
+    #[inline]
+    fn is_future_block(block_seq: u32, next_block: u32) -> bool {
+        block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
+    }
 
+    fn emit_block(&self, block: &CompletedBlock, fec_recovered: &mut u64) {
+        let mut nal_buf: Vec<u8> = Vec::with_capacity(32768);
+        let mut nal_started = false;
+
+        for (sidx, shard_data) in block.data_shards.iter().enumerate() {
+            let orig_len = block.shard_lens.get(sidx).copied().unwrap_or(0);
+            let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
+                &shard_data[..orig_len]
+            } else {
+                shard_data.as_slice()
+            };
+            if trimmed.is_empty() || trimmed.len() < 2 {
+                continue;
+            }
+
+            let frag_type = trimmed[0];
+            let frag_data = &trimmed[1..];
+
+            if *fec_recovered < 3 {
+                let nalu_type = if frag_data.len() >= 5
+                    && frag_data[0] == 0x00 && frag_data[1] == 0x00
+                    && frag_data[2] == 0x00 && frag_data[3] == 0x01
+                {
+                    Some(frag_data[4] & 0x1F)
+                } else if frag_data.len() >= 4
+                    && frag_data[0] == 0x00 && frag_data[1] == 0x00
+                    && frag_data[2] == 0x01
+                {
+                    Some(frag_data[3] & 0x1F)
+                } else {
+                    None
+                };
+                info!(
+                    "NAL: seq={}, sidx={}, frag_type=0x{:02x}, NAL_type={:?}, len={}",
+                    block.block_seq, sidx, frag_type, nalu_type, frag_data.len()
+                );
+            }
+
+            match frag_type {
+                0x00 => {
+                    *fec_recovered += 1;
+                    if let Err(e) = self.tx.send(frag_data.to_vec()) {
+                        warn!("Video frame channel closed: {}", e);
+                    }
+                }
+                0x01 => {
+                    nal_buf.clear();
+                    nal_buf.extend_from_slice(frag_data);
+                    nal_started = true;
+                }
+                0x02 => {
+                    if nal_started {
+                        nal_buf.extend_from_slice(frag_data);
+                    }
+                }
+                0x03 => {
+                    if nal_started {
+                        nal_buf.extend_from_slice(frag_data);
+                        if let Err(e) = self.tx.send(nal_buf.clone()) {
+                            warn!("Video frame channel closed: {}", e);
+                        }
+                        nal_buf.clear();
+                        nal_started = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn drain_completed(
+        &self,
+        completed: &mut [Option<CompletedBlock>; RING_SIZE],
+        next_block: &mut u32,
+        fec_recovered: &mut u64,
+    ) {
+        loop {
+            let idx = (*next_block as usize) % RING_SIZE;
+            if let Some(block) = completed[idx].take() {
+                self.emit_block(&block, fec_recovered);
+                *next_block = next_block.wrapping_add(1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn run(&self) {
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 
-        let mut buf = vec![0u8; 65536];
-        let mut blocks: HashMap<u32, RsBlock> = HashMap::new();
-        let mut next_block: Option<u32> = None;
+        let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
+        let mut completed: [Option<CompletedBlock>; RING_SIZE] = std::array::from_fn(|_| None);
+        let mut processed_ring: [Option<u32>; RING_SIZE] = std::array::from_fn(|_| None);
+        let mut next_block: u32 = 0;
+        let mut next_block_init = false;
         let mut last_decode_time = Instant::now();
-        let mut block_count: u64 = 0;
+        let mut fec_recovered: u64 = 0;
+        let mut fec_dropped: u64 = 0;
+        let mut payload_count: u64 = 0;
 
-        // FU-A reassembly state
-        let mut nal_buf: Vec<u8> = Vec::new();
-        let mut nal_started = false;
+        info!("VideoReceiver loop starting (strict in-order)");
 
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, src)) => {
-                    // Enforce source IP filter
-                    {
-                        let guard = self.cam_ip.lock().unwrap();
-                        if let Some(allowed_ip) = *guard {
-                            if allowed_ip != src.ip() {
-                                continue;
-                            }
-                        }
-                    }
-                    let recv_time = Instant::now();
-
-                    // Header: [4B seq][1B shard_index][1B total_shards][1B data_shards][1B pad][2B shard_len] = 10 bytes
-                    if len < 10 {
-                        continue;
-                    }
-
-                    let block_seq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                    let shard_index = buf[4] as usize;
-                    let total_shards = buf[5] as usize;
-                    let actual_data_shards = buf[6] as usize;
-                    let shard_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
-
-                    if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
-                        warn!(
-                            "RS: invalid shard idx={} total={}",
-                            shard_index, total_shards
-                        );
-                        continue;
-                    }
-
-                    let payload_start = 10;
-                    let payload_end = payload_start + shard_len;
-                    if payload_end > len {
-                        continue;
-                    }
-                    let payload = buf[payload_start..payload_end].to_vec();
-
-                    // Initialize next_block if needed
-                    if next_block.is_none() {
-                        next_block = Some(block_seq);
-                    } else if let Some(current) = next_block {
-                        let gap = current.wrapping_sub(block_seq);
-                        if gap > 1000 {
-                            info!(
-                                "RS: camera restarted, seq reset {} -> {}",
-                                current, block_seq
+            let payload = match self.rx.try_recv() {
+                Ok(p) => p,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if next_block_init && last_decode_time.elapsed() > STALL_TIMEOUT {
+                        let idx = (next_block as usize) % RING_SIZE;
+                        if let Some(ref block) = blocks[idx] {
+                            warn!(
+                                "RS: block {} stalled (had {}/{} shards), dropping",
+                                next_block, block.received, DATA_SHARDS
                             );
-                            next_block = Some(block_seq);
-                            blocks.clear();
-                            nal_buf.clear();
-                            nal_started = false;
                         }
+                        blocks[idx] = None;
+                        processed_ring[idx] = None;
+                        next_block = next_block.wrapping_add(1);
+                        fec_dropped += 1;
                     }
 
-                    // Clean up old blocks
-                    if let Some(current) = next_block {
-                        blocks.retain(|&k, _| {
-                            let age = current.wrapping_sub(k);
-                            age == 0 || (k.wrapping_sub(current) < 4 && age < 8)
-                        });
-                    }
-
-                    let block = blocks.entry(block_seq).or_insert_with(|| RsBlock {
-                        shards: vec![None; TOTAL_SHARDS],
-                        shard_sizes: vec![0; TOTAL_SHARDS],
-                        received: 0,
-                        actual_data_shards: actual_data_shards,
-                        first_recv: recv_time,
-                    });
-
-                    if block.shards[shard_index].is_none() {
-                        block.received += 1;
-                        block.shard_sizes[shard_index] = shard_len;
-                    }
-                    block.shards[shard_index] = Some(payload);
-
-                    // Try to reconstruct and send immediately
-                    if let Some(current_seq) = next_block {
-                        if block_seq == current_seq {
-                            let block = blocks.get(&block_seq).unwrap();
-                            if block.received >= DATA_SHARDS {
-                                // Enough shards received, attempt RS reconstruction
-                                let reconstructed = reconstruct_rs_block(&rs, block, block.actual_data_shards);
-                                if let Some(data_shards) = reconstructed {
-                                    // Process shards: FU-A reassembly
-                                    for shard_data in data_shards.iter().take(block.actual_data_shards) {
-                                        if shard_data.is_empty() {
-                                            continue;
-                                        }
-                                        let frag_index = shard_data[0];
-                                        let frag_payload = &shard_data[1..];
-
-                                        if frag_index == 0 {
-                                            // Start of a new NALU
-                                            if nal_started && !nal_buf.is_empty() {
-                                                // Flush previous NALU
-                                                let frame = VideoFrame {
-                                                    data: std::mem::take(&mut nal_buf),
-                                                    send_ts_us: None,
-                                                    recv_time: block.first_recv,
-                                                };
-                                                if let Err(e) = self.tx.try_send(frame) {
-                                                    if block_count % 60 == 0 {
-                                                        warn!(
-                                                            "Video frame channel full, dropping: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                                block_count += 1;
-                                            }
-                                            nal_buf.clear();
-                                            nal_buf.extend_from_slice(&[0, 0, 0, 1]); // Annex-B start code
-                                            nal_buf.extend_from_slice(frag_payload);
-                                            nal_started = true;
-                                        } else if nal_started {
-                                            // Continuation fragment
-                                            nal_buf.extend_from_slice(frag_payload);
-                                        }
-                                        // If !nal_started and frag_index != 0, discard orphan fragment
-                                    }
-                                } else {
-                                    // FEC reconstruction failed - drop entire NALU
-                                    if nal_started {
-                                        nal_buf.clear();
-                                        nal_started = false;
-                                    }
-                                }
-
-                                blocks.remove(&block_seq);
-                                next_block = Some(current_seq.wrapping_add(1));
-                                last_decode_time = Instant::now();
-                            } else if last_decode_time.elapsed().as_millis() > 50 {
-                                // Stall timeout - drop block
-                                warn!(
-                                    "RS: block {} stalled (had {}/{} shards), dropping",
-                                    current_seq, block.received, DATA_SHARDS
-                                );
-                                // Drop entire NALU if we were accumulating
-                                if nal_started {
-                                    nal_buf.clear();
-                                    nal_started = false;
-                                }
-                                blocks.remove(&block_seq);
-                                next_block = Some(current_seq.wrapping_add(1));
-                                last_decode_time = Instant::now();
-                            }
+                    match self.rx.recv() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            info!("Video payload channel closed");
+                            return;
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Video receive error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    info!("Video payload channel closed");
+                    return;
+                }
+            };
+
+            let l2_header_size = if payload.len() >= 2 && payload[0..2] == link::MAGIC {
+                8
+            } else {
+                0
+            };
+
+            let actual_payload = if l2_header_size > 0 {
+                if payload.len() <= l2_header_size {
+                    continue;
+                }
+                &payload[l2_header_size..]
+            } else {
+                &payload[..]
+            };
+
+            if actual_payload.len() < VIDEO_HDR_LEN {
+                continue;
+            }
+
+            payload_count += 1;
+            if payload_count % 1000 == 0 {
+                info!(
+                    "VideoReceiver: {} payloads, recovered={}, dropped={}, next={}",
+                    payload_count, fec_recovered, fec_dropped, next_block
+                );
+            }
+
+            let block_seq = u32::from_le_bytes([
+                actual_payload[0],
+                actual_payload[1],
+                actual_payload[2],
+                actual_payload[3],
+            ]);
+            let shard_index = actual_payload[4] as usize;
+            let total_shards = actual_payload[5] as usize;
+            let actual_data_shards = (actual_payload[6] as usize).min(DATA_SHARDS);
+
+            let mut parsed_shard_lens = [0usize; DATA_SHARDS];
+            for i in 0..DATA_SHARDS {
+                let off = VIDEO_HDR_FIXED + i * 2;
+                parsed_shard_lens[i] =
+                    u16::from_le_bytes([actual_payload[off], actual_payload[off + 1]]) as usize;
+            }
+
+            if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
+                continue;
+            }
+
+            if DATA_START >= actual_payload.len() {
+                continue;
+            }
+            let shard_data = actual_payload[DATA_START..].to_vec();
+
+            if !next_block_init {
+                next_block = block_seq;
+                next_block_init = true;
+            }
+
+            let idx = (block_seq as usize) % RING_SIZE;
+
+            if let Some(ref existing) = blocks[idx] {
+                if existing.block_seq != block_seq {
+                    blocks[idx] = None;
+                    processed_ring[idx] = None;
+                }
+            }
+
+            if blocks[idx].is_none() {
+                blocks[idx] = Some(RsBlock {
+                    block_seq,
+                    shards: vec![None; TOTAL_SHARDS],
+                    shard_sizes: vec![0; TOTAL_SHARDS],
+                    received: 0,
+                    actual_data_shards,
+                    shard_lens: parsed_shard_lens,
+                });
+            }
+            let block = blocks[idx].as_mut().unwrap();
+
+            if block.shards[shard_index].is_none() {
+                block.received += 1;
+                block.shard_sizes[shard_index] = shard_data.len();
+            }
+            block.shards[shard_index] = Some(shard_data);
+
+            if block.received >= DATA_SHARDS {
+                let block = blocks[idx].take().unwrap();
+                let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
+
+                if let Some(data_shards) = reconstructed {
+                    fec_recovered += 1;
+
+                    completed[idx] = Some(CompletedBlock {
+                        block_seq: block.block_seq,
+                        data_shards,
+                        shard_lens: block.shard_lens,
+                    });
+                    processed_ring[idx] = Some(block_seq);
+
+                    if block_seq == next_block {
+                        self.drain_completed(&mut completed, &mut next_block, &mut fec_recovered);
+                        last_decode_time = Instant::now();
+                    } else if Self::is_future_block(block_seq, next_block) {
+                        // block is in the future, just store it
+                    }
+                } else {
+                    fec_dropped += 1;
+                    processed_ring[idx] = Some(block_seq);
                 }
             }
         }

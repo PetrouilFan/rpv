@@ -1,0 +1,20 @@
+[Unit]
+Description=RPV Ground Station
+After=network.target rpv-x11.service
+Requires=rpv-x11.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rpv-ground
+ExecStartPre=/bin/sleep 2
+ExecStart=/opt/rpv-ground/start.sh
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

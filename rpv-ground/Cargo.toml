@@ -7,12 +7,11 @@ edition = "2021"
 name = "rpv-ground"
 path = "src/main.rs"
 
-[[bin]]
-name = "rpv-ground-rpi5"
-path = "src/main_rpi5.rs"
+[build-dependencies]
+pkg-config = "0.3"
 
 [dependencies]
-tokio         = { version = "1", features = ["net", "sync", "rt-multi-thread", "time", "signal"] }
+rpv-proto = { path = "../rpv-proto" }
 egui          = "0.29"
 eframe        = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
 egui-wgpu     = "0.29"
@@ -24,6 +23,15 @@ tracing       = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml          = "0.8"
 ctrlc         = "3"
-reed-solomon-erasure = "6"
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 libc          = "0.2"
 crossbeam-channel = "0.5"
+evdev = { version = "0.13", optional = true }
+arc-swap = "1"
+ffmpeg-sys-next = "8.1"
+
+[features]
+default = ["raw-sock", "udp-transport", "gamepad"]
+raw-sock = []          # Raw 802.11 monitor mode (requires Linux)
+udp-transport = []     # UDP/IP transport (for testing)
+gamepad = ["evdev"]    # Gamepad/Joystick input (evdev)

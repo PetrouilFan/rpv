@@ -7,11 +7,8 @@ edition = "2021"
 name = "rpv-cam"
 path = "src/main.rs"
 
-[[bin]]
-name = "rpv-cam-rpi5"
-path = "src/main_rpi5.rs"
-
 [dependencies]
+rpv-proto = { path = "../rpv-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -22,4 +19,16 @@ reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 libc = "0.2"
 crossbeam-channel = "0.5"
 mavlink = { version = "0.17", features = ["common"] }
-serialport = "4"
+serialport = { version = "4", default-features = false }
+memchr = "2"
+bytes = "1"
+arc-swap = "1"
+ffmpeg-sys-next = { version = "8", optional = true }
+
+[features]
+default = ["raw-sock", "udp-transport", "csi-cam", "usb-cam"]
+raw-sock = []          # Raw 802.11 monitor mode (requires Linux)
+udp-transport = []     # UDP/IP transport (for testing)
+csi-cam = ["ffmpeg-sys-next"]           # Raspberry Pi Camera (rpicam-vid)
+usb-cam = ["ffmpeg-sys-next"]           # USB webcam via ffmpeg
+gamepad = []           # Gamepad/Joystick input (evdev)

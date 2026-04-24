@@ -1,0 +1,17 @@
+[Unit]
+Description=RPV Ground Station Weston Compositor
+After=display-manager.service
+Before=rpv-ground.service
+PartOf=rpv-ground.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/weston --config=/opt/rpv-ground/weston.ini
+Restart=on-failure
+User=root
+Group=root
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/0
+
+[Install]
+WantedBy=rpv-ground.service

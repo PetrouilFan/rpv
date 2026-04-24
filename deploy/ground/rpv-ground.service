@@ -5,14 +5,17 @@ Wants=graphical.target
 
 [Service]
 Type=simple
-User=petrouil
-Environment="WAYLAND_DISPLAY=wayland-0"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
+ExecStartPre=/usr/local/bin/rpv-net-setup-pre.sh
+ExecStartPost=/bin/bash -c 'IFACE=$(cat /tmp/rpv-iface 2>/dev/null || echo wlan0); for i in 1 2 3 4 5; do iw dev $IFACE set txpower fixed 3000 2>/dev/null && break; sleep 0.2; done'
 ExecStart=/usr/local/bin/rpv-ground
+ExecStopPost=/usr/local/bin/rpv-net-teardown.sh
 Restart=always
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=50
 RestartSec=3
+Environment=RUST_LOG=info
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 StandardOutput=journal
 StandardError=journal
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=RPV Ground Station X11 on Framebuffer
+After=local-fs.target
+Before=rpv-ground.service
+PartOf=rpv-ground.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/X -config /opt/rpv-ground/xorg.conf :0
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=rpv-ground.service

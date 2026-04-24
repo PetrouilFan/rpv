@@ -1,9 +1,9 @@
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use tokio::net::UdpSocket;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::info;
 
-use crate::LinkStatus;
+use crate::link_state::LinkStateHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
@@ -14,7 +14,7 @@ pub struct Telemetry {
     pub speed: f64,
     pub satellites: u32,
     pub battery_v: f64,
-    pub battery_pct: u32,
+    pub battery_pct: Option<u32>,
     pub mode: String,
     pub armed: bool,
     #[serde(default = "default_true")]
@@ -35,7 +35,7 @@ impl Default for Telemetry {
             speed: 0.0,
             satellites: 0,
             battery_v: 0.0,
-            battery_pct: 0,
+            battery_pct: None,
             mode: "UNKNOWN".to_string(),
             armed: false,
             camera_ok: true,
@@ -44,66 +44,49 @@ impl Default for Telemetry {
 }
 
 pub struct TelemetryReceiver {
-    state: Arc<Mutex<Telemetry>>,
-    link_status: Arc<Mutex<LinkStatus>>,
+    state: Arc<ArcSwap<Telemetry>>,
+    link_state: LinkStateHandle,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
 }
 
 impl TelemetryReceiver {
-    pub fn new(link_status: Arc<Mutex<LinkStatus>>) -> Self {
+    pub fn new(link_state: LinkStateHandle, rx: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(Telemetry::default())),
-            link_status,
+            state: Arc::new(ArcSwap::from_pointee(Telemetry::default())),
+            link_state,
+            rx,
         }
     }
 
-    pub fn get_state(&self) -> Arc<Mutex<Telemetry>> {
+    pub fn get_state(&self) -> Arc<ArcSwap<Telemetry>> {
         Arc::clone(&self.state)
     }
 
-    pub async fn run(&self, port: u16) {
-        let bind_addr = format!("0.0.0.0:{}", port);
-        let socket = match UdpSocket::bind(&bind_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to bind telemetry socket on {}: {}", bind_addr, e);
-                return;
-            }
-        };
+    pub fn run(&self) {
+        info!("Telemetry receiver ready (L2 payload channel)");
 
-        info!("Telemetry receiver listening on {}", bind_addr);
-        let mut buf = vec![0u8; 4096];
+        // #22: 100ms timeout — fast Ctrl+C shutdown (was 3s)
+        let timeout = std::time::Duration::from_millis(100);
 
         loop {
-            let timeout = tokio::time::Duration::from_secs(3);
-            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, _))) => {
-                    if let Ok(json_str) = std::str::from_utf8(&buf[..len]) {
-                        if let Ok(telem) = serde_json::from_str::<Telemetry>(json_str) {
-                            let mut state = self.state.lock().unwrap();
-                            *state = telem;
-
-                            // Set link to Connected when telemetry arrives
-                            if let Ok(mut status) = self.link_status.lock() {
-                                if *status == LinkStatus::Searching || *status == LinkStatus::SignalLost {
-                                    *status = LinkStatus::Connected;
-                                    info!("Telemetry: camera connected");
-                                }
-                            }
+            match self.rx.recv_timeout(timeout) {
+                Ok(payload) => {
+                    // #3: Use from_slice directly — faster, no UTF-8 intermediate check
+                    if let Ok(telem) = serde_json::from_slice::<Telemetry>(&payload) {
+                        if !telem.camera_ok {
+                            tracing::debug!(
+                                "Telemetry camera_ok=false: {:?}",
+                                String::from_utf8_lossy(&payload).chars().take(100)
+                            );
                         }
+                        self.state.store(Arc::new(telem));
+                        self.link_state.telemetry_activity();
                     }
                 }
-                Ok(Err(e)) => {
-                    warn!("Telemetry recv error: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-                Err(_) => {
-                    // Timeout - no telemetry for 3 seconds
-                    if let Ok(mut status) = self.link_status.lock() {
-                        if *status == LinkStatus::Connected {
-                            *status = LinkStatus::SignalLost;
-                            warn!("Telemetry: no data for 3s, signal lost");
-                        }
-                    }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    info!("Telemetry payload channel closed");
+                    return;
                 }
             }
         }
