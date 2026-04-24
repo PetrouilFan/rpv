@@ -90,11 +90,10 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
         let u_val = textureSample(t_u, s, uv).r * 255.0 - 128.0;
         let v_val = textureSample(t_v, s, uv).r * 255.0 - 128.0;
         
-        // BT.701 YCbCr (limited range) -> RGB
-        // More accurate coefficients for modern video streams
-        let r = (255.0 / 219.0) * y_val + (255.0 / 224.0) * 1.5748 * v_val;
-        let g = (255.0 / 219.0) * y_val - (255.0 / 224.0) * 0.8728 * u_val - (255.0 / 224.0) * 0.1873 * v_val;
-        let b = (255.0 / 219.0) * y_val + (255.0 / 224.0) * 1.8556 * u_val;
+        // BT.601 YCbCr (limited range) - what rpicam-vid uses
+        let r = y_val + 1.402 * v_val;
+        let g = y_val - 0.344 * u_val - 0.714 * v_val;
+        let b = y_val + 1.772 * u_val;
         
         return vec4<f32>(
             clamp(r / 255.0, 0.0, 1.0),
