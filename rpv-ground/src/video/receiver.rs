@@ -240,11 +240,23 @@ impl VideoReceiver {
                         let checksum: u32 = frag_data.iter().fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
                         
                         if fec_recovered <= 3 {
+                            // NAL type is at frag_data[4] after 4-byte start code
                             let nalu_type = if frag_data.len() >= 5 { frag_data[4] & 0x1F } else { 99 };
+                            let nalu_name = match nalu_type {
+                                1 => "non-IDR",
+                                5 => "IDR",
+                                6 => "SEI",
+                                7 => "SPS",
+                                8 => "PPS",
+                                9 => "AUD",
+                                10 => "EOS",
+                                11 => "EOB",
+                                _ => "other",
+                            };
                             info!(
-                                "NAL: seq={}, type=0x{:02x}, H264_nalu_type={}, len={}, checksum={:08x}, first5={:02x?}",
-                                block.block_seq, frag_type, nalu_type, frag_data.len(), checksum,
-                                &frag_data[..5.min(frag_data.len())]
+                                "NAL: seq={}, frag_type=0x{:02x}, NAL_type={} ({}), len={}, first4={:02x?}",
+                                block.block_seq, frag_type, nalu_type, nalu_name, frag_data.len(),
+                                &frag_data[..4.min(frag_data.len())]
                             );
                         }
 
