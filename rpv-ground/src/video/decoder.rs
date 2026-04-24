@@ -2,8 +2,8 @@ use tracing::{error, info, warn};
 
 use ffmpeg_sys_next as ffi;
 
-// FFmpeg constants
 const AV_PIX_FMT_NV12: i32 = 23;
+const AV_PIX_FMT_YUV420P: i32 = 0; // YUV420P will be detected at runtime
 const AVERROR_EOF: i32 = -0x5445_4f46; // FFERRTAG('E','O','F',' ')
 const AVERROR_EAGAIN: i32 = -11;
 
@@ -106,7 +106,7 @@ fn process_decoded_frame(
         let sample_u = if !u_buf.is_empty() { u_buf[0] } else { 128 };
         let sample_v = if !v_buf.is_empty() { v_buf[0] } else { 128 };
         info!(
-            "Frame {}: Y={}, U={}, V (color space check)",
+            "Frame {}: Y={}, U={}, V={} (color space check)",
             *frame_count, sample_y, sample_u, sample_v
         );
     }
@@ -160,7 +160,7 @@ fn process_decoded_frame(
                 }
             }
         }
-    } else if pix_fmt == ffi::AV_PIX_FMT_YUV420P as i32 {
+    } else if pix_fmt == AV_PIX_FMT_YUV420P as i32 {
         // Standard YUV420P planar format
         let uv_src_h = fh / 2;
         let uv_copy_h = uv_src_h.min(uv_h as usize);
