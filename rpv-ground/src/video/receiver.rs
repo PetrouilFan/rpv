@@ -244,13 +244,18 @@ impl VideoReceiver {
                             );
                         }
 
+                        static TOTAL_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
                         match frag_type {
                             0x00 => {
-                                if frag_data.len() > 8 {
-                                    tracing::debug!(
-                                        "NAL single: len={}, first8={:02x?}",
-                                        frag_data.len(),
-                                        &frag_data[..8.min(frag_data.len())]
+                                let total = TOTAL_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if total < 3 {
+                                    let has_start = frag_data.len() >= 4 && 
+                                        (frag_data[..4] == [0x00, 0x00, 0x00, 0x01] || 
+                                         frag_data[..3] == [0x00, 0x00, 0x01]);
+                                    tracing::info!(
+                                        "NAL to decoder: type=0x00, len={}, has_start={}, first4={:02x?}",
+                                        frag_data.len(), has_start, &frag_data[..4.min(frag_data.len())]
                                     );
                                 }
                                 if let Err(e) = self.tx.send(frag_data.to_vec()) {
@@ -270,6 +275,16 @@ impl VideoReceiver {
                             0x03 => {
                                 if nal_started {
                                     nal_buf.extend_from_slice(frag_data);
+                                    let total = TOTAL_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if total < 3 {
+                                        let has_start = nal_buf.len() >= 4 && 
+                                            (nal_buf[..4] == [0x00, 0x00, 0x00, 0x01] || 
+                                             nal_buf[..3] == [0x00, 0x00, 0x01]);
+                                        tracing::info!(
+                                            "NAL to decoder: type=0x03, len={}, has_start={}, first4={:02x?}",
+                                            nal_buf.len(), has_start, &nal_buf[..4.min(nal_buf.len())]
+                                        );
+                                    }
                                     if let Err(e) = self.tx.send(nal_buf.clone()) {
                                         warn!("Video frame channel closed: {}", e);
                                     }
