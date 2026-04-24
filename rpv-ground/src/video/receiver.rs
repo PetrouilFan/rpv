@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use rpv_proto::link;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -130,9 +130,28 @@ impl VideoReceiver {
                 }
             };
 
-            if payload.len() < VIDEO_HDR_LEN {
+            // Check if payload starts with L2 magic (MAGIC bytes)
+            // If so, skip the L2 header (8 bytes: MAGIC[2] + drone_id[1] + type[1] + seq[4])
+            let l2_header_size = if payload.len() >= 2 && payload[0..2] == link::MAGIC {
+                8
+            } else {
+                0
+            };
+            
+            let actual_payload = if l2_header_size > 0 {
+                // Skip L2 header
+                if payload.len() <= l2_header_size {
+                    continue;
+                }
+                &payload[l2_header_size..]
+            } else {
+                &payload[..]
+            };
+            
+            if actual_payload.len() < VIDEO_HDR_LEN {
                 continue;
             }
+            
             payload_count += 1;
             if payload_count % 1000 == 0 {
                 info!(
@@ -143,16 +162,16 @@ impl VideoReceiver {
                 );
             }
 
-            let block_seq = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let shard_index = payload[4] as usize;
-            let total_shards = payload[5] as usize;
-            let actual_data_shards = (payload[6] as usize).min(DATA_SHARDS);
+            let block_seq = u32::from_le_bytes([actual_payload[0], actual_payload[1], actual_payload[2], actual_payload[3]]);
+            let shard_index = actual_payload[4] as usize;
+            let total_shards = actual_payload[5] as usize;
+            let actual_data_shards = (actual_payload[6] as usize).min(DATA_SHARDS);
 
             let mut parsed_shard_lens = [0usize; DATA_SHARDS];
             for i in 0..DATA_SHARDS {
                 let off = VIDEO_HDR_FIXED + i * 2;
                 parsed_shard_lens[i] =
-                    u16::from_le_bytes([payload[off], payload[off + 1]]) as usize;
+                    u16::from_le_bytes([actual_payload[off], actual_payload[off + 1]]) as usize;
             }
 
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
@@ -163,10 +182,10 @@ impl VideoReceiver {
                 continue;
             }
 
-            if DATA_START >= payload.len() {
+            if DATA_START >= actual_payload.len() {
                 continue;
             }
-            let shard_data = payload[DATA_START..].to_vec();
+            let shard_data = actual_payload[DATA_START..].to_vec();
 
             // O(1) dedup bitmap lookup
             let dedup_idx = (block_seq as usize) % RING_SIZE;
@@ -239,9 +258,26 @@ impl VideoReceiver {
                         // Compute checksum for data integrity verification
                         let checksum: u32 = frag_data.iter().fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
                         
-                        if fec_recovered <= 3 {
-                            // NAL type is at frag_data[4] after 4-byte start code
-                            let nalu_type = if frag_data.len() >= 5 { frag_data[4] & 0x1F } else { 99 };
+if fec_recovered <= 3 {
+                            // NAL type detection: handle both 3-byte and 4-byte start codes
+                            // 4-byte: 00 00 00 01 67 (SPS) -> type at offset 4
+                            // 3-byte: 00 00 01 67 (SPS) -> type at offset 3
+                            let (sc_len, nalu_type) = if frag_data.len() >= 5
+                                && frag_data[0] == 0x00
+                                && frag_data[1] == 0x00
+                                && frag_data[2] == 0x00
+                                && frag_data[3] == 0x01
+                            {
+                                (4, frag_data[4] & 0x1F)
+                            } else if frag_data.len() >= 4
+                                && frag_data[0] == 0x00
+                                && frag_data[1] == 0x00
+                                && frag_data[2] == 0x01
+                            {
+                                (3, frag_data[3] & 0x1F)
+                            } else {
+                                (0, 99)
+                            };
                             let nalu_name = match nalu_type {
                                 1 => "non-IDR",
                                 5 => "IDR",
@@ -254,8 +290,8 @@ impl VideoReceiver {
                                 _ => "other",
                             };
                             info!(
-                                "NAL: seq={}, frag_type=0x{:02x}, NAL_type={} ({}), len={}, first4={:02x?}",
-                                block.block_seq, frag_type, nalu_type, nalu_name, frag_data.len(),
+                                "NAL: seq={}, frag_type=0x{:02x}, NAL_type={} ({}), len={}, sc_len={}, first4={:02x?}",
+                                block.block_seq, frag_type, nalu_type, nalu_name, frag_data.len(), sc_len,
                                 &frag_data[..4.min(frag_data.len())]
                             );
                         }

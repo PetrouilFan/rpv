@@ -88,9 +88,11 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
         
         // BT.601 YCbCr (limited range 16-235 for Y, 16-240 for U/V)
         // Convert from 0-255 to proper ranges
+        // Y at full resolution, U/V at half resolution -> use uv*0.5 for correct chroma coordinates
+        // Use textureSampleLevel(..., 0.0) to force nearest-neighbor (no interpolation)
         let y_val = (textureSample(t_y, s, uv).r * 255.0 - 16.0) * (255.0 / 219.0);
-        let u_val = (textureSample(t_u, s, uv).r * 255.0 - 128.0) * (255.0 / 224.0);
-        let v_val = (textureSample(t_v, s, uv).r * 255.0 - 128.0) * (255.0 / 224.0);
+        let u_val = (textureSampleLevel(t_u, s, uv * 0.5, 0.0).r * 255.0 - 128.0) * (255.0 / 224.0);
+        let v_val = (textureSampleLevel(t_v, s, uv * 0.5, 0.0).r * 255.0 - 128.0) * (255.0 / 224.0);
         
         // BT.601 YCbCr -> RGB
         let r = y_val + 1.402 * v_val;
@@ -298,7 +300,7 @@ impl YuvGpuResources {
         }
     }
 
-    fn upload(&self, y_data: &[u8], u_data: &[u8], v_data: &[u8]) {
+    fn upload(&self, y_data: &[u8], u_data: &[u8], v_data: &[u8], y_stride: u32, uv_stride: u32) {
         let w = self.video_width as usize;
         let h = self.video_height as usize;
         let uv_w = w / 2;
@@ -314,7 +316,7 @@ impl YuvGpuResources {
             y_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(w as u32),
+                bytes_per_row: Some(y_stride),
                 rows_per_image: Some(h as u32),
             },
             wgpu::Extent3d {
@@ -334,7 +336,7 @@ impl YuvGpuResources {
             u_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(uv_w as u32),
+                bytes_per_row: Some(uv_stride),
                 rows_per_image: Some(uv_h as u32),
             },
             wgpu::Extent3d {
@@ -354,7 +356,7 @@ impl YuvGpuResources {
             v_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(uv_w as u32),
+                bytes_per_row: Some(uv_stride),
                 rows_per_image: Some(uv_h as u32),
             },
             wgpu::Extent3d {
@@ -516,7 +518,7 @@ impl RpvApp {
             }
 
             let res = gpu.lock().unwrap();
-            res.upload(&frame.y_data, &frame.u_data, &frame.v_data);
+            res.upload(&frame.y_data, &frame.u_data, &frame.v_data, frame.y_stride, frame.uv_stride);
             drop(res);
 
             self.state.frame_count += 1;
@@ -898,7 +900,11 @@ fn main() -> Result<(), eframe::Error> {
                 });
 
         let mut waited = std::time::Duration::ZERO;
-        let wait_timeout = std::time::Duration::from_secs(30);
+        let wait_timeout = if config.common.peer_addr.is_some() {
+            std::time::Duration::from_millis(100)
+        } else {
+            std::time::Duration::from_secs(30)
+        };
         while peer_addr.load().is_none() && waited < wait_timeout {
             std::thread::sleep(std::time::Duration::from_millis(200));
             waited += std::time::Duration::from_millis(200);
@@ -1212,6 +1218,15 @@ fn rx_dispatcher(
         };
 
         if header.drone_id != drone_id {
+            reject_count += 1;
+            if reject_count <= 5 {
+                tracing::warn!(
+                    "RX: drone_id mismatch: expected {}, got {}, first16={:02x?}",
+                    drone_id,
+                    header.drone_id,
+                    &payload[..16.min(payload.len())]
+                );
+            }
             continue;
         }
 

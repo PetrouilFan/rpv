@@ -119,12 +119,12 @@ pub fn run(
             // raw YUV420 into ffmpeg for H.264 encoding via libx264 (software)
             // The Pi 5 has no h264_v4l2m2m hardware encoder like the Pi 4
             let shell_cmd = format!(
-                "rpicam-vid -t 0 --codec yuv420 -o - --width {} --height {} --framerate {} {} | \
+                "rpicam-vid -t 0 --codec yuv420 -o - --width {} --height {} --framerate {} | \
                  ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt yuv420p -s {} -r {} -i pipe:0 \
-                 -c:v libx264 -b:v {} -g {} -preset veryfast -tune zerolatency -crf 28 \
-                 -x264-params rc-lookahead=0:sync-lookahead=0:sliced-threads=1:repeat-headers=1 \
-                 -f h264 pipe:1",
-                video_width, video_height, framerate_s, rpicam_options,
+                  -c:v libx264 -b:v {} -g {} -preset veryfast -tune zerolatency -crf 28 \
+                  -x264-params rc-lookahead=0:sync-lookahead=0:sliced-threads=1:repeat-headers=1 \
+                  -f h264 pipe:1",
+                video_width, video_height, framerate_s,
                 video_size_s, framerate_s, bitrate_s, gop_s,
             );
             let mut cmd = Command::new("sh");
@@ -310,6 +310,21 @@ pub fn run(
                         
                         // nal_data already has start code from extract_next_nal_cursor()
                         let nal_with_sc = nal_data.clone();
+
+                        // Log NAL type for diagnostics
+                        let nal_type = if nal_with_sc.len() >= 5 {
+                            (nal_with_sc[4] & 0x1F)
+                        } else if nal_with_sc.len() >= 4 {
+                            (nal_with_sc[3] & 0x1F)
+                        } else { 99 };
+                        let total_nals = total_nals + 1;
+                        if total_nals <= 10 {
+                            tracing::info!(
+                                "CAM NAL #{}: type={}, len={}, first4={:02x?}",
+                                total_nals, nal_type, nal_with_sc.len(),
+                                &nal_with_sc[..4.min(nal_with_sc.len())]
+                            );
+                        }
 
                         // Send NAL with fragment header: [type:1][data...]
                         // type 0 = fits in one shard, type 1 = first fragment,

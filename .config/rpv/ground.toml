@@ -1,8 +1,9 @@
 transport = "udp"
-interface = "wlp3s0f0u10"
+interface = "wlp3s0f0u1"
 drone_id = 0
 udp_port = 9001
 ap_ssid = "rpv-link"
 ap_channel = 6
 video_width = 960
 video_height = 540
+peer_addr = "10.42.0.1:9001"

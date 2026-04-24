@@ -28,7 +28,7 @@ fn default_interface() -> String {
     "wlan1".to_string()
 }
 fn default_drone_id() -> u8 {
-    0
+    1
 }
 fn default_transport() -> String {
     "udp".to_string()

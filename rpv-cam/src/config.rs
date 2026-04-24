@@ -29,7 +29,7 @@ fn default_video_device() -> String {
 }
 
 fn default_camera_type() -> String {
-    "usb".to_string()
+    "csi".to_string()
 }
 
 fn default_rpicam_options() -> String {

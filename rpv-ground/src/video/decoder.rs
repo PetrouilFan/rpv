@@ -16,6 +16,8 @@ pub struct DecodedFrame {
     pub v_data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub y_stride: u32,
+    pub uv_stride: u32,
     pub send_ts_us: Option<u64>,
     pub recv_time: Option<std::time::Instant>,
 }
@@ -221,35 +223,12 @@ fn process_decoded_frame(
                 v_buf[dst_start..dst_end].copy_from_slice(v_src);
             }
         }
-    }
+}
 
-    // Create output frames, transferring ownership of the YUV data
-    // without extra copying. We use Vec::from_raw_parts to take the existing
-    // allocation and leave a new buffer for reuse.
-    let y_data = {
-        let old_y = std::mem::replace(&mut *y_buf, Vec::new());
-        let ptr = old_y.as_ptr() as *mut u8;
-        let len = y_size;
-        let cap = old_y.capacity();
-        std::mem::forget(old_y);
-        unsafe { Vec::from_raw_parts(ptr, len, cap) }
-    };
-    let u_data = {
-        let old_u = std::mem::replace(&mut *u_buf, Vec::new());
-        let ptr = old_u.as_ptr() as *mut u8;
-        let len = uv_size;
-        let cap = old_u.capacity();
-        std::mem::forget(old_u);
-        unsafe { Vec::from_raw_parts(ptr, len, cap) }
-    };
-    let v_data = {
-        let old_v = std::mem::replace(&mut *v_buf, Vec::new());
-        let ptr = old_v.as_ptr() as *mut u8;
-        let len = uv_size;
-        let cap = old_v.capacity();
-        std::mem::forget(old_v);
-        unsafe { Vec::from_raw_parts(ptr, len, cap) }
-    };
+    // Clone the data we need (avoiding the unsafe buffer swap hack)
+    let y_data = y_buf[..y_size].to_vec();
+    let u_data = u_buf[..uv_size].to_vec();
+    let v_data = v_buf[..uv_size].to_vec();
 
     let decoded = DecodedFrame {
         y_data,
@@ -257,22 +236,13 @@ fn process_decoded_frame(
         v_data,
         width: fw as u32,
         height: fh as u32,
+        y_stride: linesize0 as u32,
+        uv_stride: linesize1 as u32,
         send_ts_us: None,
         recv_time: Some(std::time::Instant::now()),
     };
 
     let _ = frame_tx.try_send(decoded);
-
-    // Buffers are now empty. Restore capacity for next frame.
-    if y_buf.capacity() < y_size {
-        y_buf.reserve(y_size);
-    }
-    if u_buf.capacity() < uv_size {
-        u_buf.reserve(uv_size);
-    }
-    if v_buf.capacity() < uv_size {
-        v_buf.reserve(uv_size);
-    }
 
     *frame_count += 1;
     if *frame_count % 30 == 0 {
