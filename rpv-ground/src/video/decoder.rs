@@ -100,6 +100,17 @@ fn process_decoded_frame(
         );
     }
 
+    // Debug: Check for potential color issues
+    if *frame_count < 10 {
+        let sample_y = y_buf[0];
+        let sample_u = if !u_buf.is_empty() { u_buf[0] } else { 128 };
+        let sample_v = if !v_buf.is_empty() { v_buf[0] } else { 128 };
+        info!(
+            "Frame {}: Y={}, U={}, V (color space check)",
+            *frame_count, sample_y, sample_u, sample_v
+        );
+    }
+
     // Use actual decoded frame dimensions, not config dimensions
     let w = fw;
     let h = fh;
@@ -142,6 +153,39 @@ fn process_decoded_frame(
             for col in 0..uv_copy_w.min(uv_interleaved_w / 2) {
                 u_buf[row * uv_w + col] = src[col * 2];
                 v_buf[row * uv_w + col] = src[col * 2 + 1];
+            }
+        }
+    } else if pix_fmt == ffi::AV_PIX_FMT_YUV420P as i32 {
+        // Standard YUV420P planar format
+        let uv_src_h = fh / 2;
+        let uv_copy_h = uv_src_h.min(uv_h);
+        for row in 0..uv_copy_h {
+            if !data1.is_null() {
+                let u_src =
+                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
+                u_buf[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
+            }
+            if !data2.is_null() {
+                let v_src =
+                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_v_copy_w) };
+                v_buf[row * uv_w..row * uv_w + uv_v_copy_w].copy_from_slice(v_src);
+            }
+        }
+    } else {
+        // Fallback for other formats - log warning
+        warn!("Unknown pixel format: {}, attempting YUV420P fallback", pix_fmt);
+        let uv_src_h = fh / 2;
+        let uv_copy_h = uv_src_h.min(uv_h);
+        for row in 0..uv_copy_h {
+            if !data1.is_null() {
+                let u_src =
+                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
+                u_buf[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
+            }
+            if !data2.is_null() {
+                let v_src =
+                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_v_copy_w) };
+                v_buf[row * uv_w..row * uv_w + uv_v_copy_w].copy_from_slice(v_src);
             }
         }
     } else {

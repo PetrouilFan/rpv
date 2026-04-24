@@ -1,0 +1,17 @@
+transport = "udp"
+interface = "wlp3s0f0u1"
+drone_id = 1
+udp_port = 9001
+ap_ssid = "rpv-link"
+ap_channel = 6
+video_width = 960
+video_height = 540
+
+camera_type = "csi"
+video_device = "/dev/video0"
+rpicam_options = "--width 960 --height 540 --framerate 30"
+fc_port = "/dev/ttyAMA0"
+fc_baud = 115200
+framerate = 30
+bitrate = 3000000
+intra = 30

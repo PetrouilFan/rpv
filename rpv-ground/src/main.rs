@@ -83,14 +83,19 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
     @fragment
     fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+        // Scale UV coordinates for half-resolution chroma planes
+        let uv_scaled = vec2<f32>(in.uv.x * 2.0, in.uv.y * 2.0);
+        
         let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
-        let u_val = textureSample(t_u, s, in.uv).r * 255.0 - 128.0;
-        let v_val = textureSample(t_v, s, in.uv).r * 255.0 - 128.0;
-        // BT.601 YCbCr (limited range) -> RGB
-        // Standard coefficients with U/V correctly assigned
-        let r = (298.0 * y_val + 409.0 * v_val + 128.0) / 256.0;
-        let g = (298.0 * y_val - 100.0 * u_val - 208.0 * v_val + 128.0) / 256.0;
-        let b = (298.0 * y_val + 516.0 * u_val + 128.0) / 256.0;
+        let u_val = textureSample(t_u, s, uv_scaled).r * 255.0 - 128.0;
+        let v_val = textureSample(t_v, s, uv_scaled).r * 255.0 - 128.0;
+        
+        // BT.701 YCbCr (limited range) -> RGB
+        // More accurate coefficients for modern video streams
+        let r = (255.0 / 219.0) * y_val + (255.0 / 224.0) * 1.5748 * v_val;
+        let g = (255.0 / 219.0) * y_val - (255.0 / 224.0) * 0.8728 * u_val - (255.0 / 224.0) * 0.1873 * v_val;
+        let b = (255.0 / 219.0) * y_val + (255.0 / 224.0) * 1.8556 * u_val;
+        
         return vec4<f32>(
             clamp(r / 255.0, 0.0, 1.0),
             clamp(g / 255.0, 0.0, 1.0),
