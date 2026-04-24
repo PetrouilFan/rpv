@@ -121,7 +121,6 @@ pub fn run(
             let shell_cmd = format!(
                 "rpicam-vid -t 0 --codec yuv420 -o - --width {} --height {} --framerate {} {} | \
                  ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt yuv420p -s {} -r {} -i pipe:0 \
-                 -colorspace bt601 -color_range tv \
                  -c:v libx264 -b:v {} -g {} -preset veryfast -tune zerolatency -crf 28 \
                  -x264-params rc-lookahead=0:sync-lookahead=0:sliced-threads=1:repeat-headers=1 \
                  -f h264 pipe:1",
