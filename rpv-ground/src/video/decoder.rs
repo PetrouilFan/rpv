@@ -131,9 +131,12 @@ fn process_decoded_frame(
     // Zero-fill and copy Y plane
     y_buf[..y_size].fill(0);
     for row in 0..h {
+        let src_len = w.min(linesize0 as usize);
         let src =
-            unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), w.min(linesize0)) };
-        y_buf[row * w..row * w + w.min(linesize0)].copy_from_slice(src);
+            unsafe { std::slice::from_raw_parts(data0.add(row * linesize0 as usize), src_len) };
+        let dst_start = row * w;
+        let dst_end = dst_start + w.min(src_len);
+        y_buf[dst_start..dst_end].copy_from_slice(src);
     }
 
     // U/V planes
@@ -141,51 +144,65 @@ fn process_decoded_frame(
     let uv_h = h / 2;
     u_buf[..uv_size].fill(0);
     v_buf[..uv_size].fill(0);
-    let uv_copy_w = (fw / 2).min(uv_w).min(linesize1);
-    let uv_v_copy_w = (fw / 2).min(uv_w).min(linesize2);
+    let uv_copy_w = (fw / 2).min(uv_w as usize).min(linesize1 as usize);
+    let uv_v_copy_w = (fw / 2).min(uv_w as usize).min(linesize2 as usize);
 
     if pix_fmt == AV_PIX_FMT_NV12 as i32 {
-        let uv_interleaved_w = fw.min(linesize1);
-        let uv_copy_h = fh.min(uv_h);
+        let uv_interleaved_w = fw.min(linesize1 as usize);
+        let uv_copy_h = fh.min(uv_h as usize);
         for row in 0..uv_copy_h {
             let src =
-                unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_interleaved_w) };
-            for col in 0..uv_copy_w.min(uv_interleaved_w / 2) {
-                u_buf[row * uv_w + col] = src[col * 2];
-                v_buf[row * uv_w + col] = src[col * 2 + 1];
+                unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), uv_interleaved_w) };
+            for col in 0..uv_copy_w {
+                if col * 2 + 1 < uv_interleaved_w {
+                    u_buf[row * uv_w + col] = src[col * 2];
+                    v_buf[row * uv_w + col] = src[col * 2 + 1];
+                }
             }
         }
     } else if pix_fmt == ffi::AV_PIX_FMT_YUV420P as i32 {
         // Standard YUV420P planar format
         let uv_src_h = fh / 2;
-        let uv_copy_h = uv_src_h.min(uv_h);
+        let uv_copy_h = uv_src_h.min(uv_h as usize);
         for row in 0..uv_copy_h {
             if !data1.is_null() {
+                let u_src_len = uv_copy_w.min(linesize1 as usize);
                 let u_src =
-                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
-                u_buf[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
+                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), u_src_len) };
+                let dst_start = row * uv_w;
+                let dst_end = dst_start + u_src_len;
+                u_buf[dst_start..dst_end].copy_from_slice(u_src);
             }
             if !data2.is_null() {
+                let v_src_len = uv_v_copy_w.min(linesize2 as usize);
                 let v_src =
-                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_v_copy_w) };
-                v_buf[row * uv_w..row * uv_w + uv_v_copy_w].copy_from_slice(v_src);
+                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2 as usize), v_src_len) };
+                let dst_start = row * uv_w;
+                let dst_end = dst_start + v_src_len;
+                v_buf[dst_start..dst_end].copy_from_slice(v_src);
             }
         }
     } else {
         // Fallback for other formats - log warning
         warn!("Unknown pixel format: {}, attempting YUV420P fallback", pix_fmt);
         let uv_src_h = fh / 2;
-        let uv_copy_h = uv_src_h.min(uv_h);
+        let uv_copy_h = uv_src_h.min(uv_h as usize);
         for row in 0..uv_copy_h {
             if !data1.is_null() {
+                let u_src_len = uv_copy_w.min(linesize1 as usize);
                 let u_src =
-                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
-                u_buf[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
+                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), u_src_len) };
+                let dst_start = row * uv_w;
+                let dst_end = dst_start + u_src_len;
+                u_buf[dst_start..dst_end].copy_from_slice(u_src);
             }
             if !data2.is_null() {
+                let v_src_len = uv_v_copy_w.min(linesize2 as usize);
                 let v_src =
-                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_v_copy_w) };
-                v_buf[row * uv_w..row * uv_w + uv_v_copy_w].copy_from_slice(v_src);
+                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2 as usize), v_src_len) };
+                let dst_start = row * uv_w;
+                let dst_end = dst_start + v_src_len;
+                v_buf[dst_start..dst_end].copy_from_slice(v_src);
             }
         }
     } else {
