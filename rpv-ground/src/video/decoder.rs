@@ -89,7 +89,7 @@ fn process_decoded_frame(
 
     if *frame_count == 0 {
         info!(
-            "Decoded frame: {}x{}, fmt={}, ls=[{},{},{}], d2_null={}",
+            "DECODED: {}x{}, fmt={} (0=YUV420P, 23=NV12), ls=[{},{},{}], d2_null={}",
             fw,
             fh,
             pix_fmt,
@@ -100,15 +100,18 @@ fn process_decoded_frame(
         );
     }
 
-    // Debug: Check for potential color issues
-    if *frame_count < 10 && !y_buf.is_empty() {
-        let sample_y = y_buf[0];
-        let sample_u = if !u_buf.is_empty() { u_buf[0] } else { 128 };
-        let sample_v = if !v_buf.is_empty() { v_buf[0] } else { 128 };
-        info!(
-            "Frame {}: Y={}, U={}, V={} (color space check)",
-            *frame_count, sample_y, sample_u, sample_v
-        );
+    // Detailed diagnostics for first few frames
+    if *frame_count < 5 && !y_buf.is_empty() {
+        let y1 = y_buf[0];
+        let y2 = y_buf[1];
+        let y3 = y_buf[2];
+        let y4 = if fw < y_buf.len() { y_buf[fw] } else { 0 };
+        info!("FRAME {}: Y=[{},{},{},{}], U=[{},{},{},{}], V=[{},{},{},{}]",
+            *frame_count, y1, y2, y3, y4,
+            u_buf.get(0).copied().unwrap_or(128), u_buf.get(1).copied().unwrap_or(128),
+            u_buf.get(2).copied().unwrap_or(128), u_buf.get(3).copied().unwrap_or(128),
+            v_buf.get(0).copied().unwrap_or(128), v_buf.get(1).copied().unwrap_or(128),
+            v_buf.get(2).copied().unwrap_or(128), v_buf.get(3).copied().unwrap_or(128));
     }
 
     // Use actual decoded frame dimensions, not config dimensions
@@ -139,22 +142,35 @@ fn process_decoded_frame(
         y_buf[dst_start..dst_end].copy_from_slice(src);
     }
 
-    // U/V planes
+    // U/V planes - fix stride handling
     let uv_w = w / 2;
     let uv_h = h / 2;
     u_buf[..uv_size].fill(0);
     v_buf[..uv_size].fill(0);
-    let uv_copy_w = (fw / 2).min(uv_w as usize).min(linesize1 as usize);
-    let uv_v_copy_w = (fw / 2).min(uv_w as usize).min(linesize2 as usize);
+    
+    // For YUV420P: linesize is bytes per row (row stride in bytes)
+    // For NV12: linesize1 is bytes for interleaved UV, so UV pixels = linesize1 / 2
+    let uv_copy_w = if pix_fmt == AV_PIX_FMT_NV12 as i32 {
+        (fw / 2).min(uv_w).min(linesize1 as usize / 2)
+    } else {
+        (fw / 2).min(uv_w).min(linesize1 as usize)
+    };
+    let uv_v_copy_w = if pix_fmt == AV_PIX_FMT_NV12 as i32 {
+        (fw / 2).min(uv_w).min(linesize2 as usize / 2)
+    } else {
+        (fw / 2).min(uv_w).min(linesize2 as usize)
+    };
 
     if pix_fmt == AV_PIX_FMT_NV12 as i32 {
-        let uv_interleaved_w = fw.min(linesize1 as usize);
-        let uv_copy_h = fh.min(uv_h as usize);
+        // NV12: UV interleaved, linesize1 is bytes, pixels = linesize1 / 2
+        let uv_interleaved_bytes = fw.min(linesize1 as usize);
+        let uv_interleaved_pixels = uv_interleaved_bytes / 2;
+        let uv_copy_h = (fh / 2).min(uv_h);
         for row in 0..uv_copy_h {
             let src =
-                unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), uv_interleaved_w) };
-            for col in 0..uv_copy_w {
-                if col * 2 + 1 < uv_interleaved_w {
+                unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), uv_interleaved_bytes) };
+            for col in 0..uv_copy_w.min(uv_interleaved_pixels) {
+                if col * 2 + 1 < uv_interleaved_bytes {
                     u_buf[row * uv_w + col] = src[col * 2];
                     v_buf[row * uv_w + col] = src[col * 2 + 1];
                 }
