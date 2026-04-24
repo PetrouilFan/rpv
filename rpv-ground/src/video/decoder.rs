@@ -101,7 +101,7 @@ fn process_decoded_frame(
     }
 
     // Debug: Check for potential color issues
-    if *frame_count < 10 {
+    if *frame_count < 10 && !y_buf.is_empty() {
         let sample_y = y_buf[0];
         let sample_u = if !u_buf.is_empty() { u_buf[0] } else { 128 };
         let sample_v = if !v_buf.is_empty() { v_buf[0] } else { 128 };
@@ -292,6 +292,8 @@ fn decode_loop_libavcodec(
         (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
         (*codec_ctx).thread_count = 1;
         (*codec_ctx).thread_type = 0;
+        (*codec_ctx).err_recognition = 1;
+        (*codec_ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL as i32;
     }
 
     let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };

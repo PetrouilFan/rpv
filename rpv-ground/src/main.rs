@@ -83,12 +83,12 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
     @fragment
     fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-        // Scale UV coordinates for half-resolution chroma planes
-        let uv_scaled = vec2<f32>(in.uv.x * 2.0, in.uv.y * 2.0);
+        // Use same UV for all planes - sampler handles half-resolution chroma via linear filtering
+        let uv = in.uv;
         
-        let y_val = textureSample(t_y, s, in.uv).r * 255.0 - 16.0;
-        let u_val = textureSample(t_u, s, uv_scaled).r * 255.0 - 128.0;
-        let v_val = textureSample(t_v, s, uv_scaled).r * 255.0 - 128.0;
+        let y_val = textureSample(t_y, s, uv).r * 255.0 - 16.0;
+        let u_val = textureSample(t_u, s, uv).r * 255.0 - 128.0;
+        let v_val = textureSample(t_v, s, uv).r * 255.0 - 128.0;
         
         // BT.701 YCbCr (limited range) -> RGB
         // More accurate coefficients for modern video streams
