@@ -86,11 +86,13 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
         // Use same UV for all planes - sampler handles half-resolution chroma via linear filtering
         let uv = in.uv;
         
-        let y_val = textureSample(t_y, s, uv).r * 255.0 - 16.0;
-        let u_val = textureSample(t_u, s, uv).r * 255.0 - 128.0;
-        let v_val = textureSample(t_v, s, uv).r * 255.0 - 128.0;
+        // BT.601 YCbCr (limited range 16-235 for Y, 16-240 for U/V)
+        // Convert from 0-255 to proper ranges
+        let y_val = (textureSample(t_y, s, uv).r * 255.0 - 16.0) * (255.0 / 219.0);
+        let u_val = (textureSample(t_u, s, uv).r * 255.0 - 128.0) * (255.0 / 224.0);
+        let v_val = (textureSample(t_v, s, uv).r * 255.0 - 128.0) * (255.0 / 224.0);
         
-        // BT.601 YCbCr (limited range) - what rpicam-vid uses
+        // BT.601 YCbCr -> RGB
         let r = y_val + 1.402 * v_val;
         let g = y_val - 0.344 * u_val - 0.714 * v_val;
         let b = y_val + 1.772 * u_val;
