@@ -205,22 +205,6 @@ fn process_decoded_frame(
                 v_buf[dst_start..dst_end].copy_from_slice(v_src);
             }
         }
-    } else {
-        // YUV420P or similar planar
-        let uv_src_h = fh / 2;
-        let uv_copy_h = uv_src_h.min(uv_h);
-        for row in 0..uv_copy_h {
-            if !data1.is_null() {
-                let u_src =
-                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), uv_copy_w) };
-                u_buf[row * uv_w..row * uv_w + uv_copy_w].copy_from_slice(u_src);
-            }
-            if !data2.is_null() {
-                let v_src =
-                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), uv_v_copy_w) };
-                v_buf[row * uv_w..row * uv_w + uv_v_copy_w].copy_from_slice(v_src);
-            }
-        }
     }
 
     // Create output frames, transferring ownership of the YUV data
