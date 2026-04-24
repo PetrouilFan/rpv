@@ -87,8 +87,8 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
         let uv = in.uv;
         
         let y_val = textureSample(t_y, s, uv).r * 255.0 - 16.0;
-        let u_val = textureSample(t_u, s, uv).r * 255.0 - 128.0;
-        let v_val = textureSample(t_v, s, uv).r * 255.0 - 128.0;
+        let u_val = textureSample(t_v, s, uv).r * 255.0 - 128.0;
+        let v_val = textureSample(t_u, s, uv).r * 255.0 - 128.0;
         
         // BT.601 YCbCr (limited range) - what rpicam-vid uses
         let r = y_val + 1.402 * v_val;

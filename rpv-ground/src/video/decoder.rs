@@ -98,6 +98,12 @@ fn process_decoded_frame(
             linesize2,
             data2.is_null()
         );
+        // Log first few samples
+        if !y_buf.is_empty() && !u_buf.is_empty() && !v_buf.is_empty() {
+            info!("YUV samples: y={}, u={}, v={}", y_buf[0], u_buf[0], v_buf[0]);
+        } else if !y_buf.is_empty() {
+            info!("Y only: y={}", y_buf[0]);
+        }
     }
 
     // Debug: Check for potential color issues
