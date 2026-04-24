@@ -26,6 +26,12 @@ ctrlc         = "3"
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 libc          = "0.2"
 crossbeam-channel = "0.5"
-evdev = "0.13"
+evdev = { version = "0.13", optional = true }
 arc-swap = "1"
 ffmpeg-sys-next = "8.1"
+
+[features]
+default = ["raw-sock", "udp-transport", "gamepad"]
+raw-sock = []          # Raw 802.11 monitor mode (requires Linux)
+udp-transport = []     # UDP/IP transport (for testing)
+gamepad = ["evdev"]    # Gamepad/Joystick input (evdev)

@@ -6,16 +6,11 @@ use rpv_proto::link;
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
-/// Ring buffer size for FEC blocks — O(1) lookups via seq % RING_SIZE
 const RING_SIZE: usize = 128;
-/// Video header layout (8 + 2*DATA_SHARDS bytes):
-///   [4B block_seq][1B shard_idx][1B total_shards][1B data_shards][1B pad]
-///   [2B * DATA_SHARDS shard_len_array]
 const VIDEO_HDR_FIXED: usize = 8;
 const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
-/// If no FEC block completes within this window, drop the stalled block.
 const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 struct RsBlock {
@@ -24,12 +19,15 @@ struct RsBlock {
     shard_sizes: Vec<usize>,
     received: usize,
     actual_data_shards: usize,
-    /// Original data shard lengths before FEC padding, broadcast by the sender.
     shard_lens: [usize; DATA_SHARDS],
 }
 
-/// Video receiver that processes FEC-encoded video payloads
-/// from a crossbeam channel (fed by the raw socket RX dispatcher).
+struct CompletedBlock {
+    block_seq: u32,
+    data_shards: Vec<Vec<u8>>,
+    shard_lens: [usize; DATA_SHARDS],
+}
+
 pub struct VideoReceiver {
     tx: crossbeam_channel::Sender<Vec<u8>>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
@@ -41,48 +39,102 @@ impl VideoReceiver {
         rx: crossbeam_channel::Receiver<Vec<u8>>,
     ) -> Self {
         info!(
-            "Video receiver (RS {}+{}) ready (L2 payload channel)",
+            "Video receiver (RS {}+{}) ready (strict in-order release)",
             DATA_SHARDS, PARITY_SHARDS
         );
         Self { tx, rx }
     }
 
-    fn check_stall(
-        blocks: &mut [Option<RsBlock>; RING_SIZE],
-        processed_ring: &mut [Option<u32>; RING_SIZE],
-        next_block: &mut Option<u32>,
-        last_decode_time: &mut Instant,
-        nal_buf: &mut Vec<u8>,
-        nal_started: &mut bool,
-    ) -> bool {
-        if let Some(cur) = *next_block {
-            if last_decode_time.elapsed() > STALL_TIMEOUT {
-                let idx = (cur as usize) % RING_SIZE;
-                if let Some(ref block) = blocks[idx] {
-                    warn!(
-                        "RS: block {} stalled (had {}/{} shards), dropping",
-                        cur, block.received, DATA_SHARDS
-                    );
+    #[inline]
+    fn is_future_block(block_seq: u32, next_block: u32) -> bool {
+        block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
+    }
+
+    fn emit_block(&self, block: &CompletedBlock, fec_recovered: &mut u64) {
+        let mut nal_buf: Vec<u8> = Vec::with_capacity(32768);
+        let mut nal_started = false;
+
+        for (sidx, shard_data) in block.data_shards.iter().enumerate() {
+            let orig_len = block.shard_lens.get(sidx).copied().unwrap_or(0);
+            let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
+                &shard_data[..orig_len]
+            } else {
+                shard_data.as_slice()
+            };
+            if trimmed.is_empty() || trimmed.len() < 2 {
+                continue;
+            }
+
+            let frag_type = trimmed[0];
+            let frag_data = &trimmed[1..];
+
+            if *fec_recovered < 3 {
+                let nalu_type = if frag_data.len() >= 5
+                    && frag_data[0] == 0x00 && frag_data[1] == 0x00
+                    && frag_data[2] == 0x00 && frag_data[3] == 0x01
+                {
+                    Some(frag_data[4] & 0x1F)
+                } else if frag_data.len() >= 4
+                    && frag_data[0] == 0x00 && frag_data[1] == 0x00
+                    && frag_data[2] == 0x01
+                {
+                    Some(frag_data[3] & 0x1F)
                 } else {
-                    if cur % 100 == 0 {
-                        warn!("RS: block {} stalled (no shards received), dropping", cur);
+                    None
+                };
+                info!(
+                    "NAL: seq={}, sidx={}, frag_type=0x{:02x}, NAL_type={:?}, len={}",
+                    block.block_seq, sidx, frag_type, nalu_type, frag_data.len()
+                );
+            }
+
+            match frag_type {
+                0x00 => {
+                    *fec_recovered += 1;
+                    if let Err(e) = self.tx.send(frag_data.to_vec()) {
+                        warn!("Video frame channel closed: {}", e);
                     }
                 }
-                if *nal_started {
+                0x01 => {
                     nal_buf.clear();
-                    *nal_started = false;
+                    nal_buf.extend_from_slice(frag_data);
+                    nal_started = true;
                 }
-                // Clear ALL blocks and reset — full stall recovery
-                for i in 0..RING_SIZE {
-                    blocks[i] = None;
-                    processed_ring[i] = None;
+                0x02 => {
+                    if nal_started {
+                        nal_buf.extend_from_slice(frag_data);
+                    }
                 }
-                *next_block = None;
-                *last_decode_time = Instant::now();
-                return true;
+                0x03 => {
+                    if nal_started {
+                        nal_buf.extend_from_slice(frag_data);
+                        if let Err(e) = self.tx.send(nal_buf.clone()) {
+                            warn!("Video frame channel closed: {}", e);
+                        }
+                        nal_buf.clear();
+                        nal_started = false;
+                    }
+                }
+                _ => {}
             }
         }
-        false
+    }
+
+    fn drain_completed(
+        &self,
+        completed: &mut [Option<CompletedBlock>; RING_SIZE],
+        next_block: &mut u32,
+        fec_recovered: &mut u64,
+    ) {
+        loop {
+            let idx = (*next_block as usize) % RING_SIZE;
+            if let Some(block) = completed[idx].take() {
+                self.emit_block(&block, fec_recovered);
+                *next_block = next_block.wrapping_add(1);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn run(&self) {
@@ -90,32 +142,35 @@ impl VideoReceiver {
             .expect("Failed to create Reed-Solomon decoder");
 
         let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
-        let mut processed_ring: [Option<u32>; RING_SIZE] = [None; RING_SIZE];
-        let mut next_block: Option<u32> = None;
+        let mut completed: [Option<CompletedBlock>; RING_SIZE] = std::array::from_fn(|_| None);
+        let mut processed_ring: [Option<u32>; RING_SIZE] = std::array::from_fn(|_| None);
+        let mut next_block: u32 = 0;
+        let mut next_block_init = false;
         let mut last_decode_time = Instant::now();
-        let mut _block_count: u64 = 0;
         let mut fec_recovered: u64 = 0;
         let mut fec_dropped: u64 = 0;
         let mut payload_count: u64 = 0;
-        let mut nal_buf: Vec<u8> = Vec::with_capacity(32768);
-        let mut nal_started: bool = false;
 
-        info!("VideoReceiver loop starting");
+        info!("VideoReceiver loop starting (strict in-order)");
 
         loop {
-            // Fast path: drain buffered packets immediately without blocking
             let payload = match self.rx.try_recv() {
                 Ok(p) => p,
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No data buffered — check stall, then block until data arrives
-                    Self::check_stall(
-                        &mut blocks,
-                        &mut processed_ring,
-                        &mut next_block,
-                        &mut last_decode_time,
-                        &mut nal_buf,
-                        &mut nal_started,
-                    );
+                    if next_block_init && last_decode_time.elapsed() > STALL_TIMEOUT {
+                        let idx = (next_block as usize) % RING_SIZE;
+                        if let Some(ref block) = blocks[idx] {
+                            warn!(
+                                "RS: block {} stalled (had {}/{} shards), dropping",
+                                next_block, block.received, DATA_SHARDS
+                            );
+                        }
+                        blocks[idx] = None;
+                        processed_ring[idx] = None;
+                        next_block = next_block.wrapping_add(1);
+                        fec_dropped += 1;
+                    }
+
                     match self.rx.recv() {
                         Ok(p) => p,
                         Err(_) => {
@@ -130,16 +185,13 @@ impl VideoReceiver {
                 }
             };
 
-            // Check if payload starts with L2 magic (MAGIC bytes)
-            // If so, skip the L2 header (8 bytes: MAGIC[2] + drone_id[1] + type[1] + seq[4])
             let l2_header_size = if payload.len() >= 2 && payload[0..2] == link::MAGIC {
                 8
             } else {
                 0
             };
-            
+
             let actual_payload = if l2_header_size > 0 {
-                // Skip L2 header
                 if payload.len() <= l2_header_size {
                     continue;
                 }
@@ -147,22 +199,25 @@ impl VideoReceiver {
             } else {
                 &payload[..]
             };
-            
+
             if actual_payload.len() < VIDEO_HDR_LEN {
                 continue;
             }
-            
+
             payload_count += 1;
             if payload_count % 1000 == 0 {
                 info!(
-                    "VideoReceiver: {} payloads, blocks={}, next={:?}",
-                    payload_count,
-                    blocks.len(),
-                    next_block
+                    "VideoReceiver: {} payloads, recovered={}, dropped={}, next={}",
+                    payload_count, fec_recovered, fec_dropped, next_block
                 );
             }
 
-            let block_seq = u32::from_le_bytes([actual_payload[0], actual_payload[1], actual_payload[2], actual_payload[3]]);
+            let block_seq = u32::from_le_bytes([
+                actual_payload[0],
+                actual_payload[1],
+                actual_payload[2],
+                actual_payload[3],
+            ]);
             let shard_index = actual_payload[4] as usize;
             let total_shards = actual_payload[5] as usize;
             let actual_data_shards = (actual_payload[6] as usize).min(DATA_SHARDS);
@@ -175,10 +230,6 @@ impl VideoReceiver {
             }
 
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
-                warn!(
-                    "RS: invalid shard idx={} total={}",
-                    shard_index, total_shards
-                );
                 continue;
             }
 
@@ -187,19 +238,13 @@ impl VideoReceiver {
             }
             let shard_data = actual_payload[DATA_START..].to_vec();
 
-            // O(1) dedup bitmap lookup
-            let dedup_idx = (block_seq as usize) % RING_SIZE;
-            if processed_ring[dedup_idx] == Some(block_seq) {
-                continue;
-            }
-
-            if next_block.is_none() {
-                next_block = Some(block_seq);
+            if !next_block_init {
+                next_block = block_seq;
+                next_block_init = true;
             }
 
             let idx = (block_seq as usize) % RING_SIZE;
 
-            // Clear stale slot if it contains a different block_seq
             if let Some(ref existing) = blocks[idx] {
                 if existing.block_seq != block_seq {
                     blocks[idx] = None;
@@ -225,159 +270,31 @@ impl VideoReceiver {
             }
             block.shards[shard_index] = Some(shard_data);
 
-            // O(1) ready-block check: only check the specific block that just received a shard
             if block.received >= DATA_SHARDS {
                 let block = blocks[idx].take().unwrap();
                 let reconstructed = reconstruct_rs_block(&rs, &block, block.actual_data_shards);
+
                 if let Some(data_shards) = reconstructed {
                     fec_recovered += 1;
-                    if fec_recovered % 10 == 0 {
-                        info!(
-                            "RS: recovered={} dropped={} blocks",
-                            fec_recovered, fec_dropped
-                        );
+
+                    completed[idx] = Some(CompletedBlock {
+                        block_seq: block.block_seq,
+                        data_shards,
+                        shard_lens: block.shard_lens,
+                    });
+                    processed_ring[idx] = Some(block_seq);
+
+                    if block_seq == next_block {
+                        self.drain_completed(&mut completed, &mut next_block, &mut fec_recovered);
+                        last_decode_time = Instant::now();
+                    } else if Self::is_future_block(block_seq, next_block) {
+                        // block is in the future, just store it
                     }
-                    for (sidx, shard_data) in data_shards
-                        .iter()
-                        .take(block.actual_data_shards)
-                        .enumerate()
-                    {
-                        let orig_len = block.shard_lens.get(sidx).copied().unwrap_or(0);
-                        let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
-                            &shard_data[..orig_len]
-                        } else {
-                            shard_data
-                        };
-                        if trimmed.is_empty() || trimmed.len() < 2 {
-                            continue;
-                        }
-
-                        let frag_type = trimmed[0];
-                        let frag_data = &trimmed[1..];
-
-                        // Compute checksum for data integrity verification
-                        let checksum: u32 = frag_data.iter().fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
-                        
-if fec_recovered <= 3 {
-                            // NAL type detection: handle both 3-byte and 4-byte start codes
-                            // 4-byte: 00 00 00 01 67 (SPS) -> type at offset 4
-                            // 3-byte: 00 00 01 67 (SPS) -> type at offset 3
-                            let (sc_len, nalu_type) = if frag_data.len() >= 5
-                                && frag_data[0] == 0x00
-                                && frag_data[1] == 0x00
-                                && frag_data[2] == 0x00
-                                && frag_data[3] == 0x01
-                            {
-                                (4, frag_data[4] & 0x1F)
-                            } else if frag_data.len() >= 4
-                                && frag_data[0] == 0x00
-                                && frag_data[1] == 0x00
-                                && frag_data[2] == 0x01
-                            {
-                                (3, frag_data[3] & 0x1F)
-                            } else {
-                                (0, 99)
-                            };
-                            let nalu_name = match nalu_type {
-                                1 => "non-IDR",
-                                5 => "IDR",
-                                6 => "SEI",
-                                7 => "SPS",
-                                8 => "PPS",
-                                9 => "AUD",
-                                10 => "EOS",
-                                11 => "EOB",
-                                _ => "other",
-                            };
-                            info!(
-                                "NAL: seq={}, frag_type=0x{:02x}, NAL_type={} ({}), len={}, sc_len={}, first4={:02x?}",
-                                block.block_seq, frag_type, nalu_type, nalu_name, frag_data.len(), sc_len,
-                                &frag_data[..4.min(frag_data.len())]
-                            );
-                        }
-
-                        static TOTAL_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-                        match frag_type {
-                            0x00 => {
-                                let total = TOTAL_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if total < 3 {
-                                    let has_start = frag_data.len() >= 4 && 
-                                        (frag_data[..4] == [0x00, 0x00, 0x00, 0x01] || 
-                                         frag_data[..3] == [0x00, 0x00, 0x01]);
-                                    tracing::info!(
-                                        "NAL to decoder: type=0x00, len={}, has_start={}, first4={:02x?}",
-                                        frag_data.len(), has_start, &frag_data[..4.min(frag_data.len())]
-                                    );
-                                }
-                                if let Err(e) = self.tx.send(frag_data.to_vec()) {
-                                    warn!("Video frame channel closed: {}", e);
-                                }
-                            }
-                            0x01 => {
-                                nal_buf.clear();
-                                nal_buf.extend_from_slice(frag_data);
-                                nal_started = true;
-                            }
-                            0x02 => {
-                                if nal_started {
-                                    nal_buf.extend_from_slice(frag_data);
-                                }
-                            }
-                            0x03 => {
-                                if nal_started {
-                                    nal_buf.extend_from_slice(frag_data);
-                                    let total = TOTAL_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if total < 3 {
-                                        let has_start = nal_buf.len() >= 4 && 
-                                            (nal_buf[..4] == [0x00, 0x00, 0x00, 0x01] || 
-                                             nal_buf[..3] == [0x00, 0x00, 0x01]);
-                                        tracing::info!(
-                                            "NAL to decoder: type=0x03, len={}, has_start={}, first4={:02x?}",
-                                            nal_buf.len(), has_start, &nal_buf[..4.min(nal_buf.len())]
-                                        );
-                                    }
-                                    if let Err(e) = self.tx.send(nal_buf.clone()) {
-                                        warn!("Video frame channel closed: {}", e);
-                                    }
-                                    nal_buf.clear();
-                                    nal_started = false;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    _block_count += 1;
-                    processed_ring[dedup_idx] = Some(block_seq);
-                    if let Some(nb) = next_block {
-                        if block_seq >= nb {
-                            next_block = Some(block_seq.wrapping_add(1));
-                        }
-                    }
-                    last_decode_time = Instant::now();
                 } else {
                     fec_dropped += 1;
-                    processed_ring[dedup_idx] = Some(block_seq);
-                    if nal_started {
-                        nal_buf.clear();
-                        nal_started = false;
-                    }
-                    if let Some(nb) = next_block {
-                        if block_seq >= nb {
-                            next_block = Some(block_seq.wrapping_add(1));
-                        }
-                    }
+                    processed_ring[idx] = Some(block_seq);
                 }
             }
-
-            Self::check_stall(
-                &mut blocks,
-                &mut processed_ring,
-                &mut next_block,
-                &mut last_decode_time,
-                &mut nal_buf,
-                &mut nal_started,
-            );
         }
     }
 }

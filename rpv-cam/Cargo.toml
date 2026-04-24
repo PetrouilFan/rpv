@@ -23,3 +23,12 @@ serialport = { version = "4", default-features = false }
 memchr = "2"
 bytes = "1"
 arc-swap = "1"
+ffmpeg-sys-next = { version = "8", optional = true }
+
+[features]
+default = ["raw-sock", "udp-transport", "csi-cam", "usb-cam"]
+raw-sock = []          # Raw 802.11 monitor mode (requires Linux)
+udp-transport = []     # UDP/IP transport (for testing)
+csi-cam = ["ffmpeg-sys-next"]           # Raspberry Pi Camera (rpicam-vid)
+usb-cam = ["ffmpeg-sys-next"]           # USB webcam via ffmpeg
+gamepad = []           # Gamepad/Joystick input (evdev)

@@ -2966,6 +2966,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "ctrlc",
+ "ffmpeg-sys-next",
  "libc",
  "mavlink",
  "memchr",

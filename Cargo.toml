@@ -2,6 +2,11 @@
 members = ["rpv-proto", "rpv-ground", "rpv-cam"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

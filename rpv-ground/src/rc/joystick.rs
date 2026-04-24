@@ -1,29 +1,221 @@
-use evdev::{Device, KeyCode};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
 
+use arc_swap::ArcSwap;
 use rpv_proto::link;
 use rpv_proto::socket_trait::SocketTrait;
+use tracing::{debug, info, warn};
 
+const RC_CHANNELS: usize = 16;
+const RC_CENTER: u16 = 1500;
 const RC_MIN: u16 = 1000;
-const RC_MID: u16 = 1500;
 const RC_MAX: u16 = 2000;
-const DEADZONE: i32 = 4096;
-const RC_INTERVAL: Duration = Duration::from_millis(50);
+const RC_FREQUENCY_HZ: u64 = 50;
+const RC_INTERVAL_US: u64 = 1_000_000 / RC_FREQUENCY_HZ;
 
+#[cfg(feature = "gamepad")]
+const DEVICE_NAMES: [&str; 8] = [
+    "/dev/input/event0",
+    "/dev/input/event1",
+    "/dev/input/event2",
+    "/dev/input/event3",
+    "/dev/input/js0",
+    "/dev/input/js1",
+    "/dev/evdev",
+    "/dev/input/by-id/usb-*_event-joystick",
+];
+
+#[cfg(feature = "gamepad")]
+use evdev::{Device, EventType, KeyCode};
+
+pub struct RCTx {
+    socket: Arc<dyn SocketTrait>,
+    drone_id: u8,
+    running: Arc<AtomicBool>,
+    channels: Arc<ArcSwap<[u16; RC_CHANNELS]>>,
+    #[cfg(feature = "gamepad")]
+    device: Option<Device>,
+    #[cfg(not(feature = "gamepad"))]
+    device: Option<()>,
+    last_send: Instant,
+    seq: u32,
+}
+
+impl RCTx {
+    pub fn new(
+        socket: Arc<dyn SocketTrait>,
+        drone_id: u8,
+        running: Arc<AtomicBool>,
+    ) -> Self {
+        let channels = Arc::new(ArcSwap::new(Arc::new([RC_CENTER; RC_CHANNELS])));
+        
+        #[cfg(feature = "gamepad")]
+        let device = Self::find_gamepad();
+        #[cfg(not(feature = "gamepad"))]
+        let device = None;
+
+        #[cfg(feature = "gamepad")]
+        if device.is_some() {
+            info!("Gamepad detected, using for RC input");
+        } else {
+            warn!("No gamepad detected, using safe defaults");
+        }
+
+        Self {
+            socket,
+            drone_id,
+            running,
+            channels,
+            device,
+            last_send: Instant::now(),
+            seq: 0,
+        }
+    }
+
+    #[cfg(feature = "gamepad")]
+    fn find_gamepad() -> Option<Device> {
+        for name in DEVICE_NAMES.iter() {
+            if std::path::Path::new(name).exists() {
+                if let Ok(dev) = Device::open(name) {
+                    info!("Opened gamepad device: {}", name);
+                    return Some(dev);
+                }
+            }
+        }
+        // Try to find any event device
+        if let Ok(entries) = std::fs::read_dir("/dev/input") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("event") {
+                        if let Ok(dev) = Device::open(&path) {
+                            info!("Opened event device: {:?}", path);
+                            return Some(dev);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "gamepad"))]
+    #[allow(dead_code)]
+    fn find_gamepad() -> Option<()> {
+        warn!("Gamepad support not compiled in (enable 'gamepad' feature)");
+        None
+    }
+
+    pub fn channels(&self) -> Arc<ArcSwap<[u16; RC_CHANNELS]>> {
+        self.channels.clone()
+    }
+
+    pub fn run(mut self) {
+        info!("RC transmitter ready (L2 broadcast, {}Hz, deadline-based)", RC_FREQUENCY_HZ);
+
+        while self.running.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_send);
+
+            if elapsed >= Duration::from_micros(RC_INTERVAL_US) {
+                self.send_rc_packet();
+                self.last_send = now;
+            } else {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+
+            #[cfg(feature = "gamepad")]
+            self.poll_gamepad();
+        }
+    }
+
+    #[cfg(feature = "gamepad")]
+    fn poll_gamepad(&mut self) {
+        if let Some(ref mut dev) = self.device {
+            let events: Vec<_> = match dev.fetch_events() {
+                Ok(events) => events.collect(),
+                Err(e) => {
+                    debug!("Gamepad read error: {}", e);
+                    return;
+                }
+            };
+            
+            for event in events {
+                if event.event_type() == EventType::KEY {
+                    let code = event.code();
+                    let value = event.value();
+                    self.handle_key_event(code, value);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gamepad")]
+    fn handle_key_event(&mut self, code: u16, value: i32) {
+        // Map common gamepad buttons to RC channels
+        let arr = self.channels.load();
+        let mut arr_copy = (**arr).clone();
+        let mut updated = false;
+
+        match code {
+            // D-pad up/down -> throttle
+            544 if value == 1 => { arr_copy[2] = 2000; updated = true; }
+            544 if value == 0 => { arr_copy[2] = 1000; updated = true; }
+            545 if value == 1 => { arr_copy[2] = 1000; updated = true; }
+            545 if value == 0 => { arr_copy[2] = 1500; updated = true; }
+            // A button -> arm/disarm
+            304 if value == 1 => { arr_copy[4] = 2000; updated = true; }
+            304 if value == 0 => { arr_copy[4] = 1000; updated = true; }
+            // B button -> mode switch
+            305 if value == 1 => { arr_copy[5] = 2000; updated = true; }
+            305 if value == 0 => { arr_copy[5] = 1000; updated = true; }
+            _ => {}
+        }
+
+        if updated {
+            self.channels.store(Arc::new(arr_copy));
+        }
+    }
+
+    fn send_rc_packet(&mut self) {
+        let channels = self.channels.load();
+        
+        let mut payload = Vec::with_capacity(4 + RC_CHANNELS * 2);
+        payload.extend_from_slice(&(RC_CHANNELS as u32).to_le_bytes());
+        for &ch in channels.iter() {
+            payload.extend_from_slice(&ch.to_le_bytes());
+        }
+
+        let mut l2_buf = Vec::with_capacity(link::HEADER_LEN + payload.len());
+        let header = link::L2Header {
+            drone_id: self.drone_id,
+            payload_type: link::PAYLOAD_RC,
+            seq: self.seq,
+        };
+        header.encode_into(&payload, &mut l2_buf);
+
+        let mut send_buf = Vec::with_capacity(8 + 24 + link::HEADER_LEN + payload.len());
+        if let Err(e) = self.socket.send_with_buf(&l2_buf, &mut send_buf) {
+            warn!("RC send error: {}", e);
+        }
+
+        self.seq = self.seq.wrapping_add(1);
+    }
+}
+
+#[cfg(feature = "gamepad")]
 struct GamepadInput {
     device: Device,
 }
 
+#[cfg(feature = "gamepad")]
 impl GamepadInput {
     fn auto_detect() -> Option<Self> {
         let gamepad_path = match Self::find_gamepad_path() {
             Some(p) => p,
             None => {
-                error!("No gamepad found in /dev/input");
+                tracing::error!("No gamepad found in /dev/input");
                 return None;
             }
         };
@@ -33,8 +225,7 @@ impl GamepadInput {
         let mut device = match Device::open(&gamepad_path) {
             Ok(d) => d,
             Err(e) => {
-                // #1: Hard error — pilot has no control visibility
-                error!("FATAL: Failed to open gamepad {}: {}. Run as root or add user to 'input' group.", gamepad_path.display(), e);
+                tracing::error!("FATAL: Failed to open gamepad {}: {}. Run as root or add user to 'input' group.", gamepad_path.display(), e);
                 return None;
             }
         };
@@ -42,8 +233,7 @@ impl GamepadInput {
         match device.grab() {
             Ok(()) => {}
             Err(e) => {
-                // #1: Hard error — falling back to "safe defaults" hides the problem
-                error!(
+                tracing::error!(
                     "FATAL: Failed to grab gamepad: {}. Another process may be using it.",
                     e
                 );
@@ -55,18 +245,17 @@ impl GamepadInput {
         Some(Self { device })
     }
 
-    // #5: Check both event* and js* devices
-    fn find_gamepad_path() -> Option<PathBuf> {
-        let dev_path = PathBuf::from("/dev/input");
+    fn find_gamepad_path() -> Option<std::path::PathBuf> {
+        let dev_path = std::path::PathBuf::from("/dev/input");
         if !dev_path.exists() {
-            error!("/dev/input doesn't exist");
+            tracing::error!("/dev/input doesn't exist");
             return None;
         }
 
         let entries = match std::fs::read_dir(dev_path) {
             Ok(e) => e,
             Err(e) => {
-                error!("Failed to read /dev/input: {}", e);
+                tracing::error!("Failed to read /dev/input: {}", e);
                 return None;
             }
         };
@@ -75,7 +264,6 @@ impl GamepadInput {
             let path = entry.path();
             if let Some(name) = path.file_name() {
                 let name_str = name.to_string_lossy();
-                // #5: Check both evdev (event*) and joydev (js*) devices
                 if name_str.starts_with("event") || name_str.starts_with("js") {
                     if let Ok(device) = Device::open(&path) {
                         let has_abs = device.supported_absolute_axes().is_some();
@@ -92,7 +280,7 @@ impl GamepadInput {
                 }
             }
         }
-        error!("No gamepad device found in /dev/input");
+        tracing::error!("No gamepad device found in /dev/input");
         None
     }
 
@@ -106,44 +294,32 @@ impl GamepadInput {
     }
 
     fn read_input(&mut self, channels: &mut [u16; 16]) {
-        // #7: Check for dropped events (EV_SYN/SYN_DROPPED)
         match self.device.fetch_events() {
-            Ok(_events) => {
-                // Events consumed — cached_state is now up to date
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No new events — cached_state is still valid
-            }
+            Ok(_events) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                // #21: Device disconnected or error — return safe defaults
-                error!("Gamepad read error (disconnected?): {}", e);
+                tracing::error!("Gamepad read error (disconnected?): {}", e);
                 channels.fill(RC_MID);
-                channels[2] = RC_MIN; // Throttle zero
+                channels[2] = RC_MIN;
                 return;
             }
         }
 
-        // Mode 2 mapping (standard gamepad):
-        // ABS_X  (0x00) -> Left Stick X  -> Yaw
-        // ABS_Y  (0x01) -> Left Stick Y  -> Throttle
-        // ABS_RX (0x03) -> Right Stick X -> Roll
-        // ABS_RY (0x04) -> Right Stick Y -> Pitch
         let axis_yaw = Self::get_axis_value(&self.device, 0x00);
         let axis_thr = Self::get_axis_value(&self.device, 0x01);
         let axis_rol = Self::get_axis_value(&self.device, 0x03);
         let axis_pit = Self::get_axis_value(&self.device, 0x04);
 
-        channels[0] = Self::axis_to_rc(axis_rol, false, false); // Roll
-        channels[1] = Self::axis_to_rc(axis_pit, true, false); // Pitch (up=1000)
-        channels[2] = Self::axis_to_rc(axis_thr, true, true); // Throttle (up=2000)
-        channels[3] = Self::axis_to_rc(axis_yaw, false, false); // Yaw
+        channels[0] = Self::axis_to_rc(axis_rol, false, false);
+        channels[1] = Self::axis_to_rc(axis_pit, true, false);
+        channels[2] = Self::axis_to_rc(axis_thr, true, true);
+        channels[3] = Self::axis_to_rc(axis_yaw, false, false);
 
         let keys = match self.device.cached_state().key_vals() {
             Some(k) => k,
             None => return,
         };
 
-        // Button codes: BTN_A(0x130) through BTN_THUMBR(0x139) + extras
         channels[4] = Self::button_to_rc(keys.contains(KeyCode(0x120)));
         channels[5] = Self::button_to_rc(keys.contains(KeyCode(0x121)));
         channels[6] = Self::button_to_rc(keys.contains(KeyCode(0x122)));
@@ -158,7 +334,6 @@ impl GamepadInput {
         channels[15] = Self::button_to_rc(keys.contains(KeyCode(0x12b)));
     }
 
-    // #6: Continuous deadzone mapping — no jump at threshold
     fn axis_to_rc(axis: Option<i32>, invert: bool, throttle_mode: bool) -> u16 {
         let value = match axis {
             Some(v) => v,
@@ -171,14 +346,11 @@ impl GamepadInput {
             let normalized = ((value + 32767) as f64 / 65534.0).clamp(0.0, 1.0);
             (RC_MIN as f64 + normalized * (RC_MAX as f64 - RC_MIN as f64)) as u16
         } else {
-            // #6: Linear remap with continuous deadzone
-            // Map [-32767, 32767] → [-1.0, 1.0] with deadzone suppression
             let abs_val = value.abs();
             let effective_range = 32767 - DEADZONE;
             let with_deadzone = if abs_val <= DEADZONE {
                 0.0
             } else {
-                // Continuous: no jump, smooth transition from deadzone edge
                 ((abs_val - DEADZONE) as f64 / effective_range as f64).clamp(0.0, 1.0)
                     * value.signum() as f64
             };
@@ -195,122 +367,5 @@ impl GamepadInput {
     }
 }
 
-pub struct RCTx {
-    socket: Arc<dyn SocketTrait>,
-    drone_id: u8,
-    channels: Arc<arc_swap::ArcSwap<[u16; 16]>>,
-    gamepad: Option<GamepadInput>,
-    l2_seq: u32,
-    running: Arc<AtomicBool>,
-}
-
-impl RCTx {
-    pub fn new(socket: Arc<dyn SocketTrait>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
-        let gamepad = GamepadInput::auto_detect();
-
-        if gamepad.is_some() {
-            info!("Gamepad input enabled");
-        } else {
-            // #1: Print visible warning so pilot knows there's no controller
-            warn!("NO GAMEPAD DETECTED — RC channels stuck at safe defaults (throttle zero). Drone will not arm.");
-            info!("No gamepad detected, using safe defaults");
-        }
-
-        Self {
-            socket,
-            drone_id,
-            // #2: Throttle default to RC_MIN (1000) to keep throttle at zero
-            // This is correct for "no gamepad" — throttle must be zero.
-            // The failsafe issue (#2) is in fc.rs, not here — the FC writer
-            // should check if any real RC data has EVER been received.
-            channels: Arc::new(arc_swap::ArcSwap::from({
-                let mut ch = [RC_MID; 16];
-                ch[2] = RC_MIN;
-                Arc::new(ch)
-            })),
-            gamepad,
-            l2_seq: 0,
-            running,
-        }
-    }
-
-    pub fn channels(&self) -> Arc<arc_swap::ArcSwap<[u16; 16]>> {
-        Arc::clone(&self.channels)
-    }
-
-    pub fn run(&mut self) {
-        info!("RC transmitter ready (L2 broadcast, 20Hz, deadline-based)");
-
-        let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
-        let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::MAX_PAYLOAD);
-        // #16: Pre-allocated payload buffer (reused each cycle)
-        let mut payload_buf: Vec<u8> = Vec::with_capacity(4 + 16 * 2);
-        let mut next_send = Instant::now();
-        let mut max_jitter_us: u64 = 0;
-        let mut jitter_samples: u64 = 0;
-
-        while self.running.load(Ordering::SeqCst) {
-            let now = Instant::now();
-            if now < next_send {
-                // #19: Loop sleep to handle EINTR
-                let mut remaining = next_send - now;
-                while remaining > Duration::ZERO {
-                    let before = Instant::now();
-                    std::thread::sleep(remaining);
-                    let elapsed = before.elapsed();
-                    if elapsed >= remaining {
-                        break;
-                    }
-                    remaining -= elapsed;
-                }
-            }
-
-            let actual = Instant::now();
-            let slip = actual.duration_since(next_send);
-            if slip.as_micros() > 0 {
-                let slip_us = slip.as_micros() as u64;
-                if slip_us > max_jitter_us {
-                    max_jitter_us = slip_us;
-                }
-                jitter_samples += 1;
-                if jitter_samples % 3000 == 0 {
-                    tracing::debug!(
-                        "RC: max scheduling jitter {} us over {} samples",
-                        max_jitter_us,
-                        jitter_samples
-                    );
-                    max_jitter_us = 0;
-                }
-            }
-
-            next_send += RC_INTERVAL;
-
-            if let Some(ref mut gp) = self.gamepad {
-                let mut channel_buf = [0u16; 16];
-                gp.read_input(&mut channel_buf);
-                // Store via ArcSwap — lock-free write
-                self.channels.store(Arc::new(channel_buf));
-            }
-
-            // Load channels via ArcSwap — lock-free read
-            let channels: [u16; 16] = **self.channels.load();
-
-            // #16: Reuse payload buffer — no per-cycle allocation
-            payload_buf.clear();
-            let count = channels.len() as u32;
-            payload_buf.extend_from_slice(&count.to_le_bytes());
-            for &ch in channels.iter() {
-                payload_buf.extend_from_slice(&ch.to_le_bytes());
-            }
-
-            let header = link::L2Header {
-                drone_id: self.drone_id,
-                payload_type: link::PAYLOAD_RC,
-                seq: self.l2_seq,
-            };
-            header.encode_into(&payload_buf, &mut l2_buf);
-            let _ = self.socket.send_with_buf(&l2_buf, &mut send_buf);
-            self.l2_seq = self.l2_seq.wrapping_add(1);
-        }
-    }
-}
+const DEADZONE: i32 = 1000;
+const RC_MID: u16 = 1500;
