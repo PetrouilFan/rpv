@@ -315,19 +315,17 @@ fn decode_loop_libavcodec(
             }
         };
 
-        // Strip any Annex-B start codes (0x000001 or 0x00000001) from the beginning
-        // The camera now prepends start codes, so we need to remove them before decoding
         let mut nal_start = 0usize;
         for i in 0..nal_data.len().saturating_sub(3) {
             if nal_data[i] == 0x00 && nal_data[i + 1] == 0x00 {
                 if i + 2 < nal_data.len() && nal_data[i + 2] == 0x01 {
-                    nal_start = i + 3; // Skip 00 00 01
+                    nal_start = i;
                     break;
                 } else if i + 3 < nal_data.len()
                     && nal_data[i + 2] == 0x00
                     && nal_data[i + 3] == 0x01
                 {
-                    nal_start = i + 4; // Skip 00 00 00 01
+                    nal_start = i;
                     break;
                 }
             }
