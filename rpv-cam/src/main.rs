@@ -153,7 +153,7 @@ fn main() {
             .unwrap();
         let std_socket = Arc::new(std_socket);
 
-        match UdpSocket::new(std_socket, peer_addr) {
+        match UdpSocket::new(std_socket, peer_addr, cfg.common.udp_port) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!("Failed to create UDP socket: {}", e);

@@ -48,7 +48,9 @@ fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
 }
 
 fn write_link_status(status: &str) {
-    let _ = std::fs::write(STATUS_FILE, status);
+    if let Err(e) = std::fs::write(STATUS_FILE, status) {
+        tracing::warn!("Failed to write link status file: {}", e);
+    }
 }
 
 fn join_log(name: &str, handle: std::thread::JoinHandle<()>) {
@@ -883,15 +885,32 @@ fn main() -> Result<(), eframe::Error> {
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
-    ctrlc::set_handler(move || {
+    if let Err(e) = ctrlc::set_handler(move || {
         tracing::info!("Ctrl+C received, shutting down...");
         r.store(false, Ordering::SeqCst);
-    })
-    .expect("Failed to set ctrl+c handler");
+    }) {
+        tracing::error!("Failed to install Ctrl-C handler: {}. Clean shutdown may not work.", e);
+    }
 
     let is_udp = config.common.transport == "udp";
 
     let socket: Arc<dyn SocketTrait> = if is_udp {
+        // If peer_addr is pre-configured, set it directly; otherwise use discovery
+        let preconfigured_addr: Option<std::net::SocketAddr> = if let Some(ref peer) = config.common.peer_addr {
+            match peer.parse() {
+                Ok(addr) => {
+                    tracing::info!("Using configured camera address: {}", addr);
+                    Some(addr)
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid peer_addr '{}': {}, falling back to discovery", peer, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let (_discovery, peer_addr) =
             discovery::Discovery::spawn(0x02, config.common.drone_id, config.common.udp_port)
                 .unwrap_or_else(|e| {
@@ -899,29 +918,30 @@ fn main() -> Result<(), eframe::Error> {
                     std::process::exit(1);
                 });
 
-        let mut waited = std::time::Duration::ZERO;
-        let wait_timeout = if config.common.peer_addr.is_some() {
-            std::time::Duration::from_millis(100)
+        // If pre-configured, set the address directly; otherwise wait for discovery
+        if let Some(addr) = preconfigured_addr {
+            peer_addr.store(Arc::new(Some(addr)));
         } else {
-            std::time::Duration::from_secs(30)
-        };
-        while peer_addr.load().is_none() && waited < wait_timeout {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            waited += std::time::Duration::from_millis(200);
-            if (waited.as_millis() as u64) % 2000 < 200 {
-                tracing::info!("Searching for camera... ({}s elapsed)", waited.as_secs());
+            let mut waited = std::time::Duration::ZERO;
+            let wait_timeout = std::time::Duration::from_secs(30);
+            while peer_addr.load().is_none() && waited < wait_timeout {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                waited += std::time::Duration::from_millis(200);
+                if (waited.as_millis() as u64) % 2000 < 200 {
+                    tracing::info!("Searching for camera... ({}s elapsed)", waited.as_secs());
+                }
             }
-        }
 
-        if peer_addr.load().is_none() {
-            tracing::warn!(
-                "No camera discovered after {}s — continuing anyway",
-                wait_timeout.as_secs()
-            );
-        } else {
-            let addr = peer_addr.load();
-            tracing::info!("Camera discovered at {}", addr.as_ref().unwrap());
-        }
+            if peer_addr.load().is_none() {
+                tracing::warn!(
+                    "No camera discovered after {}s — continuing anyway",
+                    wait_timeout.as_secs()
+                );
+            } else {
+                let discovered_addr = peer_addr.load();
+                tracing::info!("Camera discovered at {}", discovered_addr.as_ref().unwrap());
+            }
+        };
 
         let std_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", config.common.udp_port))
             .map_err(|e| {
@@ -935,7 +955,7 @@ fn main() -> Result<(), eframe::Error> {
             .unwrap();
         let std_socket = Arc::new(std_socket);
 
-        match UdpSocket::new(std_socket, peer_addr) {
+        match UdpSocket::new(std_socket, peer_addr, config.common.udp_port) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!("Failed to create UDP socket: {}", e);
@@ -1332,6 +1352,10 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<dyn SocketTrait>, dron
     let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::HEADER_LEN + 19);
 
     while running.load(Ordering::SeqCst) {
+        // NOTE: Using wall-clock SystemTime for heartbeat timestamp. Backward clock jumps
+        // can make timestamps non-monotonic even when the link is healthy. This is a
+        // trade-off: simple implementation vs. monotonic timestamps. If strict monotonic
+        // timestamps are needed, consider using a monotonic counter instead.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

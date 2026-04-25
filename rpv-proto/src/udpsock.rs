@@ -16,10 +16,13 @@ impl UdpSocket {
     pub fn new(
         socket: Arc<StdUdpSocket>,
         peer: Arc<ArcSwap<Option<SocketAddr>>>,
+        udp_port: u16,
     ) -> io::Result<Self> {
-        let broadcast_addr: SocketAddr = "255.255.255.255:9001".parse().unwrap();
+        let broadcast_addr: SocketAddr = format!("255.255.255.255:{}", udp_port)
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        tracing::info!("UDP socket ready (shared with discovery)");
+        tracing::info!("UDP socket ready (shared with discovery, port {})", udp_port);
         Ok(Self {
             socket,
             peer,

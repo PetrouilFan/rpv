@@ -180,8 +180,9 @@ fn discovery_loop(
         }
 
         if last_log.elapsed() >= Duration::from_secs(5) {
-            if current.is_some() {
-                tracing::debug!("Discovery: connected to {}", current.as_ref().unwrap());
+            let current = peer_addr.load();
+            if let Some(ref addr) = current.as_ref() {
+                tracing::debug!("Discovery: connected to {}", addr);
             } else {
                 tracing::debug!("Discovery: searching for peer...");
             }
