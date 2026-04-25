@@ -93,24 +93,18 @@ impl CommonConfig {
         }
     }
 
-    /// Validate config, logging any errors.
-    /// Returns true if config is valid.
+/// Validate config, logging any errors.
+/// Returns true if config is valid.
     pub fn validate_and_log(&self) -> bool {
         let errors = self.validate();
-        if !errors.is_empty() {
-            tracing::error!("Config validation failed:");
+        if errors.is_empty() {
+            true
+        } else {
             for err in &errors {
-                tracing::error!("  - {}", err);
+                tracing::error!("Config error: {}", err);
             }
-            return false;
+            false
         }
-        if !errors.is_empty() {
-            tracing::warn!("Config warnings:");
-            for err in &errors {
-                tracing::warn!("  - {}", err);
-            }
-        }
-        true
     }
 
     pub fn save_to_file(&self, path: &std::path::Path) {

@@ -877,7 +877,7 @@ fn main() -> Result<(), eframe::Error> {
         .init();
 
     let (config, was_default) = Config::load();
-    tracing::info!("Config: {:?}", config);
+    tracing::debug!("Config: {:?}", config);
     tracing::info!(
         "rpv ground station starting ({} mode)",
         config.common.transport

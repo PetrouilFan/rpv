@@ -74,7 +74,7 @@ fn main() {
         .init();
 
     let (cfg, _was_default) = config::Config::load();
-    tracing::info!("Config: {:?}", cfg);
+    tracing::debug!("Config: {:?}", cfg);
     tracing::info!("rpv-cam starting (Pi 5, {} mode)", cfg.common.transport);
 
     let running = Arc::new(AtomicBool::new(true));

@@ -2,15 +2,21 @@
 ///
 /// Layout (8 bytes fixed header):
 ///   [0..2]  Magic: 0x52 0x50 ("RP")
-///   [2]     Drone ID: filters frames from other swarms
+///   [2]     Drone ID: filters frames from other swarms (1-255)
 ///   [3]     Payload Type: 0x01=Video, 0x02=Telemetry, 0x03=RC, 0x04=Heartbeat, 0x05=MAVLink
+///   [4..8]  Sequence number (u32 LE) - enables frame ordering and loss detection
 pub const MAGIC: [u8; 2] = [0x52, 0x50];
 pub const HEADER_LEN: usize = 8;
 
+/// Video data: RS-encoded FEC shards with video header
 pub const PAYLOAD_VIDEO: u8 = 0x01;
+/// Telemetry: JSON format from camera (lat, lon, alt, etc.)
 pub const PAYLOAD_TELEMETRY: u8 = 0x02;
+/// RC commands: 16-channel PWM values (1000-2000)
 pub const PAYLOAD_RC: u8 = 0x03;
+/// Heartbeat: link health indicator (rpv-bea + seq + timestamp)
 pub const PAYLOAD_HEARTBEAT: u8 = 0x04;
+/// MAVLink: raw FC communication frames
 pub const PAYLOAD_MAVLINK: u8 = 0x05;
 
 /// Maximum safe payload size for 802.11 frame without fragmentation.
@@ -36,6 +42,8 @@ impl L2Header {
         buf.extend_from_slice(payload);
     }
 
+    /// Decode a framed L2 header from raw bytes.
+    /// Returns Some((header, payload)) if valid, None otherwise.
     #[inline]
     pub fn decode(frame: &[u8]) -> Option<(L2Header, &[u8])> {
         if frame.len() < HEADER_LEN {
@@ -53,7 +61,10 @@ impl L2Header {
     }
 
     /// Fast magic check — avoids full HEADER_LEN check since rawsock
-    /// already verified frame size. Full decode() enforces the 8-byte minimum.
+    /// already verified frame size.
+    ///
+    /// Use this as a filter before calling `decode()` to avoid
+    /// unnecessary processing for non-RPV frames.
     #[inline]
     pub fn matches_magic(frame: &[u8]) -> bool {
         frame.len() >= 2 && frame[0] == MAGIC[0] && frame[1] == MAGIC[1]
