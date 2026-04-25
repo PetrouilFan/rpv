@@ -130,8 +130,13 @@ fn discovery_loop(
                         PEER_SEEN_COUNT.fetch_add(1, Ordering::Relaxed);
                         last_seen.store(PEER_SEEN_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
 
-                        let peer_data_addr: SocketAddr =
-                            format!("{}:{}", src.ip(), peer_data_port).parse().unwrap();
+                        let peer_data_addr = match format!("{}:{}", src.ip(), peer_data_port).parse::<SocketAddr>() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                tracing::warn!("Failed to parse peer address: {}", e);
+                                continue;
+                            }
+                        };
                         let current = peer_addr.load();
                         let changed = match current.as_ref() {
                             Some(existing) => *existing != peer_data_addr,

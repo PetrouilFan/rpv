@@ -38,11 +38,14 @@ fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
             };
             let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
             if ret < 0 {
+                let err = std::io::Error::last_os_error();
                 tracing::warn!(
-                    "Failed to set SCHED_FIFO priority {}: {}",
+                    "Failed to set SCHED_FIFO priority {}: {}. Running with standard scheduling.",
                     prio,
-                    std::io::Error::last_os_error()
+                    err
                 );
+            } else {
+                tracing::info!("Set SCHED_FIFO priority {} (real-time)", prio);
             }
         }
     }
@@ -52,7 +55,9 @@ fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
 static VIDEO_HEALTHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn write_link_status(status: &str) {
-    let _ = std::fs::write(STATUS_FILE, status);
+    if let Err(e) = std::fs::write(STATUS_FILE, status) {
+        tracing::warn!("Failed to write link status file: {}", e);
+    }
 }
 
 fn join_log(name: &str, handle: std::thread::JoinHandle<()>) {
@@ -75,11 +80,14 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
-    ctrlc::set_handler(move || {
+    // Install Ctrl-C handler for clean shutdown
+    // NOTE: If this fails, the process won't have clean shutdown handling
+    if let Err(e) = ctrlc::set_handler(move || {
         tracing::info!("Shutting down...");
         r.store(false, Ordering::SeqCst);
-    })
-    .ok();
+    }) {
+        tracing::error!("Failed to install Ctrl-C handler: {}. Clean shutdown may not work.", e);
+    }
 
     let is_udp = cfg.common.transport == "udp";
 
@@ -93,13 +101,21 @@ fn main() {
 
         if let Some(ref peer) = cfg.common.peer_addr {
             // Use pre-configured peer address, skip discovery
-            let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| {
-                tracing::error!("Invalid peer_addr '{}': {}", peer, e);
-                std::process::exit(1);
-            });
-            tracing::info!("Using configured peer address: {}", addr);
-            peer_addr.store(std::sync::Arc::new(Some(addr)));
-        } else {
+            // If parsing fails, fall back to discovery instead of exiting
+            match peer.parse() {
+                Ok(addr) => {
+                    tracing::info!("Using configured peer address: {}", addr);
+                    peer_addr.store(std::sync::Arc::new(Some(addr)));
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid peer_addr '{}': {}, falling back to discovery", peer, e);
+                    // Fall through to discovery logic below
+                }
+            }
+        }
+
+        // If peer_addr not set (either not configured or parse failed), use discovery
+        if peer_addr.load().is_none() {
             let (_disc, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
                 .unwrap_or_else(|e| {
                     tracing::error!("Failed to start discovery: {}", e);
@@ -119,8 +135,8 @@ fn main() {
 
             if addr.load().is_none() {
                 tracing::warn!("No ground station discovered after {}s — continuing anyway, will connect when found", wait_timeout.as_secs());
-            } else {
-                tracing::info!("Ground station discovered at {}", addr.load().as_ref().unwrap());
+            } else if let Some(ref addr) = **addr.load() {
+                tracing::info!("Ground station discovered at {}", addr);
                 write_link_status("connected");
             }
             peer_addr.store(Arc::clone(&*addr.load()));
@@ -166,7 +182,7 @@ fn main() {
 
     // Start MAVLink FC link
     let (fc_rc_tx, fc_telem_rx, fc_raw_downlink_rx, fc_raw_uplink_tx) =
-        match fc::start(running.clone(), &cfg.fc_port, cfg.fc_baud) {
+        match fc::start(running.clone(), &cfg.fc_port, cfg.fc_baud, cfg.common.drone_id) {
             Some(link) => (
                 Some(link.rc_tx),
                 Some(link.telem_rx),
@@ -279,6 +295,8 @@ fn main() {
                         let buf_to_send =
                             std::mem::replace(&mut l2_buf, Vec::with_capacity(link::MAX_PAYLOAD));
                         if fwd_hp_tx.send(buf_to_send).is_err() {
+                            // HP channel full - terminate forwarder to signal failure upstream
+                            tracing::warn!("MAVLink forwarder: HP channel full, terminating");
                             break;
                         }
                         l2_seq = l2_seq.wrapping_add(1);
@@ -292,8 +310,10 @@ fn main() {
     });
 
     // Wait for shutdown
+    // Wait for shutdown signal (Ctrl-C sets running to false)
+    // Use shorter sleep for faster shutdown response (was 500ms)
     while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(50));
     }
 
     write_link_status("disconnected");
@@ -323,6 +343,14 @@ fn rx_dispatcher(
     let failsafe_timeout = Duration::from_secs(2);
     let mut failsafe_active = false;
     let mut magic_rejects: u64 = 0;
+
+    // Clean up any stale RC file at startup to prevent old controls from persisting
+    if rc_tx.is_none() {
+        if std::path::Path::new(rc_file_path).exists() {
+            tracing::info!("Cleaning stale RC file at startup");
+            let _ = std::fs::remove_file(rc_file_path);
+        }
+    }
 
     while running.load(Ordering::SeqCst) {
         if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
@@ -356,8 +384,16 @@ fn rx_dispatcher(
                     "RX: magic mismatch, payload first 8 bytes: {:02x?}",
                     &payload[..8.min(payload.len())]
                 );
+            } else if magic_rejects % 1000 == 0 {
+                // Periodically log the reject count to track noise levels
+                tracing::warn!("RX: {} magic rejects since last valid packet", magic_rejects);
             }
             continue;
+        }
+        // Reset magic_rejects on valid packet to avoid aggregating stale noise
+        if magic_rejects > 0 {
+            tracing::debug!("RX: valid packet after {} magic rejects", magic_rejects);
+            magic_rejects = 0;
         }
         let (header, data) = match link::L2Header::decode(payload) {
             Some(h) => h,
@@ -399,11 +435,23 @@ fn rx_dispatcher(
                 } else {
                     let ch_str: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
                     let tmp_path = format!("{}.tmp", rc_file_path);
-                    if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                        use std::io::Write;
-                        let _ = f.write_all(ch_str.join(",").as_bytes());
-                        let _ = f.flush();
-                        let _ = std::fs::rename(&tmp_path, rc_file_path);
+                    match std::fs::File::create(&tmp_path) {
+                        Ok(mut f) => {
+                            use std::io::Write;
+                            if let Err(e) = f.write_all(ch_str.join(",").as_bytes()) {
+                                tracing::warn!("RC file write error: {}", e);
+                            } else if let Err(e) = f.sync_all() {
+                                // NOTE: fsync ensures data hits disk, reducing torn file risk on crash/power loss
+                                tracing::warn!("RC file fsync error: {}", e);
+                            }
+                            // Atomic rename (note: directory sync would provide stronger guarantees)
+                            if let Err(e) = std::fs::rename(&tmp_path, rc_file_path) {
+                                tracing::warn!("RC file rename error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("RC file create error: {}", e);
+                        }
                     }
                     last_rc_time = Instant::now();
                     failsafe_active = false;
@@ -512,6 +560,10 @@ fn telemetry_sender(
         }
 
         if let Some(ref rx) = fc_telem_rx {
+            // NOTE: Drain latest telemetry, discarding intermediate states.
+            // This design prioritizes freshness (only send newest sample) but can
+            // hide short armed/mode transitions that occur between 200ms intervals.
+            // Trade-off: Reduced UI jitter vs. missed transient states.
             while let Ok(t) = rx.try_recv() {
                 fc_telem = t;
             }
@@ -534,7 +586,10 @@ fn telemetry_sender(
             "battery_pct": battery_pct_json,
             "mode": fc_telem.mode,
             "armed": fc_telem.armed,
+            // camera_ok = camera hardware present AND video encoder producing NALs
+            // video_healthy = encoder actively extracting/transmitting NAL units
             "camera_ok": camera_ok && VIDEO_HEALTHY.load(Ordering::Relaxed),
+            "video_healthy": VIDEO_HEALTHY.load(Ordering::Relaxed),
         });
         if serde_json::to_writer(&mut json_buf, &telem).is_err() {
             continue;
@@ -563,6 +618,8 @@ fn heartbeat_sender(running: Arc<AtomicBool>, socket: Arc<dyn SocketTrait>, dron
     let mut send_buf: Vec<u8> = Vec::with_capacity(8 + 24 + link::HEADER_LEN + 19);
 
     while running.load(Ordering::SeqCst) {
+        // NOTE: Using wall-clock SystemTime for heartbeat timestamp. Backward clock jumps
+        // can make timestamps non-monotonic even when the link is healthy.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

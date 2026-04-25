@@ -62,7 +62,12 @@ pub struct FcLink {
 ///
 /// Returns handles for the RC and telemetry flows, or `None` if the serial
 /// port could not be opened (non-fatal — the system runs without FC).
-pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcLink> {
+pub fn start(
+    running: Arc<AtomicBool>,
+    port_path: &str,
+    baud: u32,
+    drone_id: u8,
+) -> Option<FcLink> {
     // Create persistent channels that survive reconnections
     let (telem_tx, telem_rx) = unbounded::<FcTelemetry>();
     let (rc_tx, rc_rx) = bounded::<Vec<u16>>(2);
@@ -115,12 +120,19 @@ pub fn start(running: Arc<AtomicBool>, port_path: &str, baud: u32) -> Option<FcL
             let rc_rx_clone = rc_rx.clone();
             let ul_rx_clone = raw_uplink_rx.clone();
             let writer_handle = thread::spawn(move || {
-                fc_writer(writer_running, writer_port, rc_rx_clone, ul_rx_clone);
+                fc_writer(writer_running, writer_port, rc_rx_clone, ul_rx_clone, drone_id);
             });
 
-            // Wait for both threads to finish
-            reader_handle.join().ok();
-            writer_handle.join().ok();
+            // Wait for both threads to finish and log any panics
+            let reader_panic = reader_handle.join();
+            let writer_panic = writer_handle.join();
+
+            if let Err(e) = reader_panic {
+                tracing::error!("FC reader thread panicked: {:?}", e);
+            }
+            if let Err(e) = writer_panic {
+                tracing::error!("FC writer thread panicked: {:?}", e);
+            }
 
             if !running.load(Ordering::SeqCst) {
                 break;
@@ -156,13 +168,22 @@ fn fc_reader(
         match reader_port.read(&mut raw_buf) {
             Ok(0) => {
                 tracing::warn!("FC serial EOF");
-                thread::sleep(Duration::from_millis(100));
+                // Reduced from 100ms to 10ms for faster recovery
+                thread::sleep(Duration::from_millis(10));
                 continue;
             }
             Ok(n) => {
                 acc.extend_from_slice(&raw_buf[..n]);
+                // Buffer overflow protection: instead of discarding ALL data,
+                // keep the last few bytes (potential partial message start).
+                // MAVLink messages have magic bytes 0xFE or 0xFD at the start.
+                // Keeping 16 bytes gives us room to find a message boundary.
                 if acc.len() > 8192 {
+                    const KEEP_BYTES: usize = 16;
+                    let tail = acc[acc.len() - KEEP_BYTES..].to_vec();
                     acc.clear();
+                    acc.extend_from_slice(&tail);
+                    tracing::debug!("FC MAVLink buffer overflow, preserved {} tail bytes", KEEP_BYTES);
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -176,11 +197,15 @@ fn fc_reader(
             }
             Err(e) => {
                 tracing::warn!("FC serial read error: {}", e);
-                thread::sleep(Duration::from_millis(50));
+                // Reduced from 50ms to 10ms for faster recovery
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
-        // Parse all complete messages from the accumulator
+        // Track dropped MAVLink frames for operator visibility
+    static DOWNLINK_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    // Parse all complete messages from the accumulator
         while !acc.is_empty() {
             let consumed = {
                 let mut cursor = Cursor::new(&*acc);
@@ -190,7 +215,17 @@ fn fc_reader(
                         drop(peek);
                         let consumed = cursor.position() as usize;
 
-                        let _ = raw_downlink_tx.try_send(acc[..consumed].to_vec());
+                        // Log drops when channel is full
+                        // NOTE: Raw frame forwarding (to GCS) and telemetry parsing are independent.
+                        // If the forward channel is full, raw frames are dropped but telemetry
+                        // still updates the UI. This can cause asymmetry between GCS and UI,
+                        // but ensures local telemetry stays current even under backpressure.
+                        if raw_downlink_tx.try_send(acc[..consumed].to_vec()).is_err() {
+                            let drops = DOWNLINK_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if drops % 100 == 1 {
+                                tracing::warn!("FC MAVLink downlink frame dropped (channel full), total drops: {}", drops);
+                            }
+                        }
 
                         match msg {
                             MavMessage::SYS_STATUS(s) => {
@@ -256,6 +291,7 @@ fn fc_writer(
     mut writer_port: Box<dyn serialport::SerialPort>,
     rc_rx: crossbeam_channel::Receiver<Vec<u16>>,
     raw_uplink_rx: crossbeam_channel::Receiver<Vec<u8>>,
+    drone_id: u8,
 ) {
     let mut header = MavHeader {
         sequence: 0,
@@ -263,8 +299,20 @@ fn fc_writer(
         component_id: 0,
     };
     let mut last_rc_time = Instant::now();
+
+    // NOTE: This failsafe is based on LOCAL RC timing (time since last RC packet received).
+    // It may NOT match FC-side failsafe timing - there could be a race condition or
+    // arbitration between FC and ground station failsafe logic.
+    // The FC may have its own failsafe (e.g., RCMODE, Failsafe Timeout) that could
+    // trigger differently than this local timing.
     let failsafe_timeout = Duration::from_millis(1500);
     let mut failsafe_active = false;
+
+    // Throttle neutrality threshold: requires throttle >= 1050 to clear failsafe.
+    // WARNING: This may be wrong for vehicles using different RC calibration,
+    // reversed channels, or non-center-neutral auxiliary semantics.
+    const THROTTLE_NEUTRAL_THRESHOLD: u16 = 1050;
+
     let mut last_heartbeat = Instant::now() - Duration::from_secs(2);
     let mut _last_channels: Vec<u16> = vec![1500; 8];
 
@@ -289,7 +337,9 @@ fn fc_writer(
                 last_rc_time = Instant::now();
                 if failsafe_active {
                     let throttle = channels.get(2).copied().unwrap_or(1500);
-                    if throttle > 1050 {
+                    if throttle > THROTTLE_NEUTRAL_THRESHOLD {
+                        // Failsafe active but RC stick still high - drain uplink but don't send
+                        while raw_uplink_rx.try_recv().is_ok() {}
                         continue;
                     }
                     tracing::info!("RC failsafe cleared (throttle at neutral)");
@@ -297,7 +347,7 @@ fn fc_writer(
                 failsafe_active = false;
                 _last_channels = channels.clone();
 
-                let msg = channels_to_override(&channels, 1);
+                let msg = channels_to_override(&channels, drone_id);
                 if !write_mavlink(&mut writer_port, &mut header, &msg) {
                     break;
                 }
@@ -305,7 +355,7 @@ fn fc_writer(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
                     tracing::warn!("RC failsafe: holding mid-sticks, throttle to zero");
-                    let msg = failsafe_override(1);
+                    let msg = failsafe_override(drone_id);
                     if !write_mavlink(&mut writer_port, &mut header, &msg) {
                         break;
                     }
@@ -363,6 +413,11 @@ fn channels_to_override(channels: &[u16], target_system: u8) -> MavMessage {
     })
 }
 
+/// Creates an RC_CHANNELS_OVERRIDE message for failsafe state.
+/// Default: throttle=1000 (low), all other channels at 1500 (mid), aux channels disabled.
+/// NOTE: These values may not be appropriate for all vehicle types.
+/// Channel 3 (throttle) at 1000 is typical for "low throttle" failsafe.
+/// Channels 5-8 set to 0 (disabled) since RC_CHANNELS_OVERRIDE treats 0 as "ignore".
 fn failsafe_override(target_system: u8) -> MavMessage {
     MavMessage::RC_CHANNELS_OVERRIDE(mavlink::common::RC_CHANNELS_OVERRIDE_DATA {
         chan1_raw: 1500,
@@ -631,6 +686,52 @@ mod tests {
         match msg2.1 {
             MavMessage::SYS_STATUS(s) => assert_eq!(s.voltage_battery, 11100),
             other => panic!("expected SYS_STATUS, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rc_channels_to_override_all_channels() {
+        let channels: Vec<u16> = vec![1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 1500, 1500, 1500, 1500, 1500];
+        let msg = channels_to_override(&channels, 1);
+        match msg {
+            MavMessage::RC_CHANNELS_OVERRIDE(r) => {
+                assert_eq!(r.chan1_raw, 1000);
+                assert_eq!(r.chan2_raw, 1100);
+                assert_eq!(r.chan3_raw, 1200);
+                assert_eq!(r.chan4_raw, 1300);
+                assert_eq!(r.chan5_raw, 1400);
+                assert_eq!(r.chan6_raw, 1500);
+                assert_eq!(r.chan7_raw, 1600);
+                assert_eq!(r.chan8_raw, 1700);
+            }
+            other => panic!("expected RC_CHANNELS_OVERRIDE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rc_channels_to_override_defaults_missing() {
+        let channels: Vec<u16> = vec![1500];
+        let msg = channels_to_override(&channels, 1);
+        match msg {
+            MavMessage::RC_CHANNELS_OVERRIDE(r) => {
+                assert_eq!(r.chan1_raw, 1500);
+                assert_eq!(r.chan2_raw, 1500);
+                assert_eq!(r.target_system, 1);
+            }
+            other => panic!("expected RC_CHANNELS_OVERRIDE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn failsafe_override_throttle_low() {
+        let msg = failsafe_override(1);
+        match msg {
+            MavMessage::RC_CHANNELS_OVERRIDE(r) => {
+                assert_eq!(r.chan3_raw, 1000);
+                assert_eq!(r.chan1_raw, 1500);
+                assert_eq!(r.chan2_raw, 1500);
+            }
+            other => panic!("expected RC_CHANNELS_OVERRIDE, got {:?}", other),
         }
     }
 }

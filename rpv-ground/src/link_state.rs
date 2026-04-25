@@ -163,3 +163,64 @@ impl LinkStateHandle {
         self.state.camera_available();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_state_searching_to_connected_via_heartbeat() {
+        let state = LinkStateMachine::new();
+        assert_eq!(state.get(), LinkStatus::Searching);
+
+        state.heartbeat_restored();
+        assert_eq!(state.get(), LinkStatus::Connected);
+
+        state.heartbeat_lost();
+        assert_eq!(state.get(), LinkStatus::SignalLost);
+
+        state.heartbeat_restored();
+        assert_eq!(state.get(), LinkStatus::Connected);
+    }
+
+    #[test]
+    fn link_state_heartbeat_restored_checks_camera_ok() {
+        let state = LinkStateMachine::new();
+
+        state.camera_unavailable();
+        state.heartbeat_restored();
+        assert_eq!(state.get(), LinkStatus::NoCamera);
+
+        state.camera_available();
+        state.heartbeat_restored();
+        assert_eq!(state.get(), LinkStatus::Connected);
+    }
+
+    #[test]
+    fn link_state_telemetry_does_not_override_signal_lost() {
+        let state = LinkStateMachine::new();
+
+        state.heartbeat_restored();
+        assert_eq!(state.get(), LinkStatus::Connected);
+
+        state.heartbeat_lost();
+        assert_eq!(state.get(), LinkStatus::SignalLost);
+
+        state.telemetry_activity();
+        assert_eq!(state.get(), LinkStatus::SignalLost);
+    }
+
+    #[test]
+    fn link_state_video_frame_decoded_only_from_searching() {
+        let state = LinkStateMachine::new();
+
+        state.video_frame_decoded();
+        assert_eq!(state.get(), LinkStatus::Connected);
+
+        state.heartbeat_lost();
+        assert_eq!(state.get(), LinkStatus::SignalLost);
+
+        state.video_frame_decoded();
+        assert_eq!(state.get(), LinkStatus::SignalLost);
+    }
+}
