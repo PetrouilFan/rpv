@@ -41,4 +41,4 @@ jobs:
         run: cargo check --workspace
 
       - name: Build release
-        run: cargo build --workspace --release --no-default-features --features "raw-sock,udp-transport" --bins
+        run: cargo build --workspace --release --no-default-features --features "raw-sock,udp-transport" --bins -j1
