@@ -31,6 +31,8 @@ struct CompletedBlock {
 pub struct VideoReceiver {
     tx: crossbeam_channel::Sender<Vec<u8>>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
+    assembly_buf: Vec<u8>,
+    assembly_active: bool,
 }
 
 impl VideoReceiver {
@@ -38,11 +40,12 @@ impl VideoReceiver {
         tx: crossbeam_channel::Sender<Vec<u8>>,
         rx: crossbeam_channel::Receiver<Vec<u8>>,
     ) -> Self {
-        info!(
-            "Video receiver (RS {}+{}) ready (strict in-order release)",
-            DATA_SHARDS, PARITY_SHARDS
-        );
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            assembly_buf: Vec::with_capacity(32768),
+            assembly_active: false,
+        }
     }
 
     #[inline]
@@ -50,10 +53,7 @@ impl VideoReceiver {
         block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
     }
 
-    fn emit_block(&self, block: &CompletedBlock, fec_recovered: &mut u64) {
-        let mut nal_buf: Vec<u8> = Vec::with_capacity(32768);
-        let mut nal_started = false;
-
+    fn emit_block(&mut self, block: &CompletedBlock, fec_recovered: &mut u64) {
         for (sidx, shard_data) in block.data_shards.iter().enumerate() {
             let orig_len = block.shard_lens.get(sidx).copied().unwrap_or(0);
             let trimmed = if orig_len > 0 && orig_len <= shard_data.len() {
@@ -91,28 +91,39 @@ impl VideoReceiver {
             match frag_type {
                 0x00 => {
                     *fec_recovered += 1;
+                    // Single-fragment NAL: if there is an ongoing multi-frag assembly, it's unexpected.
+                    if self.assembly_active {
+                        warn!("Incomplete multi-frag NAL interrupted by single-frag NAL; discarding assembly");
+                        self.assembly_buf.clear();
+                        self.assembly_active = false;
+                    }
                     if let Err(e) = self.tx.send(frag_data.to_vec()) {
                         warn!("Video frame channel closed: {}", e);
                     }
                 }
                 0x01 => {
-                    nal_buf.clear();
-                    nal_buf.extend_from_slice(frag_data);
-                    nal_started = true;
+                    // Start of a multi-fragment NAL
+                    self.assembly_buf.clear();
+                    self.assembly_buf.extend_from_slice(frag_data);
+                    self.assembly_active = true;
                 }
                 0x02 => {
-                    if nal_started {
-                        nal_buf.extend_from_slice(frag_data);
+                    if self.assembly_active {
+                        self.assembly_buf.extend_from_slice(frag_data);
+                    } else {
+                        // Orphan continuation fragment; ignore
                     }
                 }
                 0x03 => {
-                    if nal_started {
-                        nal_buf.extend_from_slice(frag_data);
-                        if let Err(e) = self.tx.send(nal_buf.clone()) {
+                    if self.assembly_active {
+                        self.assembly_buf.extend_from_slice(frag_data);
+                        if let Err(e) = self.tx.send(self.assembly_buf.clone()) {
                             warn!("Video frame channel closed: {}", e);
                         }
-                        nal_buf.clear();
-                        nal_started = false;
+                        self.assembly_buf.clear();
+                        self.assembly_active = false;
+                    } else {
+                        // Orphan last fragment; ignore
                     }
                 }
                 _ => {}
@@ -121,7 +132,7 @@ impl VideoReceiver {
     }
 
     fn drain_completed(
-        &self,
+        &mut self,
         completed: &mut [Option<CompletedBlock>; RING_SIZE],
         next_block: &mut u32,
         fec_recovered: &mut u64,
@@ -137,7 +148,7 @@ impl VideoReceiver {
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
             .expect("Failed to create Reed-Solomon decoder");
 

@@ -1017,7 +1017,7 @@ fn main() -> Result<(), eframe::Error> {
         );
     });
 
-    let vr = VideoReceiver::new(video_frame_tx, video_payload_rx);
+    let mut vr = VideoReceiver::new(video_frame_tx, video_payload_rx);
     let vr_handle = std::thread::spawn(move || {
         vr.run();
     });

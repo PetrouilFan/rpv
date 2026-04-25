@@ -1,5 +1,7 @@
 use bytes::{Buf, BytesMut};
-use std::io::Read;
+use std::env;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +98,25 @@ pub fn run(
     let mut fec_block_seq: u32 = 0;
     let mut l2_pkt_seq: u32 = 0;
     let mut use_hw_encoder = true; // false after h264_v4l2m2m fails
+
+    // Test mode: if RPV_TEST_VIDEO is set, stream from file instead of camera
+    if let Ok(test_path) = env::var("RPV_TEST_VIDEO") {
+        tracing::info!(
+            "TEST MODE: streaming H.264 from file '{}' ({}x{} {}fps)",
+            test_path, video_width, video_height, framerate
+        );
+        run_test_video(
+            running,
+            socket,
+            drone_id,
+            &test_path,
+            &mut fec_block_seq,
+            &mut l2_pkt_seq,
+            video_width,
+            video_height,
+        );
+        return;
+    }
 
     while running.load(Ordering::SeqCst) {
         let proc_name = if is_csi { "rpicam-vid" } else { "ffmpeg" };
@@ -650,3 +671,183 @@ fn send_fec_group_arena(
     }
     Ok(())
 }
+
+/// Test mode: stream an H.264 file in a loop using the same FEC pipeline.
+fn run_test_video(
+    running: Arc<AtomicBool>,
+    socket: Arc<dyn SocketTrait>,
+    drone_id: u8,
+    test_path: &str,
+    fec_block_seq: &mut u32,
+    l2_pkt_seq: &mut u32,
+    _video_width: u32,
+    _video_height: u32,
+) {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match File::open(test_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to open test video file '{}': {}", test_path, e);
+            return;
+        }
+    };
+
+    let rs = match ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS) {
+        Ok(rs) => rs,
+        Err(e) => {
+            tracing::error!("Failed to create Reed-Solomon encoder: {:?}", e);
+            return;
+        }
+    };
+
+    let mut arena = ShardArena::new();
+    let mut fec_shards: Vec<Vec<u8>> = (0..TOTAL_SHARDS)
+        .map(|_| Vec::with_capacity(MAX_SHARD_DATA))
+        .collect();
+    let mut l2_frame_buf = Vec::new();
+    let mut send_buf = Vec::new();
+    let mut video_payload_buf = Vec::new();
+
+    let mut nal_buf: Vec<u8> = Vec::with_capacity(MAX_NAL_BUF);
+    let mut read_buf = [0u8; 65536];
+    let mut shards_in_group = 0;
+    let mut slot_filled = [0usize; DATA_SHARDS];
+    let mut slot_frag_lens = [0usize; DATA_SHARDS];
+    let mut total_nals: u64 = 0;
+    let mut fail_count: u32 = 0;
+
+    while running.load(Ordering::SeqCst) {
+        // Read from file
+        match file.read(&mut read_buf) {
+            Ok(0) => {
+                tracing::info!("EOF reached on test video, rewinding");
+                file.seek(SeekFrom::Start(0)).ok();
+                nal_buf.clear();
+                continue;
+            }
+            Ok(n) => {
+                if nal_buf.len() + n > MAX_NAL_BUF {
+                    if let Some(next_sc) = find_start_code(&nal_buf, nal_buf.len() / 4) {
+                        nal_buf.drain(..next_sc);
+                    } else {
+                        nal_buf.clear();
+                    }
+                }
+                nal_buf.extend_from_slice(&read_buf[..n]);
+            }
+            Err(e) => {
+                tracing::error!("Read error from test video: {}", e);
+                break;
+            }
+        }
+
+        // Extract NAL units from buffer
+        loop {
+            let (nal_data, consumed) = match extract_next_nal_cursor(&nal_buf) {
+                Some((nal, consumed)) => (nal.to_vec(), consumed),
+                None => break,
+            };
+            nal_buf.drain(..consumed);
+
+            let nal_with_sc = nal_data.clone();
+
+            let nal_type = if nal_with_sc.len() >= 5 {
+                (nal_with_sc[4] & 0x1F)
+            } else if nal_with_sc.len() >= 4 {
+                (nal_with_sc[3] & 0x1F)
+            } else {
+                99
+            };
+            total_nals += 1;
+            if total_nals <= 10 {
+                tracing::info!(
+                    "CAM NAL #{}: type={}, len={}, first4={:02x?}",
+                    total_nals,
+                    nal_type,
+                    nal_with_sc.len(),
+                    &nal_with_sc[..4.min(nal_with_sc.len())]
+                );
+            }
+
+            // Fragment and send (same as live camera)
+            let max_data = MAX_SHARD_DATA - 1;
+            if nal_with_sc.len() <= max_data {
+                // Single shard NAL
+                let slot = shards_in_group % DATA_SHARDS;
+                let frag_start = slot_filled[slot];
+                arena.write_frag(slot, slot_filled[slot], &[0x00]);
+                slot_filled[slot] += 1;
+                arena.write_frag(slot, slot_filled[slot], &nal_with_sc);
+                slot_filled[slot] += nal_with_sc.len();
+                slot_frag_lens[slot] = slot_filled[slot] - frag_start;
+                shards_in_group += 1;
+                if shards_in_group == DATA_SHARDS {
+                    let _ = send_fec_group_arena(
+                        socket.as_ref(),
+                        &rs,
+                        &mut arena,
+                        &slot_filled,
+                        &slot_frag_lens,
+                        drone_id,
+                        fec_block_seq,
+                        l2_pkt_seq,
+                        &mut fail_count,
+                        &mut l2_frame_buf,
+                        &mut send_buf,
+                        &mut video_payload_buf,
+                        &None,
+                        &mut fec_shards,
+                    );
+                    shards_in_group = 0;
+                    slot_filled = [0; DATA_SHARDS];
+                    slot_frag_lens = [0; DATA_SHARDS];
+                }
+            } else {
+                // Multi-shard NAL
+                let mut off = 0;
+                let mut frag_num: u8 = 1;
+                while off < nal_with_sc.len() {
+                    let slot = shards_in_group % DATA_SHARDS;
+                    let frag_start = slot_filled[slot];
+                    let chunk = &nal_with_sc[off..nal_with_sc.len().min(off + max_data)];
+                    off += chunk.len();
+                    let frag_type = if off >= nal_with_sc.len() { 3 } else { frag_num };
+                    frag_num = 2;
+                    arena.write_frag(slot, slot_filled[slot], &[frag_type]);
+                    slot_filled[slot] += 1;
+                    arena.write_frag(slot, slot_filled[slot], chunk);
+                    slot_filled[slot] += chunk.len();
+                    slot_frag_lens[slot] = slot_filled[slot] - frag_start;
+                    shards_in_group += 1;
+                    if shards_in_group == DATA_SHARDS {
+                        let _ = send_fec_group_arena(
+                            socket.as_ref(),
+                            &rs,
+                            &mut arena,
+                            &slot_filled,
+                            &slot_frag_lens,
+                            drone_id,
+                            fec_block_seq,
+                            l2_pkt_seq,
+                            &mut fail_count,
+                            &mut l2_frame_buf,
+                            &mut send_buf,
+                            &mut video_payload_buf,
+                            &None,
+                            &mut fec_shards,
+                        );
+                        shards_in_group = 0;
+                        slot_filled = [0; DATA_SHARDS];
+                        slot_frag_lens = [0; DATA_SHARDS];
+                    }
+                }
+            }
+        } // end NAL extraction loop
+
+        // Rate limit slightly to avoid overwhelming the network
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    } // end running loop
+}
+
