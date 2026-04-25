@@ -26,9 +26,9 @@ arc-swap = "1"
 ffmpeg-sys-next = { version = "8", optional = true }
 
 [features]
-default = ["raw-sock", "udp-transport", "csi-cam", "usb-cam"]
-raw-sock = []          # Raw 802.11 monitor mode (requires Linux)
-udp-transport = []     # UDP/IP transport (for testing)
-csi-cam = ["ffmpeg-sys-next"]           # Raspberry Pi Camera (rpicam-vid)
-usb-cam = ["ffmpeg-sys-next"]           # USB webcam via ffmpeg
+default = ["raw-sock", "udp-transport"]
+raw-sock = []          # Raw 802.11 monitor mode
+udp-transport = []     # UDP/IP transport
+csi-cam = ["ffmpeg-sys-next"]           # Raspberry Pi Camera
+usb-cam = ["ffmpeg-sys-next"]           # USB webcam
 gamepad = []           # Gamepad/Joystick input (evdev)

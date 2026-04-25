@@ -31,7 +31,7 @@ arc-swap = "1"
 ffmpeg-sys-next = "8.1"
 
 [features]
-default = ["raw-sock", "udp-transport", "gamepad"]
-raw-sock = []          # Raw 802.11 monitor mode (requires Linux)
-udp-transport = []     # UDP/IP transport (for testing)
+default = ["raw-sock", "udp-transport"]
+raw-sock = []          # Raw 802.11 monitor mode
+udp-transport = []     # UDP/IP transport
 gamepad = ["evdev"]    # Gamepad/Joystick input (evdev)
