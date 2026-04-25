@@ -743,13 +743,20 @@ fn run_test_video(
             }
         }
 
+        tracing::debug!("After read: nal_buf.len()={}", nal_buf.len());
+
         // Extract NAL units from buffer
         loop {
             let (nal_data, consumed) = match extract_next_nal_cursor(&nal_buf) {
                 Some((nal, consumed)) => (nal.to_vec(), consumed),
-                None => break,
+                None => {
+                    tracing::debug!("No NAL found in buffer (len={})", nal_buf.len());
+                    break;
+                }
             };
             nal_buf.drain(..consumed);
+
+            tracing::debug!("Extracted NAL: len={}, first4={:02x?}", nal_data.len(), &nal_data[..4.min(nal_data.len())]);
 
             let nal_with_sc = nal_data.clone();
 
