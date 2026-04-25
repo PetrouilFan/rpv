@@ -109,8 +109,8 @@ fn discovery_loop(
                 if pkt[0] == MAGIC[0] && pkt[1] == MAGIC[1] {
                     let peer_role = pkt[2];
                     let peer_data_port = u16::from_le_bytes([pkt[6], pkt[7]]);
-                    let expected_role = if pkt[2] == 0x02 { ROLE_CAMERA } else { ROLE_GROUND };
-                    if peer_role == expected_role {
+                    // Accept beacons only from the opposite role (camera vs ground)
+                    if peer_role != role {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
