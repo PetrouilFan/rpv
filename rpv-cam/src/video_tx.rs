@@ -1,7 +1,6 @@
 use bytes::{Buf, BytesMut};
 use std::env;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,12 +276,13 @@ pub fn run(
         let mut total_nals: u64 = 0;
         let mut total_groups: u64 = 0;
         let mut fail_count: u32 = 0;
-        let mut last_stats = std::time::Instant::now();
+        let _last_stats = std::time::Instant::now();
         // #9: BytesMut ring buffer — O(1) advance instead of copy_within memory shifts
         let mut nal_buf = BytesMut::with_capacity(MAX_NAL_BUF);
         let _nal_idle_cycles: u32 = 0;
         // #4: NAL watchdog — if no NALs within 2x frame interval, mark unhealthy
-        let nal_watchdog_interval = Duration::from_millis(2 * (1000 / framerate.max(1)) as u64);
+        let frame_interval_ms = 1000 / framerate.max(1);
+        let nal_watchdog_interval = Duration::from_millis(2 * frame_interval_ms as u64);
         let mut last_nal_time = std::time::Instant::now();
         // Reusable buffers for send path
         let mut l2_frame_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
@@ -581,12 +581,37 @@ fn send_fec_group_arena(
         std::thread::sleep(std::time::Duration::from_micros(300));
 
         // Drain high-priority packets (telemetry, RC, heartbeat) before each shard
-        // to reduce channel contention
-        if i % 2 == 0 {
+        // to reduce channel contention, but cap to avoid video timing perturbation.
+        // Skip drain on first data shard (i=0) to prioritize video transmission.
+        // HP traffic (telemetry, RC, heartbeat) gets drained on even DATA shards only.
+        // Parity shards are NOT drained to preserve FEC recovery under marginal RF.
+        //
+        // NOTE: Even with bounded drain, HP traffic can still introduce jitter to video
+        // under sustained load because HP frames are sent inline on the video thread.
+        // Trade-off: HP latency vs video stability. Current bounds:
+        // - Shard 0: No drain (video-first)
+        // - Even data shards: max_drain_bytes: 256, max_packets: 2
+        // - Parity shards: No drain (prioritize FEC recovery)
+        if i % 2 == 0 && i != 0 && i < DATA_SHARDS {
             if let Some(ref hp) = hp_rx {
-                while let Ok(hp_frame) = hp.try_recv() {
-                    let mut tmp_buf = Vec::new();
-                    let _ = socket.send_with_buf(&hp_frame, &mut tmp_buf);
+                let mut drained_bytes = 0;
+                let max_drain_bytes = 256; // Reduced to minimize video jitter
+                let max_packets = 2;
+                let mut packet_count = 0;
+
+                while packet_count < max_packets && drained_bytes < max_drain_bytes {
+                    match hp.try_recv() {
+                        Ok(hp_frame) => {
+                            drained_bytes += hp_frame.len();
+                            packet_count += 1;
+                            // NOTE: send_with_buf reuses the send_buf scratch buffer.
+                            // It clears the buffer internally after use, so subsequent
+                            // video shard sends start with a clean buffer.
+                            // This is safe because HP drain runs before video shard build.
+                            let _ = socket.send_with_buf(&hp_frame, send_buf);
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
         }
@@ -637,6 +662,11 @@ fn send_fec_group_arena(
                 *l2_pkt_seq = l2_pkt_seq.wrapping_add(1);
             }
             Err(e) => {
+                // NOTE: l2_pkt_seq only increments on successful sends (or successful retries).
+                // This means TX gaps are invisible at L2 sequence level - the receiver cannot
+                // detect which packets were attempted vs succeeded. This is a trade-off:
+                // - Pro: L2 sequence reflects only successfully transmitted packets
+                // - Con: Receiver cannot detect TX failures by sequence gaps alone
                 group_ok = false;
                 if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::ENODEV) {
                     tracing::warn!("AR9271 firmware reset (ENXIO). Caller should reopen socket.");
@@ -649,12 +679,22 @@ fn send_fec_group_arena(
                     std::thread::sleep(std::time::Duration::from_micros(500));
                     if socket.send_with_buf(l2_frame_buf, send_buf).is_ok() {
                         *l2_pkt_seq = l2_pkt_seq.wrapping_add(1);
-                        group_ok = true;
+                        // NOTE: Don't set group_ok=true here - there was still a failure
+                        // that caused the retry. This ensures fail_count tracks
+                        // retransmit events even when recovery succeeds.
+                    } else {
+                        // Adaptive pacing: after failed retry, add delay before next shard
+                        // This helps under RF stress when TX ring stays full
+                        std::thread::sleep(std::time::Duration::from_micros(200));
                     }
                 }
                 *fail_count = fail_count.saturating_add(1);
                 if *fail_count <= 5 {
                     tracing::warn!("Video send error: {}", e);
+                }
+                // Adaptive pacing: increase inter-shard delay based on failure rate
+                if *fail_count > 10 {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
                 }
                 if *fail_count > 30 {
                     tracing::warn!("Too many send failures, retrying...");
@@ -723,6 +763,9 @@ fn run_test_video(
         match file.read(&mut read_buf) {
             Ok(0) => {
                 tracing::info!("EOF reached on test video, rewinding");
+                // NOTE: Any remaining data in nal_buf without a trailing start code
+                // is lost here. This is a known limitation - the last NAL in a stream
+                // without a subsequent boundary marker won't be emitted.
                 file.seek(SeekFrom::Start(0)).ok();
                 nal_buf.clear();
                 continue;

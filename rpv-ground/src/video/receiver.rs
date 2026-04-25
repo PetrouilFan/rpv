@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use rpv_proto::link;
 
@@ -33,6 +33,7 @@ pub struct VideoReceiver {
     rx: crossbeam_channel::Receiver<Vec<u8>>,
     assembly_buf: Vec<u8>,
     assembly_active: bool,
+    orphan_fragments: u64,
 }
 
 impl VideoReceiver {
@@ -45,6 +46,7 @@ impl VideoReceiver {
             rx,
             assembly_buf: Vec::with_capacity(32768),
             assembly_active: false,
+            orphan_fragments: 0,
         }
     }
 
@@ -111,7 +113,11 @@ impl VideoReceiver {
                     if self.assembly_active {
                         self.assembly_buf.extend_from_slice(frag_data);
                     } else {
-                        // Orphan continuation fragment; ignore
+                        // Orphan continuation fragment - no assembly in progress
+                        self.orphan_fragments += 1;
+                        if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
+                            debug!("Orphan continuation fragment (no active assembly), total: {}", self.orphan_fragments);
+                        }
                     }
                 }
                 0x03 => {
@@ -137,6 +143,10 @@ impl VideoReceiver {
         next_block: &mut u32,
         fec_recovered: &mut u64,
     ) {
+        // NOTE: This is strict in-order drain - a missing block holds back all later blocks.
+        // This ensures video frames are decoded in order, but if a block is permanently
+        // lost (e.g., network dropout), all subsequent completed blocks are blocked.
+        // Trade-off: Correct frame ordering vs. potential head-of-line blocking.
         loop {
             let idx = (*next_block as usize) % RING_SIZE;
             if let Some(block) = completed[idx].take() {
@@ -275,11 +285,26 @@ impl VideoReceiver {
             }
             let block = blocks[idx].as_mut().unwrap();
 
-            if block.shards[shard_index].is_none() {
+            // Check for duplicate first, then increment received count
+            if block.shards[shard_index].is_some() {
+                // Duplicate shard, skip
+            } else {
                 block.received += 1;
                 block.shard_sizes[shard_index] = shard_data.len();
             }
             block.shards[shard_index] = Some(shard_data);
+
+            // Validate header consistency: later shards must agree on shard lengths
+            if block.received == 1 {
+                block.shard_lens = parsed_shard_lens;
+            } else if parsed_shard_lens != block.shard_lens {
+                tracing::warn!(
+                    "Block {}: header inconsistency detected - expected {:?}, got {:?}",
+                    block_seq,
+                    block.shard_lens,
+                    parsed_shard_lens
+                );
+            }
 
             if block.received >= DATA_SHARDS {
                 let block = blocks[idx].take().unwrap();

@@ -1,6 +1,6 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,10 +27,10 @@ const DISCOVERY_PORT: u16 = 9002;
 /// [8..14] Reserved
 
 pub struct Discovery {
-    #[allow(dead_code)]
     peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
-    #[allow(dead_code)]
     last_seen: Arc<AtomicU64>,
+    /// Running flag for graceful shutdown - discovery thread checks this
+    running: Arc<AtomicBool>,
 }
 
 impl Discovery {
@@ -45,6 +45,7 @@ impl Discovery {
 
         let peer_addr = Arc::new(ArcSwap::new(Arc::new(None)));
         let last_seen = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(AtomicBool::new(true));
 
         let beacon = build_beacon(role, drone_id, data_port);
         let broadcast_target: SocketAddr = format!("{}:{}", BROADCAST_ADDR, DISCOVERY_PORT)
@@ -53,6 +54,7 @@ impl Discovery {
 
         let peer_addr_clone = Arc::clone(&peer_addr);
         let last_seen_clone = Arc::clone(&last_seen);
+        let running_clone = Arc::clone(&running);
 
         thread::spawn(move || {
             discovery_loop(
@@ -62,6 +64,7 @@ impl Discovery {
                 data_port,
                 peer_addr_clone,
                 last_seen_clone,
+                running_clone,
                 role,
             );
         });
@@ -69,8 +72,14 @@ impl Discovery {
         let disc = Self {
             peer_addr: Arc::clone(&peer_addr),
             last_seen: Arc::clone(&last_seen),
+            running: Arc::clone(&running),
         };
         Ok((disc, peer_addr))
+    }
+
+    /// Gracefully stop the discovery thread
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -92,6 +101,7 @@ fn discovery_loop(
     _my_data_port: u16,
     peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
     last_seen: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
     local_role: u8,
 ) {
     let mut buf = [0u8; 65536];
@@ -99,7 +109,8 @@ fn discovery_loop(
     let mut last_log = Instant::now();
     let mut consecutive_misses: u32 = 0;
 
-    loop {
+    // Check running flag to allow graceful shutdown
+    while running.load(Ordering::Relaxed) {
         if last_beacon.elapsed() >= BEACON_INTERVAL {
             let _ = socket.send_to(&beacon, broadcast_target);
             last_beacon = Instant::now();
@@ -113,11 +124,11 @@ fn discovery_loop(
                     let peer_data_port = u16::from_le_bytes([pkt[6], pkt[7]]);
                     // Accept beacons only from the opposite role (camera vs ground)
                     if peer_role != local_role {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        last_seen.store(now, Ordering::Relaxed);
+                        // Use atomic counter for peer presence tracking
+                        // This is immune to clock jumps (NTP, suspend/resume)
+                        static PEER_SEEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        PEER_SEEN_COUNT.fetch_add(1, Ordering::Relaxed);
+                        last_seen.store(PEER_SEEN_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
 
                         let peer_data_addr: SocketAddr =
                             format!("{}:{}", src.ip(), peer_data_port).parse().unwrap();
@@ -143,22 +154,24 @@ fn discovery_loop(
             }
         }
 
+        // NOTE: For peer-loss detection, we now use a counter-based approach
+        // instead of wall-clock. The consecutive_misses counter tracks how many
+        // polling cycles have passed without receiving a valid peer beacon.
+        // This is more robust against clock jumps than wall-clock timestamps.
         let current = peer_addr.load();
         if current.is_some() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let last = last_seen.load(Ordering::Relaxed);
-            if now.saturating_sub(last) > DISCOVERY_TIMEOUT.as_millis() as u64 {
-                consecutive_misses += 1;
-                if consecutive_misses == 1 {
-                    tracing::warn!("Peer lost, re-entering discovery mode");
-                    peer_addr.store(Arc::new(None));
-                }
-            } else {
+            // Increment misses on each poll cycle; reset on successful receive
+            // If we miss DISCOVERY_TIMEOUT / 50ms cycles (default: 3000/50 = 60), peer is lost
+            let max_misses = (DISCOVERY_TIMEOUT.as_millis() / 50) as u32;
+            consecutive_misses += 1;
+            if consecutive_misses >= max_misses {
+                tracing::warn!("Peer lost, re-entering discovery mode");
+                peer_addr.store(Arc::new(None));
                 consecutive_misses = 0;
             }
+        } else {
+            // Reset counter when no peer - allows clean rediscovery
+            consecutive_misses = 0;
         }
 
         if last_log.elapsed() >= Duration::from_secs(5) {
