@@ -62,6 +62,7 @@ impl Discovery {
                 data_port,
                 peer_addr_clone,
                 last_seen_clone,
+                role,
             );
         });
 
@@ -91,6 +92,7 @@ fn discovery_loop(
     _my_data_port: u16,
     peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
     last_seen: Arc<AtomicU64>,
+    local_role: u8,
 ) {
     let mut buf = [0u8; 65536];
     let mut last_beacon = Instant::now();
@@ -110,7 +112,7 @@ fn discovery_loop(
                     let peer_role = pkt[2];
                     let peer_data_port = u16::from_le_bytes([pkt[6], pkt[7]]);
                     // Accept beacons only from the opposite role (camera vs ground)
-                    if peer_role != role {
+                    if peer_role != local_role {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
