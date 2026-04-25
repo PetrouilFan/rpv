@@ -334,9 +334,9 @@ pub fn run(
 
                         // Log NAL type for diagnostics
                         let nal_type = if nal_with_sc.len() >= 5 {
-                            (nal_with_sc[4] & 0x1F)
+                            nal_with_sc[4] & 0x1F
                         } else if nal_with_sc.len() >= 4 {
-                            (nal_with_sc[3] & 0x1F)
+                            nal_with_sc[3] & 0x1F
                         } else { 99 };
                         let total_nals = total_nals + 1;
                         if total_nals <= 10 {
@@ -472,6 +472,7 @@ pub fn run(
 
 /// #20: Shared helper — find the next start code position in a byte slice.
 /// Returns the byte offset of the start code (00 00 01 or 00 00 00 01).
+#[inline]
 fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
     let search = &data[from..];
     // SIMD-accelerated search for 3-byte start code
@@ -804,9 +805,9 @@ fn run_test_video(
             let nal_with_sc = nal_data.clone();
 
             let nal_type = if nal_with_sc.len() >= 5 {
-                (nal_with_sc[4] & 0x1F)
+                nal_with_sc[4] & 0x1F
             } else if nal_with_sc.len() >= 4 {
-                (nal_with_sc[3] & 0x1F)
+                nal_with_sc[3] & 0x1F
             } else {
                 99
             };

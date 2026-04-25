@@ -1049,7 +1049,7 @@ fn main() -> Result<(), eframe::Error> {
     let rc_socket = Arc::clone(&socket);
     let rc_drone_id = config.common.drone_id;
     let rc_running = running.clone();
-    let mut rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
+    let rc = crate::rc::joystick::RCTx::new(rc_socket, rc_drone_id, rc_running);
     let channels_shared = rc.channels();
     let rc_handle = std::thread::spawn(move || {
         rc.run();

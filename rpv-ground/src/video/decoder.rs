@@ -2,9 +2,18 @@ use tracing::{error, info, warn};
 
 use ffmpeg_sys_next as ffi;
 
+// NOTE: These FFmpeg constants are hardcoded because ffmpeg_sys_next doesn't re-export them.
+// These values are stable across FFmpeg versions:
+// - AV_PIX_FMT_YUV420P = 0 (standard YUV 4:2:0 planar)
+// - AV_PIX_FMT_NV12 = 23 (YUV 4:2:0 with interleaved UV)
+// - AVERROR_EAGAIN = -11 (resource temporarily unavailable)
+// - AVERROR_EOF = -0x54454F46 = -1414545062 (end of file)
+//
+// Using bindgen to generate these from FFmpeg headers would be more robust,
+// but requires ffbuild or manual header installation.
 const AV_PIX_FMT_NV12: i32 = 23;
-const AV_PIX_FMT_YUV420P: i32 = 0; // YUV420P will be detected at runtime
-const AVERROR_EOF: i32 = -0x5445_4f46; // FFERRTAG('E','O','F',' ')
+const AV_PIX_FMT_YUV420P: i32 = 0;
+const AVERROR_EOF: i32 = -0x5445_4f46;
 const AVERROR_EAGAIN: i32 = -11;
 
 // ── Public types ────────────────────────────────────────────────────
@@ -75,9 +84,16 @@ fn process_decoded_frame(
     let fw = unsafe { (*frame).width } as usize;
     let fh = unsafe { (*frame).height } as usize;
     let pix_fmt = unsafe { (*frame).format };
-    let linesize0 = unsafe { (*frame).linesize[0] } as usize;
-    let linesize1 = unsafe { (*frame).linesize[1] } as usize;
-    let linesize2 = unsafe { (*frame).linesize[2] } as usize;
+    // linesize can be negative (indicating padding direction) - check before casting
+    let ls0 = unsafe { (*frame).linesize[0] };
+    let ls1 = unsafe { (*frame).linesize[1] };
+    let ls2 = unsafe { (*frame).linesize[2] };
+    if ls0 < 0 || ls1 < 0 || ls2 < 0 {
+        return;
+    }
+    let linesize0 = ls0 as usize;
+    let linesize1 = ls1 as usize;
+    let linesize2 = ls2 as usize;
     let data0 = unsafe { (*frame).data[0] };
     let data1 = unsafe { (*frame).data[1] };
     let data2 = unsafe { (*frame).data[2] };
@@ -377,12 +393,14 @@ fn decode_loop_libavcodec(
                 }
                 let retry = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
                 if retry < 0 {
+                    warn!("libavcodec: avcodec_send_packet retry failed with {}", retry);
                     unsafe {
                         ffi::av_packet_unref(pkt);
                     }
                     continue;
                 }
             } else {
+                warn!("libavcodec: avcodec_send_packet failed with {}", send_ret);
                 unsafe {
                     ffi::av_packet_unref(pkt);
                 }

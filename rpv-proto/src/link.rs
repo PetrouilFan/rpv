@@ -36,6 +36,7 @@ impl L2Header {
         buf.extend_from_slice(payload);
     }
 
+    #[inline]
     pub fn decode(frame: &[u8]) -> Option<(L2Header, &[u8])> {
         if frame.len() < HEADER_LEN {
             return None;

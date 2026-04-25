@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use rpv_proto::link;
 use rpv_proto::socket_trait::SocketTrait;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const RC_CHANNELS: usize = 16;
 const RC_CENTER: u16 = 1500;
