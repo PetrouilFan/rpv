@@ -73,57 +73,17 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Parse TOML where fields can appear either at top-level or inside [common].
-    /// The toml crate merges [common] contents into the top-level table, so we
-    /// extract known common fields from [common] and treat everything else as camera fields.
-    fn parse_toml(data: &str) -> Result<Self, toml::de::Error> {
-        let value: toml::Value = data.parse()?;
-
-        // Extract [common] section as toml::Value
-        let common_value = value.get("common")
-            .cloned()
-            .unwrap_or(toml::Value::Table(toml::map::Map::new()));
-
-        // Known CommonConfig field names
-        const COMMON_FIELDS: &[&str] = &[
-            "interface", "drone_id", "transport", "udp_port",
-            "ap_ssid", "ap_channel", "video_width", "video_height", "peer_addr",
-        ];
-
-        // Split [common] into common fields vs camera fields
-        let mut common_values = toml::map::Map::new();
-        let mut cam_values = toml::map::Map::new();
-        for (k, v) in common_value.as_table().expect("common must be a table") {
-            if COMMON_FIELDS.contains(&k.as_str()) {
-                common_values.insert(k.clone(), v.clone());
-            } else {
-                cam_values.insert(k.clone(), v.clone());
-            }
-        }
-
-        // Also grab top-level fields that aren't "common"
-        if let Some(top) = value.as_table() {
-            for (k, v) in top {
-                if k != "common" {
-                    cam_values.insert(k.clone(), v.clone());
-                }
-            }
-        }
-
-        let common: CommonConfig = toml::Value::Table(common_values).try_into()?;
-        let cam_value = toml::Value::Table(cam_values);
-        let mut cfg: Config = cam_value.try_into()?;
-        cfg.common = common;
-        Ok(cfg)
-    }
-
     pub fn load() -> (Self, bool) {
         let config_path = CommonConfig::config_dir().join("cam.toml");
         if let Ok(data) = std::fs::read_to_string(&config_path) {
-            match Self::parse_toml(&data) {
+            match toml::from_str(&data) {
                 Ok(cfg) => (cfg, false),
                 Err(e) => {
-                    tracing::warn!("Config parse error in {}: {}, using defaults", config_path.display(), e);
+                    tracing::warn!(
+                        "Config parse error in {}: {}, using defaults",
+                        config_path.display(),
+                        e
+                    );
                     (Self::default(), true)
                 }
             }
