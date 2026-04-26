@@ -20,6 +20,7 @@ use egui::Vec2;
 use rpv_proto::discovery;
 use rpv_proto::link;
 use rpv_proto::socket_trait::SocketTrait;
+use rpv_proto::tcpsock::TcpSocket;
 use rpv_proto::udpsock::UdpSocket;
 
 use crate::config::Config;
@@ -888,7 +889,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
 
 fn main() -> Result<(), eframe::Error> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,wgpu=warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -911,6 +912,7 @@ fn main() -> Result<(), eframe::Error> {
     }
 
     let is_udp = config.common.transport == "udp";
+    let is_tcp = config.common.transport == "tcp";
 
     let socket: Arc<dyn SocketTrait> = if is_udp {
         // If peer_addr is pre-configured, set it directly; otherwise use discovery
@@ -977,6 +979,22 @@ fn main() -> Result<(), eframe::Error> {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!("Failed to create UDP socket: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if is_tcp {
+        // TCP mode: ground station acts as server, camera connects to us
+        let tcp_port = config.common.tcp_port.unwrap_or(9003);
+        let listen_addr = format!("0.0.0.0:{}", tcp_port);
+        tracing::info!("Starting TCP server on {}", listen_addr);
+        
+        match TcpSocket::new_server(&listen_addr, 1000) {
+            Ok(s) => {
+                tracing::info!("TCP connection established with camera");
+                Arc::new(s)
+            }
+            Err(e) => {
+                tracing::error!("Failed to start TCP server: {}", e);
                 std::process::exit(1);
             }
         }

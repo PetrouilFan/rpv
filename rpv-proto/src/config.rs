@@ -11,6 +11,8 @@ pub struct CommonConfig {
     pub transport: String,
     #[serde(default = "default_udp_port")]
     pub udp_port: u16,
+    #[serde(default = "default_tcp_port")]
+    pub tcp_port: Option<u16>,
     #[serde(default = "default_ap_ssid")]
     pub ap_ssid: String,
     #[serde(default = "default_ap_channel")]
@@ -36,6 +38,9 @@ fn default_transport() -> String {
 fn default_udp_port() -> u16 {
     9001
 }
+fn default_tcp_port() -> Option<u16> {
+    Some(9003)
+}
 fn default_ap_ssid() -> String {
     "rpv-link".to_string()
 }
@@ -56,6 +61,7 @@ impl Default for CommonConfig {
             drone_id: default_drone_id(),
             transport: default_transport(),
             udp_port: default_udp_port(),
+            tcp_port: default_tcp_port(),
             ap_ssid: default_ap_ssid(),
             ap_channel: default_ap_channel(),
             video_width: default_video_width(),
@@ -139,8 +145,8 @@ impl CommonConfig {
         if self.drone_id == 0 {
             errors.push("drone_id should be 1-255".to_string());
         }
-        if self.transport != "udp" && self.transport != "raw" {
-            errors.push(format!("transport '{}' invalid (should be 'udp' or 'raw')", self.transport));
+        if self.transport != "udp" && self.transport != "raw" && self.transport != "tcp" {
+            errors.push(format!("transport '{}' invalid (should be 'udp', 'tcp', or 'raw')", self.transport));
         }
 
         errors

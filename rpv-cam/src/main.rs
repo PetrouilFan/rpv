@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rpv_proto::discovery;
 use rpv_proto::link;
 use rpv_proto::socket_trait::SocketTrait;
+use rpv_proto::tcpsock::TcpSocket;
 use rpv_proto::udpsock::UdpSocket;
 
 use rawsock::RawSocket;
@@ -90,12 +91,13 @@ fn main() {
     }
 
     let is_udp = cfg.common.transport == "udp";
+    let is_tcp = cfg.common.transport == "tcp";
 
     // Pre-declare peer_addr so it's in scope for UdpSocket::new below
     let peer_addr: std::sync::Arc<arc_swap::ArcSwap<Option<std::net::SocketAddr>>> =
         std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
 
-    // UDP mode: separate sockets for discovery (port 9002) and data (port 9001)
+    // Transport selection: UDP, TCP, or Raw
     let socket: Arc<dyn SocketTrait> = if is_udp {
         write_link_status("searching");
 
@@ -157,6 +159,63 @@ fn main() {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!("Failed to create UDP socket: {}", e);
+                return;
+            }
+        }
+    } else if is_tcp {
+        // TCP mode: camera connects to ground station
+        write_link_status("searching");
+        
+        let ground_addr: std::net::SocketAddr = if let Some(ref peer) = cfg.common.peer_addr {
+            match peer.parse::<std::net::SocketAddr>() {
+                Ok(addr) => {
+                    tracing::info!("Using configured ground station address: {}", addr);
+                    addr
+                }
+                Err(e) => {
+                    tracing::error!("Invalid peer_addr '{}': {}", peer, e);
+                    return;
+                }
+            }
+        } else {
+            // Use discovery to find ground station
+            let (_disc, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
+                .unwrap_or_else(|e| {
+                    tracing::error!("Failed to start discovery: {}", e);
+                    std::process::exit(1);
+                });
+
+            // Wait for ground station to discover us
+            let mut waited = Duration::ZERO;
+            let wait_timeout = Duration::from_secs(30);
+            while addr.load().is_none() && waited < wait_timeout {
+                thread::sleep(Duration::from_millis(200));
+                waited += Duration::from_millis(200);
+                if (waited.as_millis() as u64) % 2000 < 200 {
+                    tracing::info!("Waiting for ground station... ({}s elapsed)", waited.as_secs());
+                }
+            }
+
+            if addr.load().is_none() {
+                tracing::error!("No ground station discovered");
+                return;
+            }
+            addr.load().as_ref().clone().unwrap()
+        };
+        
+        // Connect to ground station via TCP
+        let tcp_port = cfg.common.tcp_port.unwrap_or(9003);
+        let target_addr = format!("{}:{}", ground_addr.ip(), tcp_port);
+        tracing::info!("Connecting to ground station via TCP at {}", target_addr);
+        
+        match TcpSocket::new_client(&target_addr, 1000) {
+            Ok(s) => {
+                tracing::info!("TCP connection established");
+                write_link_status("connected");
+                Arc::new(s)
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect via TCP: {}", e);
                 return;
             }
         }
