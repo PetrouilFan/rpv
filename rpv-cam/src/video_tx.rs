@@ -20,7 +20,7 @@ const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
 const MAX_NAL_BUF: usize = 512 * 1024;
-const NAL_START_CODE: [u8; 3] = [0x00, 0x00, 0x01];
+
 
 /// Video header: [4B block_seq][1B idx][1B total][1B data][1B pad][2B*DATA_SHARDS shard_lens]
 const VIDEO_HDR_FIXED: usize = 8;
@@ -76,7 +76,6 @@ pub fn run(
     framerate: u32,
     video_device: String,
     camera_type: &str,
-    rpicam_options: &str,
 ) {
     let is_csi = camera_type == "csi" || camera_type == "rpicam";
     tracing::info!(
@@ -272,9 +271,7 @@ pub fn run(
         );
 
         let mut read_buf = vec![0u8; 65536];
-        let mut total_bytes = u64::default();
-        let mut total_nals: u64 = 0;
-        let mut total_groups: u64 = 0;
+        let mut total_bytes: u64 = 0;
         let mut fail_count: u32 = 0;
         let _last_stats = std::time::Instant::now();
         // #9: BytesMut ring buffer — O(1) advance instead of copy_within memory shifts
@@ -307,7 +304,6 @@ pub fn run(
                 }
                 Ok(n) => {
                     total_bytes += n as u64;
-
                     if last_nal_time.elapsed() > nal_watchdog_interval {
                         VIDEO_HEALTHY.store(false, Ordering::Relaxed);
                     }
@@ -329,23 +325,11 @@ pub fn run(
                         };
                         nal_buf.advance(consumed);
                         
+                        last_nal_time = std::time::Instant::now();
+                        VIDEO_HEALTHY.store(true, Ordering::Relaxed);
+                        
                         // nal_data already has start code from extract_next_nal_cursor()
                         let nal_with_sc = nal_data.clone();
-
-                        // Log NAL type for diagnostics
-                        let nal_type = if nal_with_sc.len() >= 5 {
-                            nal_with_sc[4] & 0x1F
-                        } else if nal_with_sc.len() >= 4 {
-                            nal_with_sc[3] & 0x1F
-                        } else { 99 };
-                        let total_nals = total_nals + 1;
-                        if total_nals <= 10 {
-                            tracing::info!(
-                                "CAM NAL #{}: type={}, len={}, first4={:02x?}",
-                                total_nals, nal_type, nal_with_sc.len(),
-                                &nal_with_sc[..4.min(nal_with_sc.len())]
-                            );
-                        }
 
                         // Send NAL with fragment header: [type:1][data...]
                         // type 0 = fits in one shard, type 1 = first fragment,
@@ -384,7 +368,6 @@ pub fn run(
                                     }
                                     _ => {}
                                 }
-                                total_groups += 1;
                                 shards_in_group = 0;
                                 slot_filled = [0; DATA_SHARDS];
                                 slot_frag_lens = [0; DATA_SHARDS];
@@ -429,7 +412,6 @@ pub fn run(
                                         &hp_rx,
                                         &mut fec_shards,
                                     );
-                                    total_groups += 1;
                                     shards_in_group = 0;
                                     slot_filled = [0; DATA_SHARDS];
                                     slot_frag_lens = [0; DATA_SHARDS];
@@ -756,7 +738,6 @@ fn run_test_video(
     let mut shards_in_group = 0;
     let mut slot_filled = [0usize; DATA_SHARDS];
     let mut slot_frag_lens = [0usize; DATA_SHARDS];
-    let mut total_nals: u64 = 0;
     let mut fail_count: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
@@ -803,24 +784,6 @@ fn run_test_video(
             tracing::debug!("Extracted NAL: len={}, first4={:02x?}", nal_data.len(), &nal_data[..4.min(nal_data.len())]);
 
             let nal_with_sc = nal_data.clone();
-
-            let nal_type = if nal_with_sc.len() >= 5 {
-                nal_with_sc[4] & 0x1F
-            } else if nal_with_sc.len() >= 4 {
-                nal_with_sc[3] & 0x1F
-            } else {
-                99
-            };
-            total_nals += 1;
-            if total_nals <= 10 {
-                tracing::info!(
-                    "CAM NAL #{}: type={}, len={}, first4={:02x?}",
-                    total_nals,
-                    nal_type,
-                    nal_with_sc.len(),
-                    &nal_with_sc[..4.min(nal_with_sc.len())]
-                );
-            }
 
             // Fragment and send (same as live camera)
             let max_data = MAX_SHARD_DATA - 1;

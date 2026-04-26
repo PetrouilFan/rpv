@@ -412,6 +412,7 @@ pub struct RpvApp {
     has_ever_had_frame: bool,
     yuv_gpu: Option<Arc<Mutex<YuvGpuResources>>>,
     update_logged: bool,
+    last_rc_channels: [u16; 16],
 }
 
 impl RpvApp {
@@ -443,6 +444,7 @@ impl RpvApp {
             has_ever_had_frame: false,
             yuv_gpu: None,
             update_logged: false,
+            last_rc_channels: [1500; 16],
         }
     }
 
@@ -573,6 +575,14 @@ impl eframe::App for RpvApp {
         let new_status = self.state.link_state.get();
         if new_status != self.state.link_status {
             self.state.link_status = new_status;
+            self.needs_repaint = true;
+        }
+
+        let channels = **self.state.channels.load();
+        let rc_changed =
+            channels.iter().zip(self.last_rc_channels.iter()).any(|(a, b)| a != b);
+        if rc_changed {
+            self.last_rc_channels.copy_from_slice(&channels);
             self.needs_repaint = true;
         }
 
@@ -838,33 +848,41 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
 
     // ── Center-bottom: RC channel bars ──
     let channels = **state.channels.load();
-    let bar_width = 20.0;
-    let bar_height = 30.0;
-    let bar_gap = 4.0;
+    let bar_width = 24.0;
+    let bar_height = 36.0;
+    let bar_gap = 6.0;
     let total_width = 4.0 * bar_width + 3.0 * bar_gap;
     let start_x = screen.center().x - total_width / 2.0;
-    let bars_y = screen.max.y - 90.0;
-
-    p.text(
-        egui::pos2(screen.center().x, bars_y - 14.0),
-        egui::Align2::CENTER_TOP,
-        "RC",
-        egui::FontId::proportional(12.0),
-        egui::Color32::YELLOW,
-    );
+    let bars_y = screen.max.y - 100.0;
+    let labels = ["Ail", "Ele", "Thr", "Rud"];
 
     for (i, ch) in channels.iter().enumerate().take(4) {
         let normalized = (*ch as f32 - 1000.0) / 1000.0;
         let x = start_x + i as f32 * (bar_width + bar_gap);
+
+        p.text(
+            egui::pos2(x + bar_width / 2.0, bars_y - 12.0),
+            egui::Align2::CENTER_TOP,
+            labels[i],
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_gray(160),
+        );
+
         let rect =
             egui::Rect::from_min_size(egui::pos2(x, bars_y), egui::vec2(bar_width, bar_height));
         p.rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+
         let fill_h = bar_height * normalized.clamp(0.0, 1.0);
+        let fill_color = if *ch < 1200 || *ch > 1800 {
+            egui::Color32::from_rgb(255, 100, 100)
+        } else {
+            egui::Color32::from_rgb(100, 255, 100)
+        };
         let fill_rect = egui::Rect::from_min_size(
             egui::pos2(x, bars_y + bar_height - fill_h),
             egui::vec2(bar_width, fill_h),
         );
-        p.rect_filled(fill_rect, 2.0, egui::Color32::GREEN);
+        p.rect_filled(fill_rect, 2.0, fill_color);
     }
 }
 

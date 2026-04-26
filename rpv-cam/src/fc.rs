@@ -305,7 +305,7 @@ fn fc_writer(
     // arbitration between FC and ground station failsafe logic.
     // The FC may have its own failsafe (e.g., RCMODE, Failsafe Timeout) that could
     // trigger differently than this local timing.
-    let failsafe_timeout = Duration::from_millis(1500);
+    let failsafe_timeout = Duration::from_secs(2);
     let mut failsafe_active = false;
 
     // Throttle neutrality threshold: requires throttle >= 1050 to clear failsafe.
@@ -315,6 +315,7 @@ fn fc_writer(
 
     let mut last_heartbeat = Instant::now() - Duration::from_secs(2);
     let mut _last_channels: Vec<u16> = vec![1500; 8];
+    let mut failsafe_sent = false;
 
     while running.load(Ordering::SeqCst) {
         if last_heartbeat.elapsed() >= Duration::from_secs(1) {
@@ -323,11 +324,15 @@ fn fc_writer(
                 mavtype: mavlink::common::MavType::MAV_TYPE_GCS,
                 autopilot: mavlink::common::MavAutopilot::MAV_AUTOPILOT_INVALID,
                 base_mode: MavModeFlag::empty(),
-                system_status: mavlink::common::MavState::MAV_STATE_ACTIVE,
+                system_status: if failsafe_active {
+                    mavlink::common::MavState::MAV_STATE_STANDBY
+                } else {
+                    mavlink::common::MavState::MAV_STATE_ACTIVE
+                },
                 mavlink_version: 3,
             });
             if !write_mavlink(&mut writer_port, &mut header, &hb) {
-                break; // Fatal write error — exit so supervisor reconnects
+                break;
             }
             last_heartbeat = Instant::now();
         }
@@ -338,13 +343,13 @@ fn fc_writer(
                 if failsafe_active {
                     let throttle = channels.get(2).copied().unwrap_or(1500);
                     if throttle > THROTTLE_NEUTRAL_THRESHOLD {
-                        // Failsafe active but RC stick still high - drain uplink but don't send
                         while raw_uplink_rx.try_recv().is_ok() {}
                         continue;
                     }
                     tracing::info!("RC failsafe cleared (throttle at neutral)");
                 }
                 failsafe_active = false;
+                failsafe_sent = false;
                 _last_channels = channels.clone();
 
                 let msg = channels_to_override(&channels, drone_id);
@@ -353,13 +358,18 @@ fn fc_writer(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
-                    tracing::warn!("RC failsafe: holding mid-sticks, throttle to zero");
-                    let msg = failsafe_override(drone_id);
-                    if !write_mavlink(&mut writer_port, &mut header, &msg) {
-                        break;
+                if last_rc_time.elapsed() > failsafe_timeout {
+                    if !failsafe_active {
+                        tracing::warn!("RC failsafe: holding mid-sticks, throttle to zero");
+                        failsafe_active = true;
                     }
-                    failsafe_active = true;
+                    if !failsafe_sent || last_rc_time.elapsed() > Duration::from_millis(500) {
+                        let msg = failsafe_override(drone_id);
+                        if !write_mavlink(&mut writer_port, &mut header, &msg) {
+                            break;
+                        }
+                        failsafe_sent = true;
+                    }
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -730,6 +740,20 @@ mod tests {
                 assert_eq!(r.chan3_raw, 1000);
                 assert_eq!(r.chan1_raw, 1500);
                 assert_eq!(r.chan2_raw, 1500);
+            }
+            other => panic!("expected RC_CHANNELS_OVERRIDE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn failsafe_override_disables_aux_channels() {
+        let msg = failsafe_override(1);
+        match msg {
+            MavMessage::RC_CHANNELS_OVERRIDE(r) => {
+                assert_eq!(r.chan5_raw, 0);
+                assert_eq!(r.chan6_raw, 0);
+                assert_eq!(r.chan7_raw, 0);
+                assert_eq!(r.chan8_raw, 0);
             }
             other => panic!("expected RC_CHANNELS_OVERRIDE, got {:?}", other),
         }
