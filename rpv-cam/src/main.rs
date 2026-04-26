@@ -226,7 +226,6 @@ fn main() {
     let video_bitrate = cfg.bitrate;
     let video_device = cfg.video_device.clone();
     let camera_type = cfg.camera_type.clone();
-    let rpicam_options = cfg.rpicam_options.clone();
     let video_handle = thread::spawn(move || {
         pin_thread_to_core(1, Some(50));
         video_tx::run(
@@ -241,7 +240,6 @@ fn main() {
             video_framerate,
             video_device,
             &camera_type,
-            &rpicam_options,
         );
     });
 
