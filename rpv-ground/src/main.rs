@@ -12,7 +12,7 @@ mod rc {
 
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use egui::Vec2;
@@ -1244,6 +1244,7 @@ fn rx_dispatcher(
     let mut heartbeat_count: u64 = 0;
     let mut mavlink_count: u64 = 0;
     let mut total_frames: u64 = 0;
+    let mut retry_count: u32 = 0; // Track consecutive failures for backoff
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
@@ -1251,6 +1252,28 @@ fn rx_dispatcher(
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!("RX recv error: {}", e);
+                tracing::info!("Attempting to reconnect TCP socket...");
+                loop {
+                    retry_count += 1;
+                    match socket.reconnect() {
+                        Ok(()) => {
+                            tracing::info!("Reconnected successfully");
+                            retry_count = 0;
+                            break;
+                        }
+                        Err(re) => {
+                            let backoff_secs = 2u64.pow(retry_count.min(5));
+                            let backoff_secs = backoff_secs.min(60);
+                            tracing::error!(
+                                "Reconnect failed (attempt {}): {}, retrying in {}s...",
+                                retry_count,
+                                re,
+                                backoff_secs
+                            );
+                            std::thread::sleep(Duration::from_secs(backoff_secs));
+                        }
+                    }
+                }
                 continue;
             }
         };

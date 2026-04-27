@@ -70,3 +70,109 @@ impl L2Header {
         frame.len() >= 2 && frame[0] == MAGIC[0] && frame[1] == MAGIC[1]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_into_produces_correct_bytes() {
+        let hdr = L2Header { seq: 123, payload_type: 1, drone_id: 42 };
+        let mut buf = Vec::new();
+        hdr.encode_into(&[], &mut buf);
+        assert_eq!(buf[0], MAGIC[0]);
+        assert_eq!(buf[1], MAGIC[1]);
+        assert_eq!(buf[2], 42);
+        assert_eq!(buf[3], 1);
+        assert_eq!(buf[4..8], 123u32.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_valid_header() {
+        let mut frame = vec![];
+        frame.extend_from_slice(&MAGIC);
+        frame.push(42);
+        frame.push(1);
+        frame.extend_from_slice(&123u32.to_le_bytes());
+        frame.extend_from_slice(b"payload");
+        let result = L2Header::decode(&frame);
+        assert!(result.is_some());
+        let (hdr, payload) = result.unwrap();
+        assert_eq!(hdr.drone_id, 42);
+        assert_eq!(hdr.payload_type, 1);
+        assert_eq!(hdr.seq, 123);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn decode_invalid_magic() {
+        let frame = [0x00, 0x00, 42, 1, 0, 0, 0, 0];
+        assert!(L2Header::decode(&frame).is_none());
+    }
+
+    #[test]
+    fn decode_too_short() {
+        let frame = [0x52, 0x50, 42, 1, 0, 0, 0];
+        assert!(L2Header::decode(&frame).is_none());
+    }
+
+    #[test]
+    fn matches_magic_valid() {
+        let frame = [0x52, 0x50, 0, 0, 0, 0, 0, 0];
+        assert!(L2Header::matches_magic(&frame));
+    }
+
+    #[test]
+    fn matches_magic_invalid() {
+        let frame = [0x00, 0x00, 0, 0, 0, 0, 0, 0];
+        assert!(!L2Header::matches_magic(&frame));
+    }
+
+    #[test]
+    fn matches_magic_too_short() {
+        let frame = [0x52];
+        assert!(!L2Header::matches_magic(&frame));
+    }
+
+    #[test]
+    fn round_trip_encode_decode() {
+        let original = L2Header { seq: 999, payload_type: PAYLOAD_VIDEO, drone_id: 100 };
+        let mut buf = Vec::new();
+        let payload = b"test data";
+        original.encode_into(payload, &mut buf);
+        let result = L2Header::decode(&buf).unwrap();
+        assert_eq!(result.0.seq, original.seq);
+        assert_eq!(result.0.payload_type, original.payload_type);
+        assert_eq!(result.0.drone_id, original.drone_id);
+        assert_eq!(result.1, payload);
+    }
+
+    #[test]
+    fn edge_case_max_seq() {
+        let hdr = L2Header { seq: u32::MAX, payload_type: 1, drone_id: 42 };
+        let mut buf = Vec::new();
+        hdr.encode_into(&[], &mut buf);
+        let (decoded, _) = L2Header::decode(&buf).unwrap();
+        assert_eq!(decoded.seq, u32::MAX);
+    }
+
+    #[test]
+    fn edge_case_zero_drone_id() {
+        let hdr = L2Header { seq: 0, payload_type: 1, drone_id: 0 };
+        let mut buf = Vec::new();
+        hdr.encode_into(&[], &mut buf);
+        let (decoded, _) = L2Header::decode(&buf).unwrap();
+        assert_eq!(decoded.drone_id, 0);
+    }
+
+    #[test]
+    fn various_payload_types() {
+        for &pt in &[PAYLOAD_VIDEO, PAYLOAD_TELEMETRY, PAYLOAD_RC, PAYLOAD_HEARTBEAT, PAYLOAD_MAVLINK] {
+            let hdr = L2Header { seq: 1, payload_type: pt, drone_id: 1 };
+            let mut buf = Vec::new();
+            hdr.encode_into(&[], &mut buf);
+            let (decoded, _) = L2Header::decode(&buf).unwrap();
+            assert_eq!(decoded.payload_type, pt);
+        }
+    }
+}

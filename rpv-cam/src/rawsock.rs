@@ -188,6 +188,18 @@ impl SocketTrait for RawSocket {
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         RawSocket::recv(self, buf)
     }
+    fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
+        // Get the interface name from the file descriptor
+        // For simplicity, just return an error suggesting restart
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "RawSocket recreate not implemented - interface name not stored",
+        ))
+    }
+    fn reconnect(&self) -> std::io::Result<()> {
+        // Raw sockets are connectionless, nothing to reconnect
+        Ok(())
+    }
 }
 
 impl Drop for RawSocket {

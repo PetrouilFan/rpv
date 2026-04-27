@@ -10,3 +10,6 @@ toml = "0.8"
 tracing = "0.1"
 arc-swap = "1"
 libc = "0.2"
+
+[dev-dependencies]
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }

@@ -208,15 +208,26 @@ fn main() {
         let target_addr = format!("{}:{}", ground_addr.ip(), tcp_port);
         tracing::info!("Connecting to ground station via TCP at {}", target_addr);
         
-        match TcpSocket::new_client(&target_addr, 1000) {
-            Ok(s) => {
-                tracing::info!("TCP connection established");
-                write_link_status("connected");
-                Arc::new(s)
-            }
-            Err(e) => {
-                tracing::error!("Failed to connect via TCP: {}", e);
-                return;
+        let mut retry_count: u32 = 0;
+        loop {
+            match TcpSocket::new_client(&target_addr, 1000) {
+                Ok(s) => {
+                    tracing::info!("TCP connection established");
+                    write_link_status("connected");
+                    break Arc::new(s);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    let backoff_secs = 2u64.pow(retry_count.min(5));
+                    let backoff_secs = backoff_secs.min(60);
+                    tracing::error!(
+                        "TCP connect failed (attempt {}): {}, retrying in {}s...",
+                        retry_count,
+                        e,
+                        backoff_secs
+                    );
+                    std::thread::sleep(Duration::from_secs(backoff_secs));
+                }
             }
         }
     } else {
@@ -239,9 +250,12 @@ fn main() {
     // #8/#25: AtomicU64 for heartbeat — no lock contention on hot path
     let last_heartbeat: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // Shared RC failsafe flag between rx_dispatcher and fc_writer
+    let rc_failsafe_active = Arc::new(AtomicBool::new(false));
+
     // Start MAVLink FC link
     let (fc_rc_tx, fc_telem_rx, fc_raw_downlink_rx, fc_raw_uplink_tx) =
-        match fc::start(running.clone(), &cfg.fc_port, cfg.fc_baud, cfg.common.drone_id) {
+        match fc::start(running.clone(), &cfg.fc_port, cfg.fc_baud, cfg.common.drone_id, rc_failsafe_active.clone()) {
             Some(link) => (
                 Some(link.rc_tx),
                 Some(link.telem_rx),
@@ -258,6 +272,7 @@ fn main() {
     let rx_drone_id = cfg.common.drone_id;
     let rx_rc_tx = fc_rc_tx.clone();
     let rx_raw_uplink_tx = fc_raw_uplink_tx.clone();
+    let rx_rc_failsafe = rc_failsafe_active.clone();
     let rx_handle = thread::spawn(move || {
         pin_thread_to_core(0, Some(50));
         rx_dispatcher(
@@ -267,6 +282,7 @@ fn main() {
             rx_last_hb,
             rx_rc_tx,
             rx_raw_uplink_tx,
+            rx_rc_failsafe,
         );
     });
 
@@ -299,6 +315,7 @@ fn main() {
             video_framerate,
             video_device,
             &camera_type,
+            &cfg.rpicam_options,
         );
     });
 
@@ -306,6 +323,7 @@ fn main() {
     let telem_hp_tx = hp_tx.clone();
     let telem_running = running.clone();
     let telem_socket = Arc::clone(&socket);
+    let telem_camera_type = cfg.camera_type.clone();
     let telem_handle = thread::spawn(move || {
         telemetry_sender(
             telem_running,
@@ -313,6 +331,7 @@ fn main() {
             cfg.common.drone_id,
             fc_telem_rx,
             telem_hp_tx,
+            telem_camera_type,
         );
     });
 
@@ -392,13 +411,13 @@ fn rx_dispatcher(
     last_heartbeat: Arc<AtomicU64>,
     rc_tx: Option<crossbeam_channel::Sender<Vec<u16>>>,
     raw_uplink_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    rc_failsafe_active: Arc<AtomicBool>,
 ) {
     tracing::info!("RX dispatcher started");
     let mut buf = vec![0u8; 65536];
     let rc_file_path = "/tmp/rpv_rc_channels";
     let mut last_rc_time = Instant::now();
     let failsafe_timeout = Duration::from_secs(2);
-    let mut failsafe_active = false;
     let mut magic_rejects: u64 = 0;
 
     // Clean up any stale RC file at startup to prevent old controls from persisting
@@ -410,13 +429,13 @@ fn rx_dispatcher(
     }
 
     while running.load(Ordering::SeqCst) {
-        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !failsafe_active {
+        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !rc_failsafe_active.load(Ordering::SeqCst) {
             tracing::warn!(
                 "RC failsafe triggered: no data for {}s, clearing RC file",
                 failsafe_timeout.as_secs()
             );
             let _ = std::fs::remove_file(rc_file_path);
-            failsafe_active = true;
+            rc_failsafe_active.store(true, Ordering::SeqCst);
         }
 
         let len = match socket.recv(&mut buf) {
@@ -511,7 +530,7 @@ fn rx_dispatcher(
                         }
                     }
                     last_rc_time = Instant::now();
-                    failsafe_active = false;
+                    rc_failsafe_active.store(false, Ordering::SeqCst);
                 }
             }
             link::PAYLOAD_HEARTBEAT => {
@@ -563,35 +582,13 @@ fn heartbeat_monitor(running: Arc<AtomicBool>, last_heartbeat: Arc<AtomicU64>) {
     }
 }
 
-/// Check camera via sysfs (single stat() syscall, no subprocess spawn)
-fn check_camera_available() -> bool {
-    // /dev/v4l/by-id or /dev/v4l/by-path may contain symlinks on some systems
-    let v4l_ok = std::fs::read_dir("/dev/v4l")
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false);
-    if v4l_ok {
-        return true;
-    }
-    // Fallback: check for /dev/video* devices (standard V4L2)
-    std::fs::read_dir("/dev")
-        .map(|entries| {
-            entries.filter_map(|e| e.ok())
-                .any(|e| {
-                    e.file_name()
-                        .to_str()
-                        .map(|s| s.starts_with("video"))
-                        .unwrap_or(false)
-                })
-        })
-        .unwrap_or(false)
-}
-
 fn telemetry_sender(
     running: Arc<AtomicBool>,
     _socket: Arc<dyn SocketTrait>,
     drone_id: u8,
     fc_telem_rx: Option<crossbeam_channel::Receiver<fc::FcTelemetry>>,
     hp_tx: crossbeam_channel::Sender<Vec<u8>>,
+    camera_type: String,
 ) {
     let has_fc = fc_telem_rx.is_some();
     if has_fc {
@@ -604,7 +601,7 @@ fn telemetry_sender(
     let interval = Duration::from_millis(200);
     let camera_check_interval = Duration::from_secs(5);
     let mut last_camera_check = Instant::now();
-    let mut camera_ok = check_camera_available();
+    let mut camera_ok = video_tx::check_camera_available(&camera_type);
     let mut fc_telem = fc::FcTelemetry::default();
     let mut l2_seq: u32 = 0;
     let mut l2_buf: Vec<u8> = Vec::with_capacity(link::MAX_PAYLOAD);
@@ -612,7 +609,7 @@ fn telemetry_sender(
 
     while running.load(Ordering::SeqCst) {
         if last_camera_check.elapsed() > camera_check_interval {
-            camera_ok = check_camera_available();
+            camera_ok = video_tx::check_camera_available(&camera_type);
             last_camera_check = Instant::now();
         }
 

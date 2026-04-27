@@ -3010,6 +3010,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "libc",
+ "reed-solomon-erasure",
  "serde",
  "serde_json",
  "toml",

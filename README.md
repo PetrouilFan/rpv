@@ -273,6 +273,24 @@ The ground station tracks link status through a centralized atomic state machine
 
 Precedence: heartbeat > telemetry > video. Only heartbeat transitions can override SignalLost, preventing races where stale telemetry/video masks a real disconnect.
 
+## Fuzzing
+
+Fuzz testing for critical parsers (L2, radiotap, NAL finder) is set up in the `fuzz/` directory using `cargo-fuzz`.
+
+**Requirements:** Nightly Rust toolchain (`rustup install nightly`)
+
+**Run fuzz targets:**
+```bash
+cargo +nightly fuzz run l2_parse
+cargo +nightly fuzz run radiotap_parse
+cargo +nightly fuzz run nal_finder
+```
+
+**Targets:**
+- `l2_parse` - Fuzzes `L2Header::decode()` in rpv-proto
+- `radiotap_parse` - Fuzzes `parse_radiotap_rssi()` and `strip_radiotap()` in rpv-proto
+- `nal_finder` - Fuzzes `find_start_code()` in rpv-cam
+
 ## License
 
 MIT

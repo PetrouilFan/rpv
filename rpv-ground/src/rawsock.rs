@@ -301,6 +301,18 @@ impl SocketTrait for RawSocket {
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         RawSocket::recv(self, buf)
     }
+    fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
+        // Need to store interface name to recreate
+        // For now, return error suggesting restart
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "RawSocket recreate not implemented - interface name not stored",
+        ))
+    }
+    fn reconnect(&self) -> std::io::Result<()> {
+        // Raw sockets are connectionless, nothing to reconnect
+        Ok(())
+    }
 }
 
 impl Drop for RawSocket {

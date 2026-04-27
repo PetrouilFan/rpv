@@ -7,6 +7,9 @@ edition = "2021"
 name = "rpv-cam"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 rpv-proto = { path = "../rpv-proto" }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +35,6 @@ udp-transport = []     # UDP/IP transport
 csi-cam = ["ffmpeg-sys-next"]           # Raspberry Pi Camera
 usb-cam = ["ffmpeg-sys-next"]           # USB webcam
 gamepad = []           # Gamepad/Joystick input (evdev)
+
+[dev-dependencies]
+serialport = { version = "4", default-features = false }

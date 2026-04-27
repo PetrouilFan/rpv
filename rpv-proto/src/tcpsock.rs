@@ -1,6 +1,7 @@
 use std::io;
 use std::io::{Read, Write};
-use std::net::{TcpStream, TcpListener};
+use std::net::{TcpStream, TcpListener, SocketAddr};
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -19,6 +20,12 @@ pub struct TcpSocket {
     stream: Arc<ArcSwap<Option<Mutex<TcpStream>>>>,
     /// Read buffer for incomplete frames (interior mutability via Mutex)
     read_buf: Mutex<Vec<u8>>,
+    /// Listener for server mode (kept to re-accept connections after disconnect)
+    listener: Option<TcpListener>,
+    /// Target address for client mode (kept to reconnect after disconnect)
+    target_addr: Option<SocketAddr>,
+    /// Timeout in milliseconds for read/write operations
+    timeout_ms: u64,
 }
 
 impl TcpSocket {
@@ -40,9 +47,16 @@ impl TcpSocket {
         
         tracing::info!("TCP client connected to {}", remote_addr);
         
+        let addr: SocketAddr = remote_addr.parse().map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, e)
+        })?;
+        
         Ok(Self {
             stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
             read_buf: Mutex::new(Vec::new()),
+            listener: None,
+            target_addr: Some(addr),
+            timeout_ms,
         })
     }
     
@@ -52,30 +66,103 @@ impl TcpSocket {
     /// * `listen_addr` - The local address to listen on (e.g., "0.0.0.0:9003")
     /// * `timeout_ms` - Read/write timeout for accepted connection in milliseconds
     pub fn new_server(listen_addr: &str, timeout_ms: u64) -> io::Result<Self> {
-        let listener = TcpListener::bind(listen_addr)
+        let addr: SocketAddr = listen_addr.parse()
             .map_err(|e| {
-                tracing::error!("TCP bind to {} failed: {}", listen_addr, e);
-                e
+                tracing::error!("Invalid listen address {}: {}", listen_addr, e);
+                io::Error::new(io::ErrorKind::InvalidInput, e)
             })?;
-        
+
+        let fd = unsafe {
+            let domain = if addr.is_ipv4() {
+                libc::AF_INET
+            } else {
+                libc::AF_INET6
+            };
+            libc::socket(domain, libc::SOCK_STREAM, 0)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Set SO_REUSEADDR to allow rebinding after crash (TIME_WAIT)
+        let optval: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            unsafe { libc::close(fd); }
+            return Err(io::Error::last_os_error());
+        }
+
+        // Bind to address
+        let ret = unsafe {
+            match addr {
+                SocketAddr::V4(v4) => {
+                    let mut sockaddr: libc::sockaddr_in = std::mem::zeroed();
+                    sockaddr.sin_family = libc::AF_INET as u16;
+                    sockaddr.sin_port = v4.port().to_be();
+                    // IPv4 address: use from_be_bytes to get network byte order
+                    sockaddr.sin_addr.s_addr = u32::from_be_bytes(v4.ip().octets());
+                    libc::bind(
+                        fd,
+                        &sockaddr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+                SocketAddr::V6(v6) => {
+                    let mut sockaddr: libc::sockaddr_in6 = std::mem::zeroed();
+                    sockaddr.sin6_family = libc::AF_INET6 as u16;
+                    sockaddr.sin6_port = v6.port().to_be();
+                    sockaddr.sin6_addr.s6_addr = v6.ip().octets();
+                    libc::bind(
+                        fd,
+                        &sockaddr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd); }
+            return Err(io::Error::last_os_error());
+        }
+
+        // Listen
+        let ret = unsafe { libc::listen(fd, 128) };
+        if ret < 0 {
+            unsafe { libc::close(fd); }
+            return Err(io::Error::last_os_error());
+        }
+
+        let listener = unsafe { TcpListener::from_raw_fd(fd) };
+
         tracing::info!("TCP server listening on {}", listen_addr);
-        
+
         // Accept one connection (blocking with timeout handled after accept)
         let (stream, peer_addr) = listener.accept()
             .map_err(|e| {
                 tracing::error!("TCP accept failed: {}", e);
                 e
             })?;
-        
+
         let timeout = Duration::from_millis(timeout_ms);
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        
+
         tracing::info!("TCP server accepted connection from {}", peer_addr);
-        
+
         Ok(Self {
             stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
             read_buf: Mutex::new(Vec::new()),
+            listener: Some(listener),
+            target_addr: None,
+            timeout_ms,
         })
     }
     
@@ -179,6 +266,31 @@ impl SocketTrait for TcpSocket {
         } else {
             Err(io::Error::new(io::ErrorKind::NotConnected, "TCP socket not connected"))
         }
+    }
+
+    fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
+        if let Some(ref listener) = self.listener {
+            // Server mode: re-bind and accept
+            let listen_addr = listener.local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "0.0.0.0:0".to_string());
+            TcpSocket::new_server(&listen_addr, self.timeout_ms)
+                .map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
+        } else if let Some(addr) = self.target_addr {
+            // Client mode: re-connect
+            TcpSocket::new_client(&addr.to_string(), self.timeout_ms)
+                .map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No listener or target address for TCP recreate",
+            ))
+        }
+    }
+
+    fn reconnect(&self) -> std::io::Result<()> {
+        // Call the reconnect method on TcpSocket (not the trait)
+        TcpSocket::reconnect(self)
     }
 }
 

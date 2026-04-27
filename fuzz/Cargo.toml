@@ -1,0 +1,39 @@
+[package]
+name = "rpv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+
+[dependencies.rpv-proto]
+path = "../rpv-proto"
+
+[dependencies.rpv-cam]
+path = "../rpv-cam"
+
+[[bin]]
+name = "l2_parse"
+path = "fuzz_targets/l2_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "radiotap_parse"
+path = "fuzz_targets/radiotap_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nal_finder"
+path = "fuzz_targets/nal_finder.rs"
+test = false
+doc = false
+bench = false

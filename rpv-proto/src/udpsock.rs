@@ -62,4 +62,12 @@ impl SocketTrait for UdpSocket {
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         UdpSocket::recv(self, buf)
     }
+    fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
+        UdpSocket::new(self.socket.clone(), self.peer.clone(), self.broadcast_addr.port())
+            .map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
+    }
+    fn reconnect(&self) -> std::io::Result<()> {
+        // UDP is connectionless, nothing to reconnect
+        Ok(())
+    }
 }
