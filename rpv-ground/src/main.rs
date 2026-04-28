@@ -22,6 +22,7 @@ use rpv_proto::link;
 use rpv_proto::socket_trait::SocketTrait;
 use rpv_proto::tcpsock::TcpSocket;
 use rpv_proto::udpsock::UdpSocket;
+use rpv_proto::rawsock_common;
 
 use crate::config::Config;
 use crate::link_state::{LinkStateHandle, LinkStatus};
@@ -1280,18 +1281,26 @@ fn rx_dispatcher(
 
         let payload = &buf[..len];
 
-        if !link::L2Header::matches_magic(payload) {
+        let (actual_payload, maybe_rssi) = match rawsock_common::recv_extract(payload, false) {
+            Some((p, r)) => (p, r),
+            None => (payload, None),
+        };
+        if let Some(rssi) = maybe_rssi {
+            _rssi.store(rssi, Ordering::Relaxed);
+        }
+
+        if !link::L2Header::matches_magic(actual_payload) {
             reject_count += 1;
             if reject_count <= 10 || reject_count % 500 == 0 {
                 tracing::warn!(
                     "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
                     reject_count,
-                    &payload[..16.min(payload.len())]
+                    &actual_payload[..16.min(actual_payload.len())]
                 );
             }
             continue;
         }
-        let (header, data) = match link::L2Header::decode(payload) {
+        let (header, data) = match link::L2Header::decode(actual_payload) {
             Some(h) => h,
             None => continue,
         };
