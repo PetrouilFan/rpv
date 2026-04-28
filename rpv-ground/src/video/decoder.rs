@@ -228,7 +228,7 @@ fn decode_loop_libavcodec(
     );
     let codec_name = std::ffi::CString::new("h264").unwrap();
     // Try hardware-accelerated decoders first
-    let hw_decoder_names = ["h264_videotoolbox", "h264", "h264_cuvid", "h264_qsv"];
+    let hw_decoder_names = ["h264_vaapi", "h264_v4l2m2m", "h264_videotoolbox", "h264_cuvid", "h264_qsv"];
     let mut codec = std::ptr::null();
     let mut selected_decoder = "h264";
 
@@ -330,12 +330,15 @@ fn decode_loop_libavcodec(
         }
 
         unsafe {
-            // Properly manage packet data to avoid memory leaks
-            // av_packet_from_data takes ownership of the buffer
-            let nal_data_ptr = nal_data.as_ptr() as *mut u8;
-            let nal_data_len = nal_data.len() as i32;
-            std::mem::forget(nal_data); // Prevent Rust from deallocating
-            ffi::av_packet_from_data(pkt, nal_data_ptr, nal_data_len);
+            // Allocate buffer with FFmpeg's allocator to avoid mismatched free
+            let buf_len = nal_data.len();
+            let buffer = ffi::av_malloc(buf_len) as *mut u8;
+            if buffer.is_null() {
+                error!("av_malloc failed for packet data (size {})", buf_len);
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(nal_data.as_ptr(), buffer, buf_len);
+            ffi::av_packet_from_data(pkt, buffer, buf_len as i32);
         }
 
         let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };

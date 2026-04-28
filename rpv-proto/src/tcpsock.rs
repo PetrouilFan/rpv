@@ -9,15 +9,20 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use crate::socket_trait::SocketTrait;
+use crate::link; // for MAX_PAYLOAD and HEADER_LEN
 
 /// TCP socket with length-prefixed framing.
-/// 
+///
 /// Since TCP is a stream protocol, we use 4-byte length prefix (u32, little-endian)
 /// before each payload to delimit messages. This ensures message boundaries are preserved.
+/// 
+/// The socket uses separate read and write handles to avoid head-of-line blocking
+/// and lock contention between concurrent readers and writers.
 pub struct TcpSocket {
-    /// The underlying TCP stream wrapped in ArcSwap for potential reconnection support.
-    /// None means not connected. Mutex provides interior mutability for read/write.
-    stream: Arc<ArcSwap<Option<Mutex<TcpStream>>>>,
+    /// Write half of the TCP connection (owned, with mutex for interior mutability)
+    write_stream: Arc<ArcSwap<Option<Mutex<TcpStream>>>>,
+    /// Read half of the TCP connection (owned, with mutex)
+    read_stream: Arc<ArcSwap<Option<Mutex<TcpStream>>>>,
     /// Read buffer for incomplete frames (interior mutability via Mutex)
     read_buf: Mutex<Vec<u8>>,
     /// Listener for server mode (kept to re-accept connections after disconnect)
@@ -44,15 +49,22 @@ impl TcpSocket {
         let timeout = Duration::from_millis(timeout_ms);
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        
+
+        // Split into read and write halves to avoid lock contention
+        let read_stream = stream.try_clone().map_err(|e| {
+            tracing::error!("Failed to clone TCP stream for read half: {}", e);
+            e
+        })?;
+
         tracing::info!("TCP client connected to {}", remote_addr);
-        
+
         let addr: SocketAddr = remote_addr.parse().map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidInput, e)
         })?;
-        
+
         Ok(Self {
-            stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
+            write_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
+            read_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(read_stream))))),
             read_buf: Mutex::new(Vec::new()),
             listener: None,
             target_addr: Some(addr),
@@ -155,10 +167,17 @@ impl TcpSocket {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
+        // Split into read and write halves to avoid lock contention
+        let read_stream = stream.try_clone().map_err(|e| {
+            tracing::error!("Failed to clone accepted TCP stream for read half: {}", e);
+            e
+        })?;
+
         tracing::info!("TCP server accepted connection from {}", peer_addr);
 
         Ok(Self {
-            stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
+            write_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
+            read_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(read_stream))))),
             read_buf: Mutex::new(Vec::new()),
             listener: Some(listener),
             target_addr: None,
@@ -168,7 +187,7 @@ impl TcpSocket {
     
     /// Check if the socket is connected.
     pub fn is_connected(&self) -> bool {
-        self.stream.load().is_some()
+        self.write_stream.load().is_some()
     }
 }
 
@@ -177,9 +196,15 @@ impl SocketTrait for TcpSocket {
     ///
     /// The wire format is: [4-byte length (LE)][payload bytes]
     fn send_with_buf(&self, payload: &[u8], _buf: &mut Vec<u8>) -> io::Result<usize> {
-        let stream_opt = self.stream.load();
+        let stream_opt = self.write_stream.load();
         if let Some(ref stream_mutex) = **stream_opt {
-            let mut stream = stream_mutex.lock().unwrap();
+            let mut stream = match stream_mutex.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::warn!("TCP stream mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
             // Write length prefix + payload
             let len_bytes = (payload.len() as u32).to_le_bytes();
             stream.write_all(&len_bytes)
@@ -210,19 +235,34 @@ impl SocketTrait for TcpSocket {
     /// - Ok(n) with the number of bytes copied to buf
     /// - Err(e) on error
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let stream_opt = self.stream.load();
+        let stream_opt = self.read_stream.load();
         if let Some(ref stream_mutex) = **stream_opt {
-            let mut stream = stream_mutex.lock().unwrap();
-            let mut read_buf = self.read_buf.lock().unwrap();
+            let mut stream = match stream_mutex.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::warn!("TCP stream mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+            let mut read_buf = match self.read_buf.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::warn!("TCP read_buf mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
             
             loop {
                 // Try to parse a complete frame from read_buf
                 if read_buf.len() >= 4 {
                     let len = u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]]) as usize;
                     
-                    // Sanity check on frame length - allow up to 1MB for high-res video frames
-                    if len > 1024 * 1024 {
-                        tracing::warn!("TCP frame too large: {} bytes, clearing buffer", len);
+                    // Sanity check: frame size must not exceed maximum protocol size.
+                    // Maximum payload is link::MAX_PAYLOAD (1400) plus L2 header (HEADER_LEN=8).
+                    // Any larger frame is malicious or corrupted and will be rejected.
+                    let max_frame = link::MAX_PAYLOAD + link::HEADER_LEN;
+                    if len > max_frame {
+                        tracing::warn!("TCP frame too large: {} bytes (max {}), clearing buffer", len, max_frame);
                         read_buf.clear();
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame too large"));
                     }
@@ -289,8 +329,57 @@ impl SocketTrait for TcpSocket {
     }
 
     fn reconnect(&self) -> std::io::Result<()> {
-        // Call the reconnect method on TcpSocket (not the trait)
-        TcpSocket::reconnect(self)
+        // Server mode: accept a new connection from the existing listener
+        if let Some(listener) = &self.listener {
+            let (new_stream, peer_addr) = listener.accept().map_err(|e| {
+                tracing::warn!("TCP server accept failed during reconnect: {}", e);
+                e
+            })?;
+            let timeout = Duration::from_millis(self.timeout_ms);
+            new_stream.set_read_timeout(Some(timeout))?;
+            new_stream.set_write_timeout(Some(timeout))?;
+
+            // Split into read and write halves
+            let write_arc = Arc::new(Mutex::new(new_stream.try_clone().map_err(|e| {
+                tracing::error!("Failed to clone TCP stream for write half: {}", e);
+                e
+            })?));
+            let read_arc = Arc::new(Mutex::new(new_stream));
+
+            self.write_stream.store(Arc::new(Some(write_arc)));
+            self.read_stream.store(Arc::new(Some(read_arc)));
+
+            tracing::info!("TCP server reconnected: new connection from {}", peer_addr);
+            return Ok(());
+        }
+
+        // Client mode: reconnect to the stored target address
+        if let Some(addr) = self.target_addr {
+            let new_stream = TcpStream::connect(addr).map_err(|e| {
+                tracing::warn!("TCP client reconnect to {} failed: {}", addr, e);
+                e
+            })?;
+            let timeout = Duration::from_millis(self.timeout_ms);
+            new_stream.set_read_timeout(Some(timeout))?;
+            new_stream.set_write_timeout(Some(timeout))?;
+
+            let write_arc = Arc::new(Mutex::new(new_stream.try_clone().map_err(|e| {
+                tracing::error!("Failed to clone TCP stream for write half: {}", e);
+                e
+            })?));
+            let read_arc = Arc::new(Mutex::new(new_stream));
+
+            self.write_stream.store(Arc::new(Some(write_arc)));
+            self.read_stream.store(Arc::new(Some(read_arc)));
+
+            tracing::info!("TCP client reconnected to {}", addr);
+            return Ok(());
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "No listener or target address for TCP reconnect",
+        ))
     }
 }
 

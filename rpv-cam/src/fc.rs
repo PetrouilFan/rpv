@@ -487,6 +487,7 @@ fn write_mavlink(port: &mut dyn Write, header: &mut MavHeader, msg: &MavMessage)
             Ok(()) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 tracing::debug!("MAVLink write timeout (FC RX buffer full?)");
+                return false;
             }
             Err(ref e)
                 if e.raw_os_error() == Some(libc::EIO)
@@ -498,6 +499,7 @@ fn write_mavlink(port: &mut dyn Write, header: &mut MavHeader, msg: &MavMessage)
             }
             Err(e) => {
                 tracing::warn!("MAVLink write error: {}", e);
+                // Continue assuming non-fatal; may still be okay
             }
         }
     }

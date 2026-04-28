@@ -303,7 +303,7 @@ fn main() {
     let camera_type = cfg.camera_type.clone();
     let video_handle = thread::spawn(move || {
         pin_thread_to_core(1, Some(50));
-        video_tx::run(
+        if let Err(e) = video_tx::run(
             video_running,
             video_socket,
             cfg.common.drone_id,
@@ -316,7 +316,9 @@ fn main() {
             video_device,
             &camera_type,
             &cfg.rpicam_options,
-        );
+        ) {
+            tracing::error!("Video thread failed: {}", e);
+        }
     });
 
     // Start telemetry sender

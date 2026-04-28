@@ -209,33 +209,9 @@ impl RawSocket {
             },
         ];
 
-        self.bpf_filters = Some(Box::new(filters));
-
-        let prog = sock_fprog {
-            len: 9,
-            filter: self.bpf_filters.as_ref().unwrap().as_ptr() as *mut _,
-        };
-
-        unsafe {
-            let ret = libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_ATTACH_FILTER,
-                &prog as *const _ as *const libc::c_void,
-                std::mem::size_of::<sock_fprog>() as libc::socklen_t,
-            );
-            if ret < 0 {
-                tracing::warn!(
-                    "Failed to attach BPF filter (will filter in userspace): {}",
-                    io::Error::last_os_error()
-                );
-            } else {
-                tracing::info!("BPF magic-byte filter attached (kernel-side RP frame filtering)");
-                // Free the filter memory since the kernel has copied it
-                self.bpf_filters = None;
-            }
-        }
-
+        // BPF filter disabled due to historical bugs (use-after-free, hardcoded offsets).
+        // Rely on userspace filtering in recv_extract, which is reliable.
+        tracing::info!("BPF kernel filter disabled; using userspace filtering");
         Ok(())
     }
 

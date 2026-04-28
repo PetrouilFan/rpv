@@ -383,7 +383,7 @@ impl egui_wgpu::CallbackTrait for YuvRenderCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         _callback_resources: &egui_wgpu::CallbackResources,
     ) {
-        let res = self.resources.lock().unwrap();
+        let res = self.resources.lock().expect("GPU resources mutex poisoned; possible previous panic in paint callback");
         render_pass.set_pipeline(&res.pipeline);
         render_pass.set_bind_group(0, &res.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -496,7 +496,7 @@ impl RpvApp {
         let mut had_frame = false;
         if let (Some(frame), Some(ref gpu)) = (self.frame_buffer.front(), &self.yuv_gpu) {
             {
-                let res = gpu.lock().unwrap();
+                let res = gpu.lock().expect("GPU mutex poisoned; a panic occurred in GPU upload or paint callback");
                 if res.video_width != frame.width || res.video_height != frame.height {
                     tracing::warn!(
                         "Resolution change detected ({}x{} -> {}x{}), reinitializing GPU",
@@ -527,7 +527,7 @@ impl RpvApp {
                 }
             }
 
-            let res = gpu.lock().unwrap();
+            let res = gpu.lock().expect("GPU mutex poisoned during frame upload");
             res.upload(&frame);
             drop(res);
 
@@ -1029,7 +1029,7 @@ fn main() -> Result<(), eframe::Error> {
     let link_state = LinkStateHandle::new();
 
     let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(16);
     let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
     // QGC UDP bridge

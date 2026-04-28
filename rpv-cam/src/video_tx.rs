@@ -107,10 +107,7 @@ fn extract_next_nal_cursor(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     let nal = buf[start..end].to_vec();
     let consumed = end - start;
     Some((nal, consumed))
-}
-
-/// Pre-allocated shard arena for zero-alloc FEC encoding.
-/// Each slot is MAX_SHARD_DATA bytes, zero-filled remainder in-place.
+}\n\n/// Validate rpicam-vid extra options using an allowlist to prevent command injection.\n/// Accepts a space-separated string of \"--flag value\" pairs or standalone flags.\n/// Returns Result<Vec<String>, Box<dyn std::error::Error>> of validated arguments, or error if any flag is not allowed.\nfn validate_rpicam_options(opts: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {\n    const ALLOWED_FLAGS: &[&str] = &[\n        \"--sharpness\", \"--contrast\", \"--brightness\", \"--saturation\",\n        \"--ISO\", \"--ev\", \"--exposure\", \"--awb-gains\", \"--awb\",\n        \"--denoise\", \"--image-effect\", \"--color-effect\",\n        \"--metering\", \"--rotation\", \"--hflip\", \"--vflip\",\n        \"--roi\", \"--autofocus\", \"--lens-position\",\n    ];\n\n    let tokens: Vec<&str> = opts.split_whitespace().collect();\n    let mut args = Vec::new();\n    let mut i = 0;\n    while i < tokens.len() {\n        let token = tokens[i];\n        if !token.starts_with(\"--\") {\n            return Err(format!(\"Invalid rpicam-vid argument '{}': must start with --\", token).into());\n        }\n        if !ALLOWED_FLAGS.contains(&token) {\n            return Err(format!(\"rpicam-vid flag '{}' is not allowed\", token).into());\n        }\n        args.push(token.to_string());\n        i += 1;\n        if i < tokens.len() && !tokens[i].starts_with(\"--\") {\n            args.push(tokens[i].to_string());\n            i += 1;\n        }\n    }\n    Ok(args)\n}\n\n/// Pre-allocated shard arena for zero-alloc FEC encoding.\n/// Each slot is MAX_SHARD_DATA bytes, zero-filled remainder in-place.
 struct ShardArena {
     slots: Vec<[u8; MAX_SHARD_DATA]>,
 }
@@ -240,7 +237,7 @@ pub fn run(
     video_device: String,
     camera_type: &str,
     rpicam_options: &str,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let is_csi = camera_type == "csi" || camera_type == "rpicam";
     tracing::info!(
         "Video sender ready (FEC {}+{}, L2 broadcast, device={}, type={})",
@@ -269,27 +266,55 @@ pub fn run(
             .arg(&framerate.to_string())
             .arg("--bitrate")
             .arg(&bitrate.to_string())
-            .arg("--inline")
-            .args(rpicam_options.split_whitespace())
+                    .arg("--inline")
+                    .arg("--g")
+                    .arg(intra.to_string())
+                    // Additional safe rpicam-vid options from config (validated)
+                    .args(validate_rpicam_options(rpicam_options).map_err(|e| {
+                        tracing::error!("Invalid rpicam_options: {}", e);
+                        e
+                    })?)
             .stdout(Stdio::piped())
             .spawn()
             .expect("Failed to spawn rpicam-vid")
-    } else {
-        Command::new("ffmpeg")
-            .arg("-f")
-            .arg("v4l2")
-            .arg("-i")
-            .arg(&video_device)
-            .arg("-c:v")
-            .arg("libx264")
-            .arg("-f")
-            .arg("h264")
-            .arg("-")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn ffmpeg")
-    };
+     } else {
+         Command::new("ffmpeg")
+             .arg("-f")
+             .arg("v4l2")
+             .arg("-i")
+             .arg(&video_device)
+             .arg("-c:v")
+             .arg("libx264")
+             .arg("-preset")
+             .arg("veryfast")
+             .arg("-tune")
+             .arg("zerolatency")
+             .arg("-b:v")
+             .arg(&bitrate.to_string())
+             .arg("-maxrate")
+             .arg(&bitrate.to_string())
+             .arg("-bufsize")
+             .arg(&(bitrate / 2).to_string())
+             .arg("-g")
+             .arg(&intra.to_string())
+             .arg("-bf")
+             .arg("0")
+             .arg("-sc_threshold")
+             .arg("0")
+             .arg("-pix_fmt")
+             .arg("yuv420p")
+             .arg("-f")
+             .arg("h264")
+             .arg("-")
+             .stdout(Stdio::piped())
+             .spawn()
+             .expect("Failed to spawn ffmpeg")
+     };
     let mut stdout = child.stdout.take().unwrap();
+    // Set non-blocking mode so we can respond to shutdown promptly
+    stdout
+        .set_nonblocking(true)
+        .expect("Failed to set stdout non-blocking");
 
     let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
         .expect("Failed to create ReedSolomon");
@@ -311,14 +336,159 @@ pub fn run(
     let mut slot_frag_lens = [0usize; DATA_SHARDS];
     let mut fail_count: u32 = 0;
 
-    // Rate limiting: token bucket for ~10Mbps video bitrate
-    let mut tokens: f64 = 1000.0; // Start with some tokens
-    let max_tokens: f64 = 2000.0; // Burst capacity
-    let token_rate: f64 = 100.0; // Tokens per millisecond (approx 10Mbps)
+    // Rate limiting: token bucket derived from configured bitrate
+    let bitrate_f64 = bitrate as f64;
+    let token_rate = bitrate_f64 / 8.0 / 1000.0; // bytes per millisecond
+    let mut tokens = token_rate * 100.0; // initial burst allowance (100 ms)
+    let max_tokens = token_rate * 100.0;
     let mut last_rate_check = std::time::Instant::now();
 
     let mut camera_restart_count = 0;
     let mut last_restart_time = std::time::Instant::now();
+
+    // Track a NAL that spans multiple FEC groups
+    struct PendingNal {
+        remaining: usize,       // bytes left to send
+        slot: usize,            // slot index to write next fragment into
+        offset: usize,          // offset within that slot
+        frag_num: u8,           // 1=start, 2=middle, 3=last
+        nal_id: u32,           // NAL identifier for ordering
+    }
+
+    let mut pending_nal: Option<PendingNal> = None;
+    let mut stored_sps: Option<Vec<u8>> = None;
+    let mut stored_pps: Option<Vec<u8>> = None;
+
+    // Closure to fragment and send a single NAL unit, handling pending across groups.
+    let mut send_nal = |nal_data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
+        let max_data = MAX_SHARD_DATA - 5; // 5-byte fragment header (frag_num + nal_id_le)
+        let mut offset_remaining = nal_data.len();
+        let mut offset = 0;
+        let nal_id = nal_seq;
+        nal_seq = nal_seq.wrapping_add(1();
+
+        loop {
+            if let Some(ref mut pending) = pending_nal {
+                let slot = pending.slot;
+                let frag_start = slot_filled[slot];
+                let remaining = pending.remaining;
+                let frag_num = pending.frag_num;
+                let nal_id_val = pending.nal_id;
+
+                let space_in_slot = MAX_SHARD_DATA - pending.offset;
+                let chunk_len = remaining.min(max_data).min(space_in_slot);
+
+                arena.write_frag(slot, pending.offset, &[frag_num]);
+                arena.write_frag(slot, pending.offset + 1, &nal_id_val.to_le_bytes());
+                arena.write_frag(slot, pending.offset + 5, &nal_data[offset..offset + chunk_len]);
+
+                let new_offset = pending.offset + 5 + chunk_len;
+                slot_filled[slot] = new_offset;
+                slot_frag_lens[slot] = new_offset - frag_start;
+
+                offset += chunk_len;
+                offset_remaining -= chunk_len;
+                pending.remaining -= chunk_len;
+                pending.offset = new_offset;
+
+                if pending.remaining == 0 {
+                    arena.pad_slot(slot, new_offset);
+                    if new_offset < MAX_SHARD_DATA {
+                        arena.write_frag(slot, new_offset, &[0u8]);
+                        slot_filled[slot] = new_offset + 1;
+                    }
+                    pending_nal = None;
+                }
+
+                if offset_remaining == 0 {
+                    break;
+                }
+                if slot_filled[slot] >= MAX_SHARD_DATA {
+                    arena.pad_slot(slot, slot_filled[slot]);
+                    send_fec_group_arena(
+                        socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                        drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
+                        &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
+                        &hp_rx, &mut fec_shards,
+                    )?;
+                    fec_block_seq = fec_block_seq.wrapping_add(1();
+
+                    slot_filled = [0usize; DATA_SHARDS];
+                    slot_frag_lens = [0usize; DATA_SHARDS];
+                    shards_in_group = 0;
+                }
+
+                continue;
+            }
+
+            // Fresh fragment
+            let mut slot = 0;
+            loop {
+                while slot < DATA_SHARDS && slot_filled[slot] >= MAX_SHARD_DATA {
+                    slot += 1;
+                }
+                if slot >= DATA_SHARDS {
+                    send_fec_group_arena(
+                        socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                        drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
+                        &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
+                        &hp_rx, &mut fec_shards,
+                    )?;
+                    fec_block_seq = fec_block_seq.wrapping_add(1();
+
+                    slot_filled = [0usize; DATA_SHARDS];
+                    slot_frag_lens = [0usize; DATA_SHARDS];
+                    shards_in_group = 0;
+                    continue;
+                }
+
+                let frag_start = slot_filled[slot];
+                let frag_num = if offset == 0 { 1 } else if offset_remaining <= max_data { 3 } else { 2 };
+
+                arena.write_frag(slot, slot_filled[slot], &[frag_num]);
+                arena.write_frag(slot, slot_filled[slot] + 1, &nal_id.to_le_bytes());
+
+                let pos_in_nal = nal_data.len() - offset_remaining;
+                let chunk_len = offset_remaining.min(max_data);
+                arena.write_frag(slot, slot_filled[slot] + 5, &nal_data[pos_in_nal..pos_in_nal + chunk_len]);
+
+                let new_offset = slot_filled[slot] + 5 + chunk_len;
+                slot_filled[slot] = new_offset;
+                slot_frag_lens[slot] = new_offset - frag_start;
+
+                offset += chunk_len;
+                offset_remaining -= chunk_len;
+
+                if offset_remaining > 0 {
+                    pending_nal = Some(PendingNal {
+                        remaining: offset_remaining,
+                        slot,
+                        offset: new_offset,
+                        frag_num: if frag_num == 1 { 2 } else { frag_num },
+                        nal_id,
+                    });
+                    arena.pad_slot(slot, new_offset);
+                    if new_offset < MAX_SHARD_DATA {
+                        arena.write_frag(slot, new_offset, &[0u8]);
+                        slot_filled[slot] = new_offset + 1;
+                    }
+                    break;
+                } else {
+                    arena.pad_slot(slot, new_offset);
+                    if new_offset < MAX_SHARD_DATA {
+                        arena.write_frag(slot, new_offset, &[0u8]);
+                        slot_filled[slot] = new_offset + 1;
+                    }
+                    break;
+                }
+            }
+
+            if offset_remaining == 0 {
+                break;
+            }
+        }
+        Ok(())
+    };
 
     while running.load(Ordering::SeqCst) {
         // Check if camera process is still alive
@@ -337,10 +507,14 @@ pub fn run(
             arena = ShardArena::new();
             fec_block_seq = 0;
             l2_pkt_seq = 0;
+            nal_seq = 0;
             shards_in_group = 0;
             slot_filled = [0usize; DATA_SHARDS];
             slot_frag_lens = [0usize; DATA_SHARDS];
             fail_count = 0;
+            pending_nal = None;
+            // Mark video as unhealthy during restart
+            VIDEO_HEALTHY.store(false, Ordering::Relaxed);
 
             // Respawn camera process
             child = if is_csi {
@@ -358,7 +532,9 @@ pub fn run(
                     .arg("--bitrate")
                     .arg(&bitrate.to_string())
                     .arg("--inline")
-                    .args(rpicam_options.split_whitespace())
+                    .arg("--g")
+                    .arg(intra.to_string())
+                    .args(validate_rpicam_options(rpicam_options).map_err(|e| { tracing::error!("Invalid rpicam_options during restart: {}", e); e })?)
                     .stdout(Stdio::piped())
                     .spawn()
                     .map_err(|e| {
@@ -367,29 +543,77 @@ pub fn run(
                     })
                     .ok()
             } else {
-                Command::new("ffmpeg")
+                // Try hardware encoder first (V4L2 M2M) on Linux, fallback to software libx264
+                let hw_result = Command::new("ffmpeg")
                     .arg("-f")
                     .arg("v4l2")
                     .arg("-i")
                     .arg(&video_device)
                     .arg("-c:v")
-                    .arg("libx264")
+                    .arg("h264_v4l2m2m")
+                    .arg("-preset")
+                    .arg("veryfast")
+                    .arg("-tune")
+                    .arg("zerolatency")
+                    .arg("-b:v")
+                    .arg(&bitrate.to_string())
+                    .arg("-g")
+                    .arg(&intra.to_string())
                     .arg("-f")
                     .arg("h264")
                     .arg("-")
                     .stdout(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        tracing::error!("Failed to respawn ffmpeg: {}", e);
-                        e
-                    })
-                    .ok()
+                    .spawn();
+
+                match hw_result {
+                    Ok(child) => child,
+                    Err(e) => {
+                        tracing::warn!("Hardware encoder h264_v4l2m2m unavailable ({:?}), falling back to software libx264", e);
+                        Command::new("ffmpeg")
+                            .arg("-f")
+                            .arg("v4l2")
+                            .arg("-i")
+                            .arg(&video_device)
+                            .arg("-c:v")
+                            .arg("libx264")
+                            .arg("-preset")
+                            .arg("veryfast")
+                            .arg("-tune")
+                            .arg("zerolatency")
+                            .arg("-b:v")
+                            .arg(&bitrate.to_string())
+                            .arg("-g")
+                            .arg(&intra.to_string())
+                            .arg("-pix_fmt")
+                            .arg("yuv420p")
+                            .arg("-f")
+                            .arg("h264")
+                            .arg("-")
+                            .stdout(Stdio::piped())
+                            .spawn()
+                            .map_err(|e| {
+                                tracing::error!("Failed to spawn ffmpeg (software fallback): {}", e);
+                                e
+                            })
+                            .ok()
+                    }
+                }
             };
 
             match child {
                 Some(c) => {
                     child = c;
-                    stdout = child.stdout.take().unwrap();
+                    stdout = match child.stdout.take() {
+                        Some(s) => s,
+                        None => {
+                            tracing::error!("Camera process did not provide stdout pipe; cannot read video");
+                            // Try restarting again after a short delay? For now, continue to next iteration of restart loop
+                            // Increment restart count to avoid infinite loop
+                            camera_restart_count += 1;
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    };
                     last_restart_time = std::time::Instant::now();
                     continue; // Restart the loop with new process
                 }
@@ -400,7 +624,7 @@ pub fn run(
             }
         }
 
-        // Read from camera
+        // Read from camera (non-blocking)
         match stdout.read(&mut read_buf) {
             Ok(0) => {
                 tracing::warn!("Camera stream ended unexpectedly, will attempt restart");
@@ -417,8 +641,15 @@ pub fn run(
                 }
                 nal_buf.extend_from_slice(&read_buf[..n]);
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available currently; just loop to check running flag
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                continue;
+            }
             Err(e) => {
                 tracing::error!("Read error from camera: {}", e);
+                // Clear buffer to avoid incorporating stale partial NALs
+                nal_buf.clear();
                 // Let the process check above handle restart
                 continue;
             }
@@ -429,12 +660,49 @@ pub fn run(
         // Extract NAL units from buffer
         loop {
             let (nal_data, consumed) = match extract_next_nal_cursor(&nal_buf) {
-                Some((nal, consumed)) => (nal.to_vec(), consumed),
+                Some((nal, consumed)) => (nal, consumed),
                 None => {
                     tracing::debug!("No NAL found in buffer (len={})", nal_buf.len());
                     break;
                 }
             };
+            // Mark video as healthy once we start receiving NALs
+            VIDEO_HEALTHY.store(true, Ordering::Relaxed);
+            // Determine NAL type for SPS/PPS tracking and IDR injection
+            let sc_len = if nal_data.len() >= 4 && nal_data[0] == 0 && nal_data[1] == 0 && nal_data[2] == 0 && nal_data[3] == 1 {
+                4
+            } else if nal_data.len() >= 3 && nal_data[0] == 0 && nal_data[1] == 0 && nal_data[2] == 1 {
+                3
+            } else {
+                // Invalid NAL, skip it
+                nal_buf.drain(..consumed);
+                continue;
+            };
+            let nal_type = nal_data[sc_len] & 0x1F;
+
+            // Store SPS/PPS for future injection
+            if nal_type == 7 {
+                stored_sps = Some(nal_data.clone());
+            }
+            if nal_type == 8 {
+                stored_pps = Some(nal_data.clone());
+            }
+
+            // If this is an IDR and we have both SPS and PPS, inject them by prepending to buffer
+            if nal_type == 5 {
+                if let (Some(ref sps), Some(ref pps)) = (&stored_sps, &stored_pps) {
+                    let remaining = &nal_buf[consumed..];
+                    let mut new_buf = Vec::new();
+                    new_buf.extend_from_slice(sps);
+                    new_buf.extend_from_slice(pps);
+                    new_buf.extend_from_slice(&nal_data);
+                    new_buf.extend_from_slice(remaining);
+                    nal_buf = new_buf;
+                    continue;
+                }
+            }
+
+            // Normal path: remove this NAL from buffer
             nal_buf.drain(..consumed);
 
             tracing::debug!("Extracted NAL: len={}, first4={:02x?}", nal_data.len(), &nal_data[..4.min(nal_data.len())]);
@@ -444,136 +712,169 @@ pub fn run(
             let nal_id = nal_seq;
             nal_seq = nal_seq.wrapping_add(1);
 
-            // Fragment and send (same as live camera)
-            let max_data = MAX_SHARD_DATA - 5;
-            let num_shards_needed = if nal_with_sc.len() <= max_data {
-                1
-            } else {
-                ((nal_with_sc.len() + max_data - 1) / max_data).max(1)
-            };
-            if num_shards_needed > DATA_SHARDS - shards_in_group {
-                // Rate limiting: wait until we have enough tokens for this group
-                let group_size_bytes = slot_filled.iter().sum::<usize>();
-                let required_tokens = group_size_bytes as f64;
-                loop {
-                    let now = std::time::Instant::now();
-                    let elapsed_ms = last_rate_check.elapsed().as_millis() as f64;
-                    tokens = (tokens + elapsed_ms * token_rate).min(max_tokens);
-                    last_rate_check = now;
 
-                    if tokens >= required_tokens {
-                        tokens -= required_tokens;
+            let max_data = MAX_SHARD_DATA - 5; // 5-byte fragment header (frag_num + nal_id_le)
+            let mut offset_remaining = nal_with_sc.len();
+            let mut offset = 0;
+
+            loop {
+                // If there's a pending NAL continuation from previous group, finish it first
+                if let Some(ref mut pending) = pending_nal {
+                    let slot = pending.slot;
+                    let frag_start = slot_filled[slot]; // capture before writing
+                    let remaining = pending.remaining;
+                    let frag_num = pending.frag_num;
+                    let nal_id_val = pending.nal_id;
+
+                    let space_in_slot = MAX_SHARD_DATA - pending.offset;
+                    let chunk_len = remaining.min(max_data).min(space_in_slot);
+
+                    // Write fragment header into arena at current offset
+                    arena.write_frag(slot, pending.offset, &[frag_num]);
+                    arena.write_frag(slot, pending.offset + 1, &nal_id_val.to_le_bytes());
+                    arena.write_frag(slot, pending.offset + 5, &nal_with_sc[offset..offset + chunk_len]);
+
+                    let new_offset = pending.offset + 5 + chunk_len;
+                    slot_filled[slot] = new_offset;
+                    slot_frag_lens[slot] = new_offset - frag_start;
+
+                    offset += chunk_len;
+                    offset_remaining -= chunk_len;
+                    pending.remaining -= chunk_len;
+                    pending.offset = new_offset;
+
+                    if pending.remaining == 0 {
+                        // NAL complete, clear pending and close the slot with a trailer byte
+                        arena.pad_slot(slot, new_offset);
+                        // Write a single zero byte trailer to mark end-of-NAL within this slot
+                        if new_offset < MAX_SHARD_DATA {
+                            arena.write_frag(slot, new_offset, &[0u8]);
+                            slot_filled[slot] = new_offset + 1;
+                        }
+                        pending_nal = None;
+                    }
+
+                    // If this slot is now full (or NAL completed), send the FEC group
+                    if offset_remaining == 0 {
                         break;
                     }
-                    // Wait a bit before checking again
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-
-                // Send current group to prevent NAL fragmentation across groups
-                let _ = send_fec_group_arena(
-                    &socket,
-                    &rs,
-                    &mut arena,
-                    &slot_filled,
-                    &slot_frag_lens,
-                    drone_id,
-                    fec_block_seq,
-                    &mut l2_pkt_seq,
-                    &mut fail_count,
-                    &mut l2_frame_buf,
-                    &mut send_buf,
-                    &mut video_payload_buf,
-                    &hp_rx,
-                    &mut fec_shards,
-                );
-                shards_in_group = 0;
-                slot_filled = [0; DATA_SHARDS];
-                slot_frag_lens = [0; DATA_SHARDS];
-                fec_block_seq = fec_block_seq.wrapping_add(1);
-            }
-
-            if nal_with_sc.len() <= max_data {
-                // Single shard NAL
-                let slot = shards_in_group % DATA_SHARDS;
-                let frag_start = slot_filled[slot];
-                arena.write_frag(slot, slot_filled[slot], &[0x00]);
-                slot_filled[slot] += 1;
-                arena.write_frag(slot, slot_filled[slot], &nal_id.to_le_bytes());
-                slot_filled[slot] += 4;
-                arena.write_frag(slot, slot_filled[slot], &nal_with_sc);
-                slot_filled[slot] += nal_with_sc.len();
-                slot_frag_lens[slot] = slot_filled[slot] - frag_start;
-                shards_in_group += 1;
-                if shards_in_group == DATA_SHARDS {
-                    let _ = send_fec_group_arena(
-                        &socket,
-                        &rs,
-                        &mut arena,
-                        &slot_filled,
-                        &slot_frag_lens,
-                        drone_id,
-                        fec_block_seq,
-                        &mut l2_pkt_seq,
-                        &mut fail_count,
-                        &mut l2_frame_buf,
-                        &mut send_buf,
-                        &mut video_payload_buf,
-                        &hp_rx,
-                        &mut fec_shards,
-                    );
-                    shards_in_group = 0;
-                    slot_filled = [0; DATA_SHARDS];
-                    slot_frag_lens = [0; DATA_SHARDS];
-                    fec_block_seq = fec_block_seq.wrapping_add(1);
-                }
-            } else {
-                // Multi-shard NAL
-                let mut off = 0;
-                let mut frag_num: u8 = 1;
-                while off < nal_with_sc.len() {
-                    let slot = shards_in_group % DATA_SHARDS;
-                    let frag_start = slot_filled[slot];
-                    let chunk = &nal_with_sc[off..nal_with_sc.len().min(off + max_data)];
-                    off += chunk.len();
-                    let frag_type = if off >= nal_with_sc.len() { 3 } else { frag_num };
-                    frag_num = 2;
-                    arena.write_frag(slot, slot_filled[slot], &[frag_type]);
-                    slot_filled[slot] += 1;
-                    arena.write_frag(slot, slot_filled[slot], &nal_id.to_le_bytes());
-                    slot_filled[slot] += 4;
-                    arena.write_frag(slot, slot_filled[slot], chunk);
-                    slot_filled[slot] += chunk.len();
-                    slot_frag_lens[slot] = slot_filled[slot] - frag_start;
-                    shards_in_group += 1;
-                    if shards_in_group == DATA_SHARDS {
-                        let _ = send_fec_group_arena(
-                            &socket,
-                            &rs,
-                            &mut arena,
-                            &slot_filled,
-                            &slot_frag_lens,
-                            drone_id,
-                            fec_block_seq,
-                            &mut l2_pkt_seq,
-                            &mut fail_count,
-                            &mut l2_frame_buf,
-                            &mut send_buf,
-                            &mut video_payload_buf,
-                            &hp_rx,
-                            &mut fec_shards,
-                        );
-                        shards_in_group = 0;
-                        slot_filled = [0; DATA_SHARDS];
-                        slot_frag_lens = [0; DATA_SHARDS];
+                    if slot_filled[slot] >= MAX_SHARD_DATA {
+                        arena.pad_slot(slot, slot_filled[slot]);
+                        send_fec_group_arena(
+                            socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                            drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
+                            &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
+                            &hp_rx, &mut fec_shards,
+                        )?;
                         fec_block_seq = fec_block_seq.wrapping_add(1);
+
+                        // Start a new group; reset slot tracking but pending_nal still holds the continuation
+                        slot_filled = [0usize; DATA_SHARDS];
+                        slot_frag_lens = [0usize; DATA_SHARDS];
+                        // Also reset shards_in_group counter tracking if present
+                        shards_in_group = 0;
+                    }
+
+                    continue; // Continue loop to either send next fragment of this NAL or move to fresh NAL
+                }
+
+                // No pending NAL; start fragmenting the fresh NAL
+                let mut slot = 0;
+                loop {
+                    // Find next available slot with space
+                    while slot < DATA_SHARDS && slot_filled[slot] >= MAX_SHARD_DATA {
+                        slot += 1;
+                    }
+                    if slot >= DATA_SHARDS {
+                        // All slots full; send group and start new one
+                        send_fec_group_arena(
+                            socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                            drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
+                            &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
+                            &hp_rx, &mut fec_shards,
+                        )?;
+                        fec_block_seq = fec_block_seq.wrapping_add(1);
+                        slot_filled = [0usize; DATA_SHARDS];
+                        slot_frag_lens = [0usize; DATA_SHARDS];
+                        shards_in_group = 0;
+                        continue;
+                    }
+
+                    let frag_start = slot_filled[slot]; // capture before writing this fragment
+                    let frag_num = if offset == 0 { 1 } else if offset_remaining <= max_data { 3 } else { 2 };
+
+                    // Write fragment header: [frag_num (1)][nal_id_le (4)]
+                    arena.write_frag(slot, slot_filled[slot], &[frag_num]);
+                    arena.write_frag(slot, slot_filled[slot] + 1, &nal_id.to_le_bytes());
+
+                    let pos_in_nal = nal_with_sc.len() - offset_remaining;
+                    let chunk_len = offset_remaining.min(max_data);
+                    arena.write_frag(slot, slot_filled[slot] + 5, &nal_with_sc[pos_in_nal..pos_in_nal + chunk_len]);
+
+                    let new_offset = slot_filled[slot] + 5 + chunk_len;
+                    slot_filled[slot] = new_offset;
+                    slot_frag_lens[slot] = new_offset - frag_start;
+
+                    offset += chunk_len;
+                    offset_remaining -= chunk_len;
+
+                    if offset_remaining > 0 {
+                        // NAL continues; store pending state and break to send group
+                        pending_nal = Some(PendingNal {
+                            remaining: offset_remaining,
+                            slot,
+                            offset: new_offset,
+                            frag_num: if frag_num == 1 { 2 } else { frag_num },
+                            nal_id,
+                        });
+                        arena.pad_slot(slot, new_offset);
+                        // Write trailer byte to mark intra-slot NAL continuation
+                        if new_offset < MAX_SHARD_DATA {
+                            arena.write_frag(slot, new_offset, &[0u8]);
+                            slot_filled[slot] = new_offset + 1;
+                        }
+                        break;
+                    } else {
+                        // NAL complete within this fragment; pad slot and mark end
+                        arena.pad_slot(slot, new_offset);
+                        // Write trailer byte
+                        if new_offset < MAX_SHARD_DATA {
+                            arena.write_frag(slot, new_offset, &[0u8]);
+                            slot_filled[slot] = new_offset + 1;
+                        }
+                        // No pending; continue to next NAL
+                        break;
                     }
                 }
+
+                if pending_nal.is_some() {
+                    break;
+                } else {
+                    if slot_filled.iter().any(|&f| f > 0) {
+                        send_fec_group_arena(
+                            socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                            drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
+                            &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
+                            &hp_rx, &mut fec_shards,
+                        )?;
+                        fec_block_seq = fec_block_seq.wrapping_add(1);
+                        slot_filled = [0usize; DATA_SHARDS];
+                        slot_frag_lens = [0usize; DATA_SHARDS];
+                        shards_in_group = 0;
+                    }
+                    break;
+                }
             }
-        } // end NAL extraction loop
 
         // Rate limit slightly to avoid overwhelming the network
         std::thread::sleep(std::time::Duration::from_micros(100));
     } // end running loop
+
+    // Ensure camera child process is terminated on exit
+    if let Err(e) = child.kill() {
+        tracing::debug!("Failed to kill camera process during shutdown: {}", e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

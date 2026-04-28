@@ -74,7 +74,11 @@ impl Default for CommonConfig {
 impl CommonConfig {
     pub fn config_dir() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        std::path::PathBuf::from(format!("{}/.config/rpv", home))
+        // Resolve symlinks and .. to avoid directory traversal attacks
+        let home_canon = std::path::Path::new(&home)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&home));
+        std::path::PathBuf::from(format!("{}/.config/rpv", home_canon.display()))
     }
 
     /// Parse config from TOML string, logging a warning on parse errors
