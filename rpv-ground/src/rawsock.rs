@@ -8,9 +8,13 @@ use std::io;
 use rpv_proto::rawsock_common;
 use rpv_proto::socket_trait::SocketTrait;
 
+use libc::{sock_filter, sock_fprog};
+
 pub struct RawSocket {
     fd: i32,
     seq_control: std::sync::atomic::AtomicU16,
+    iface: String,
+    bpf_filters: Option<Box<[libc::sock_filter; 9]>>,
 }
 
 impl RawSocket {
@@ -117,31 +121,22 @@ impl RawSocket {
             }
         }
 
-        let _ = Self::try_attach_bpf_filter(fd);
-
-        Ok(Self {
+        let mut socket = Self {
             fd,
             seq_control: std::sync::atomic::AtomicU16::new(0),
-        })
+            iface: iface.to_string(),
+            bpf_filters: None,
+        };
+
+        let _ = socket.try_attach_bpf_filter();
+
+        Ok(socket)
     }
 
     /// BPF filter: accept only frames with RPV magic bytes after the radiotap
     /// and 802.11 header. Handles both QoS (26-byte) and non-QoS (24-byte)
     /// 802.11 headers by checking both offsets.
-    fn try_attach_bpf_filter(fd: i32) -> io::Result<()> {
-        #[repr(C)]
-        struct sock_filter {
-            code: u16,
-            jt: u8,
-            jf: u8,
-            k: u32,
-        }
-
-        #[repr(C)]
-        struct sock_fprog {
-            len: u16,
-            filter: *const sock_filter,
-        }
+    fn try_attach_bpf_filter(&mut self) -> io::Result<()> {
 
         const BPF_LD_H_ABS: u16 = 0x0028;
         const BPF_LD_B_IND: u16 = 0x0040;
@@ -214,14 +209,16 @@ impl RawSocket {
             },
         ];
 
+        self.bpf_filters = Some(Box::new(filters));
+
         let prog = sock_fprog {
-            len: filters.len() as u16,
-            filter: filters.as_ptr(),
+            len: 9,
+            filter: self.bpf_filters.as_ref().unwrap().as_ptr() as *mut _,
         };
 
         unsafe {
             let ret = libc::setsockopt(
-                fd,
+                self.fd,
                 libc::SOL_SOCKET,
                 libc::SO_ATTACH_FILTER,
                 &prog as *const _ as *const libc::c_void,
@@ -302,12 +299,7 @@ impl SocketTrait for RawSocket {
         RawSocket::recv(self, buf)
     }
     fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
-        // Need to store interface name to recreate
-        // For now, return error suggesting restart
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "RawSocket recreate not implemented - interface name not stored",
-        ))
+        RawSocket::new(&self.iface).map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
     }
     fn reconnect(&self) -> std::io::Result<()> {
         // Raw sockets are connectionless, nothing to reconnect

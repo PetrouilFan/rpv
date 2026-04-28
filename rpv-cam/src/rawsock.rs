@@ -7,6 +7,7 @@ use rpv_proto::socket_trait::SocketTrait;
 pub struct RawSocket {
     fd: i32,
     seq_control: std::sync::atomic::AtomicU16,
+    iface: String,
 }
 
 impl RawSocket {
@@ -117,6 +118,7 @@ impl RawSocket {
         Ok(Self {
             fd,
             seq_control: std::sync::atomic::AtomicU16::new(0),
+            iface: iface.to_string(),
         })
     }
 
@@ -189,12 +191,7 @@ impl SocketTrait for RawSocket {
         RawSocket::recv(self, buf)
     }
     fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
-        // Get the interface name from the file descriptor
-        // For simplicity, just return an error suggesting restart
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "RawSocket recreate not implemented - interface name not stored",
-        ))
+        RawSocket::new(&self.iface).map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
     }
     fn reconnect(&self) -> std::io::Result<()> {
         // Raw sockets are connectionless, nothing to reconnect

@@ -304,9 +304,9 @@ impl YuvGpuResources {
         }
     }
 
-    fn upload(&self, y_data: &[u8], u_data: &[u8], v_data: &[u8]) {
-        let w = self.video_width as usize;
-        let h = self.video_height as usize;
+    fn upload(&self, decoded: &crate::video::decoder::DecodedFrame) {
+        let w = decoded.width as usize;
+        let h = decoded.height as usize;
         let uv_w = w / 2;
         let uv_h = h / 2;
 
@@ -317,10 +317,10 @@ impl YuvGpuResources {
                 origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            y_data,
+            &decoded.y_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(w as u32),
+                bytes_per_row: Some(decoded.y_stride),
                 rows_per_image: Some(h as u32),
             },
             wgpu::Extent3d {
@@ -337,10 +337,10 @@ impl YuvGpuResources {
                 origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            u_data,
+            &decoded.u_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(uv_w as u32),
+                bytes_per_row: Some(decoded.u_stride),
                 rows_per_image: Some(uv_h as u32),
             },
             wgpu::Extent3d {
@@ -357,10 +357,10 @@ impl YuvGpuResources {
                 origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            v_data,
+            &decoded.v_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(uv_w as u32),
+                bytes_per_row: Some(decoded.v_stride),
                 rows_per_image: Some(uv_h as u32),
             },
             wgpu::Extent3d {
@@ -524,7 +524,7 @@ impl RpvApp {
             }
 
             let res = gpu.lock().unwrap();
-            res.upload(&frame.y_data, &frame.u_data, &frame.v_data);
+            res.upload(&frame);
             drop(res);
 
             self.state.frame_count += 1;

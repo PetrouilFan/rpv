@@ -26,7 +26,8 @@ pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
     pub y_stride: u32,
-    pub uv_stride: u32,
+    pub u_stride: u32,
+    pub v_stride: u32,
     pub send_ts_us: Option<u64>,
     pub recv_time: Option<std::time::Instant>,
 }
@@ -136,115 +137,61 @@ fn process_decoded_frame(
     let w = fw;
     let h = fh;
 
-    // Resize buffers if actual frame is larger than current allocation
-    let y_size = w * h;
-    let uv_size = (w / 2) * (h / 2);
-    if y_buf.len() < y_size {
-        y_buf.resize(y_size, 0);
-    }
-    if u_buf.len() < uv_size {
-        u_buf.resize(uv_size, 0);
-    }
-    if v_buf.len() < uv_size {
-        v_buf.resize(uv_size, 0);
-    }
-
-    // Zero-fill and copy Y plane
-    y_buf[..y_size].fill(0);
+    // Resize buffers to include padding
+    let y_size = linesize0 * h;
+    y_buf.resize(y_size, 0);
+    // Copy Y plane with padding
     for row in 0..h {
-        let src_len = w.min(linesize0 as usize);
-        let src =
-            unsafe { std::slice::from_raw_parts(data0.add(row * linesize0 as usize), src_len) };
-        let dst_start = row * w;
-        let dst_end = dst_start + w.min(src_len);
-        y_buf[dst_start..dst_end].copy_from_slice(src);
+        let src = unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), linesize0) };
+        let dst_start = row * linesize0;
+        y_buf[dst_start..dst_start + linesize0].copy_from_slice(src);
     }
 
-    // U/V planes - fix stride handling
     let uv_w = w / 2;
     let uv_h = h / 2;
-    u_buf[..uv_size].fill(0);
-    v_buf[..uv_size].fill(0);
-    
-    // For YUV420P: linesize is bytes per row (row stride in bytes)
-    // For NV12: linesize1 is bytes for interleaved UV, so UV pixels = linesize1 / 2
-    let uv_copy_w = if pix_fmt == AV_PIX_FMT_NV12 as i32 {
-        (fw / 2).min(uv_w).min(linesize1 as usize / 2)
-    } else {
-        (fw / 2).min(uv_w).min(linesize1 as usize)
-    };
-    let uv_v_copy_w = if pix_fmt == AV_PIX_FMT_NV12 as i32 {
-        (fw / 2).min(uv_w).min(linesize2 as usize / 2)
-    } else {
-        (fw / 2).min(uv_w).min(linesize2 as usize)
-    };
 
     if pix_fmt == AV_PIX_FMT_NV12 as i32 {
-        // NV12: UV interleaved, linesize1 is bytes, pixels = linesize1 / 2
-        let uv_interleaved_bytes = fw.min(linesize1 as usize);
-        let uv_interleaved_pixels = uv_interleaved_bytes / 2;
-        let uv_copy_h = (fh / 2).min(uv_h);
-        for row in 0..uv_copy_h {
-            let src =
-                unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), uv_interleaved_bytes) };
-            for col in 0..uv_copy_w.min(uv_interleaved_pixels) {
-                if col * 2 + 1 < uv_interleaved_bytes {
-                    u_buf[row * uv_w + col] = src[col * 2];
-                    v_buf[row * uv_w + col] = src[col * 2 + 1];
-                }
-            }
+        // NV12: copy interleaved UV with padding, then deinterleave
+        let uv_size = linesize1 * uv_h;
+        let mut uv_buf = vec![0u8; uv_size];
+        for row in 0..uv_h {
+            let src = unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), linesize1) };
+            let dst_start = row * linesize1;
+            uv_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
-    } else if pix_fmt == AV_PIX_FMT_YUV420P as i32 {
-        // Standard YUV420P planar format
-        let uv_src_h = fh / 2;
-        let uv_copy_h = uv_src_h.min(uv_h as usize);
-        for row in 0..uv_copy_h {
-            if !data1.is_null() {
-                let u_src_len = uv_copy_w.min(linesize1 as usize);
-                let u_src =
-                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), u_src_len) };
-                let dst_start = row * uv_w;
-                let dst_end = dst_start + u_src_len;
-                u_buf[dst_start..dst_end].copy_from_slice(u_src);
-            }
-            if !data2.is_null() {
-                let v_src_len = uv_v_copy_w.min(linesize2 as usize);
-                let v_src =
-                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2 as usize), v_src_len) };
-                let dst_start = row * uv_w;
-                let dst_end = dst_start + v_src_len;
-                v_buf[dst_start..dst_end].copy_from_slice(v_src);
+        // Deinterleave into padded U and V
+        let u_size = linesize1 * uv_h;
+        u_buf.resize(u_size, 0);
+        v_buf.resize(u_size, 0);
+        for row in 0..uv_h {
+            let src = &uv_buf[row * linesize1..(row + 1) * linesize1];
+            for col in 0..uv_w {
+                u_buf[row * linesize1 + col] = src[col * 2];
+                v_buf[row * linesize1 + col] = src[col * 2 + 1];
             }
         }
     } else {
-        // Fallback for other formats - log warning
-        warn!("Unknown pixel format: {}, attempting YUV420P fallback", pix_fmt);
-        let uv_src_h = fh / 2;
-        let uv_copy_h = uv_src_h.min(uv_h as usize);
-        for row in 0..uv_copy_h {
-            if !data1.is_null() {
-                let u_src_len = uv_copy_w.min(linesize1 as usize);
-                let u_src =
-                    unsafe { std::slice::from_raw_parts(data1.add(row * linesize1 as usize), u_src_len) };
-                let dst_start = row * uv_w;
-                let dst_end = dst_start + u_src_len;
-                u_buf[dst_start..dst_end].copy_from_slice(u_src);
-            }
-            if !data2.is_null() {
-                let v_src_len = uv_v_copy_w.min(linesize2 as usize);
-                let v_src =
-                    unsafe { std::slice::from_raw_parts(data2.add(row * linesize2 as usize), v_src_len) };
-                let dst_start = row * uv_w;
-                let dst_end = dst_start + v_src_len;
-                v_buf[dst_start..dst_end].copy_from_slice(v_src);
-            }
+        // YUV420P or fallback: copy U and V with padding
+        let u_size = linesize1 * uv_h;
+        u_buf.resize(u_size, 0);
+        for row in 0..uv_h {
+            let src = unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), linesize1) };
+            let dst_start = row * linesize1;
+            u_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
-}
+        let v_size = linesize2 * uv_h;
+        v_buf.resize(v_size, 0);
+        for row in 0..uv_h {
+            let src = unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), linesize2) };
+            let dst_start = row * linesize2;
+            v_buf[dst_start..dst_start + linesize2].copy_from_slice(src);
+        }
+    }
 
-    // Clone the data we need (avoiding the unsafe buffer swap hack)
-    let y_data = y_buf[..y_size].to_vec();
-    let u_data = u_buf[..uv_size].to_vec();
-    let v_data = v_buf[..uv_size].to_vec();
+    // Clone the data
+    let y_data = y_buf.clone();
+    let u_data = u_buf.clone();
+    let v_data = v_buf.clone();
 
     let decoded = DecodedFrame {
         y_data,
@@ -253,7 +200,8 @@ fn process_decoded_frame(
         width: fw as u32,
         height: fh as u32,
         y_stride: linesize0 as u32,
-        uv_stride: linesize1 as u32,
+        u_stride: linesize1 as u32,
+        v_stride: if pix_fmt == AV_PIX_FMT_YUV420P as i32 { linesize2 as u32 } else { linesize1 as u32 },
         send_ts_us: None,
         recv_time: Some(std::time::Instant::now()),
     };
@@ -362,11 +310,8 @@ fn decode_loop_libavcodec(
 
         unsafe {
             ffi::av_packet_unref(pkt);
-            ffi::av_new_packet(pkt, nal_data.len() as i32);
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(nal_data.as_ptr(), (*pkt).data, nal_data.len());
-            (*pkt).size = nal_data.len() as i32;
+            ffi::av_packet_from_data(pkt, nal_data.as_ptr() as *mut u8, nal_data.len() as i32);
+            std::mem::forget(nal_data);
         }
 
         let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };

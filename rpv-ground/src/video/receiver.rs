@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use rpv_proto::link;
+use std::collections::HashMap;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -31,8 +32,7 @@ struct CompletedBlock {
 pub struct VideoReceiver {
     tx: crossbeam_channel::Sender<Vec<u8>>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
-    assembly_buf: Vec<u8>,
-    assembly_active: bool,
+    assembly_map: HashMap<u32, Vec<u8>>,
     orphan_fragments: u64,
 }
 
@@ -75,8 +75,7 @@ impl VideoReceiver {
         Self {
             tx,
             rx,
-            assembly_buf: Vec::with_capacity(32768),
-            assembly_active: false,
+            assembly_map: HashMap::new(),
             orphan_fragments: 0,
         }
     }
@@ -99,7 +98,11 @@ impl VideoReceiver {
             }
 
             let frag_type = trimmed[0];
-            let frag_data = &trimmed[1..];
+            if trimmed.len() < 5 {
+                continue;
+            }
+            let nal_id = u32::from_le_bytes(trimmed[1..5].try_into().unwrap());
+            let frag_data = &trimmed[5..];
 
             if *fec_recovered < 3 {
                 let nalu_type = if frag_data.len() >= 5
@@ -116,54 +119,51 @@ impl VideoReceiver {
                     None
                 };
                 info!(
-                    "NAL: seq={}, sidx={}, frag_type=0x{:02x}, NAL_type={:?}, len={}",
-                    block.block_seq, sidx, frag_type, nalu_type, frag_data.len()
+                    "NAL: seq={}, sidx={}, nal_id={}, frag_type=0x{:02x}, NAL_type={:?}, len={}",
+                    block.block_seq, sidx, nal_id, frag_type, nalu_type, frag_data.len()
                 );
             }
 
             match frag_type {
                 0x00 => {
                     *fec_recovered += 1;
-                    // Single-fragment NAL: if there is an ongoing multi-frag assembly, it's unexpected.
-                    if self.assembly_active {
-                        warn!("Incomplete multi-frag NAL interrupted by single-frag NAL; discarding assembly");
-                        self.assembly_buf.clear();
-                        self.assembly_active = false;
-                    }
+                    // Single-fragment NAL
                     if let Err(e) = self.tx.send(frag_data.to_vec()) {
                         warn!("Video frame channel closed: {}", e);
                     }
                 }
                 0x01 => {
                     // Start of a multi-fragment NAL
-                    self.assembly_buf.clear();
-                    self.assembly_buf.extend_from_slice(frag_data);
-                    self.assembly_active = true;
+                    self.assembly_map.insert(nal_id, frag_data.to_vec());
                 }
                 0x02 => {
-                    if self.assembly_active {
-                        self.assembly_buf.extend_from_slice(frag_data);
+                    if let Some(buf) = self.assembly_map.get_mut(&nal_id) {
+                        buf.extend_from_slice(frag_data);
                     } else {
-                        // Orphan continuation fragment - no assembly in progress
+                        // Orphan continuation fragment
                         self.orphan_fragments += 1;
                         if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
-                            debug!("Orphan continuation fragment (no active assembly), total: {}", self.orphan_fragments);
+                            debug!("Orphan continuation fragment nal_id={}, total: {}", nal_id, self.orphan_fragments);
                         }
                     }
                 }
                 0x03 => {
-                    if self.assembly_active {
-                        self.assembly_buf.extend_from_slice(frag_data);
-                        if let Err(e) = self.tx.send(self.assembly_buf.clone()) {
+                    if let Some(mut buf) = self.assembly_map.remove(&nal_id) {
+                        buf.extend_from_slice(frag_data);
+                        if let Err(e) = self.tx.send(buf) {
                             warn!("Video frame channel closed: {}", e);
                         }
-                        self.assembly_buf.clear();
-                        self.assembly_active = false;
                     } else {
-                        // Orphan last fragment; ignore
+                        // Orphan end fragment
+                        self.orphan_fragments += 1;
+                        if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
+                            debug!("Orphan end fragment nal_id={}, total: {}", nal_id, self.orphan_fragments);
+                        }
                     }
                 }
-                _ => {}
+                _ => {
+                    warn!("Unknown frag_type: {}", frag_type);
+                }
             }
         }
     }
@@ -174,10 +174,8 @@ impl VideoReceiver {
         next_block: &mut u32,
         fec_recovered: &mut u64,
     ) {
-        // NOTE: This is strict in-order drain - a missing block holds back all later blocks.
-        // This ensures video frames are decoded in order, but if a block is permanently
-        // lost (e.g., network dropout), all subsequent completed blocks are blocked.
-        // Trade-off: Correct frame ordering vs. potential head-of-line blocking.
+        // Drain completed blocks in order, stopping at the first missing block.
+        // Head-of-line blocking is mitigated by timeout-based stall detection in the main loop.
         loop {
             let idx = (*next_block as usize) % RING_SIZE;
             if let Some(block) = completed[idx].take() {
@@ -202,6 +200,7 @@ impl VideoReceiver {
         let mut fec_recovered: u64 = 0;
         let mut fec_dropped: u64 = 0;
         let mut payload_count: u64 = 0;
+        let mut head_of_line_stall_start: Option<Instant> = None;
 
         info!("VideoReceiver loop starting (strict in-order)");
 
@@ -293,6 +292,23 @@ impl VideoReceiver {
             if !next_block_init {
                 next_block = block_seq;
                 next_block_init = true;
+            }
+
+            // Check for head-of-line blocking stall
+            if next_block_init && completed[(next_block as usize) % RING_SIZE].is_none() {
+                if head_of_line_stall_start.is_none() {
+                    head_of_line_stall_start = Some(Instant::now());
+                } else if head_of_line_stall_start.unwrap().elapsed() > STALL_TIMEOUT {
+                    warn!("Head-of-line block {} stalled for {:?}, skipping to prevent freeze", next_block, STALL_TIMEOUT);
+                    next_block = next_block.wrapping_add(1);
+                    head_of_line_stall_start = None;
+                    fec_dropped += 1;
+                    // Drain any subsequent completed blocks
+                    self.drain_completed(&mut completed, &mut next_block, &mut fec_recovered);
+                    last_decode_time = Instant::now();
+                }
+            } else {
+                head_of_line_stall_start = None;
             }
 
             let idx = (block_seq as usize) % RING_SIZE;
