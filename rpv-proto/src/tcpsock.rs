@@ -220,8 +220,8 @@ impl SocketTrait for TcpSocket {
                 if read_buf.len() >= 4 {
                     let len = u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]]) as usize;
                     
-                    // Sanity check on frame length
-                    if len > 65536 {
+                    // Sanity check on frame length - allow up to 1MB for high-res video frames
+                    if len > 1024 * 1024 {
                         tracing::warn!("TCP frame too large: {} bytes, clearing buffer", len);
                         read_buf.clear();
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame too large"));

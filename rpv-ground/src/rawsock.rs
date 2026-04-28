@@ -231,6 +231,8 @@ impl RawSocket {
                 );
             } else {
                 tracing::info!("BPF magic-byte filter attached (kernel-side RP frame filtering)");
+                // Free the filter memory since the kernel has copied it
+                self.bpf_filters = None;
             }
         }
 

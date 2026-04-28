@@ -87,16 +87,15 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
     @fragment
     fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-        // Use same UV for all planes - sampler handles half-resolution chroma via linear filtering
         let uv = in.uv;
-        
+        let uv_chroma = uv * 0.5; // Chroma planes are half resolution in YUV420
+
         // BT.601 YCbCr (limited range 16-235 for Y, 16-240 for U/V)
         // Convert from 0-255 to proper ranges
-        // Y at full resolution, U/V at half resolution -> use uv*0.5 for correct chroma coordinates
-        // Use textureSampleLevel(..., 0.0) to force nearest-neighbor (no interpolation)
+        // Y at full resolution, U/V at half resolution
         let y_val = (textureSample(t_y, s, uv).r * 255.0 - 16.0) * (255.0 / 219.0);
-        let u_val = (textureSampleLevel(t_u, s, uv * 0.5, 0.0).r * 255.0 - 128.0) * (255.0 / 224.0);
-        let v_val = (textureSampleLevel(t_v, s, uv * 0.5, 0.0).r * 255.0 - 128.0) * (255.0 / 224.0);
+        let u_val = (textureSample(t_u, s, uv_chroma).r * 255.0 - 128.0) * (255.0 / 224.0);
+        let v_val = (textureSample(t_v, s, uv_chroma).r * 255.0 - 128.0) * (255.0 / 224.0);
         
         // BT.601 YCbCr -> RGB
         let r = y_val + 1.402 * v_val;
@@ -410,6 +409,7 @@ pub struct AppState {
 pub struct RpvApp {
     state: AppState,
     frame_rx: crossbeam_channel::Receiver<DecodedYUV>,
+    frame_buffer: std::collections::VecDeque<DecodedYUV>,
     needs_repaint: bool,
     has_ever_had_frame: bool,
     yuv_gpu: Option<Arc<Mutex<YuvGpuResources>>>,
@@ -442,6 +442,7 @@ impl RpvApp {
                 channels,
             },
             frame_rx,
+            frame_buffer: std::collections::VecDeque::new(),
             needs_repaint: false,
             has_ever_had_frame: false,
             yuv_gpu: None,
@@ -473,10 +474,13 @@ impl RpvApp {
     }
 
     fn process_frames(&mut self) -> bool {
-        let mut latest = None;
         let mut recv_count = 0usize;
         while let Ok(frame) = self.frame_rx.try_recv() {
-            latest = Some(frame);
+            // Keep up to 3 frames for buffering to smooth playback
+            if self.frame_buffer.len() >= 3 {
+                let _ = self.frame_buffer.pop_front(); // Drop oldest frame
+            }
+            self.frame_buffer.push_back(frame);
             recv_count += 1;
         }
 
@@ -490,7 +494,7 @@ impl RpvApp {
         }
 
         let mut had_frame = false;
-        if let (Some(frame), Some(ref gpu)) = (latest, &self.yuv_gpu) {
+        if let (Some(frame), Some(ref gpu)) = (self.frame_buffer.front(), &self.yuv_gpu) {
             {
                 let res = gpu.lock().unwrap();
                 if res.video_width != frame.width || res.video_height != frame.height {
@@ -539,6 +543,9 @@ impl RpvApp {
             self.state.link_state.video_frame_decoded();
             self.has_ever_had_frame = true;
             had_frame = true;
+
+            // Remove the processed frame from buffer
+            self.frame_buffer.pop_front();
         }
         had_frame
     }

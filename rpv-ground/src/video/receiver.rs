@@ -13,6 +13,7 @@ const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
 const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
+const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RsBlock {
     block_seq: u32,
@@ -32,7 +33,7 @@ struct CompletedBlock {
 pub struct VideoReceiver {
     tx: crossbeam_channel::Sender<Vec<u8>>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
-    assembly_map: HashMap<u32, Vec<u8>>,
+    assembly_map: HashMap<u32, (Vec<u8>, Instant)>,
     orphan_fragments: u64,
 }
 
@@ -80,6 +81,11 @@ impl VideoReceiver {
         }
     }
 
+    fn cleanup_fragments(&mut self) {
+        let now = Instant::now();
+        self.assembly_map.retain(|_, (_, time)| now.duration_since(*time) < FRAGMENT_TIMEOUT);
+    }
+
     #[inline]
     fn is_future_block(block_seq: u32, next_block: u32) -> bool {
         block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
@@ -97,11 +103,15 @@ impl VideoReceiver {
                 continue;
             }
 
-            let frag_type = trimmed[0];
             if trimmed.len() < 5 {
                 continue;
             }
-            let nal_id = u32::from_le_bytes(trimmed[1..5].try_into().unwrap());
+            let frag_type = trimmed[0];
+            let nal_id_bytes = trimmed.get(1..5).and_then(|b| b.try_into().ok());
+            let nal_id = match nal_id_bytes {
+                Some(bytes) => u32::from_le_bytes(bytes),
+                None => continue, // Should not happen due to len check, but safe
+            };
             let frag_data = &trimmed[5..];
 
             if *fec_recovered < 3 {
@@ -134,10 +144,10 @@ impl VideoReceiver {
                 }
                 0x01 => {
                     // Start of a multi-fragment NAL
-                    self.assembly_map.insert(nal_id, frag_data.to_vec());
+                    self.assembly_map.insert(nal_id, (frag_data.to_vec(), Instant::now()));
                 }
                 0x02 => {
-                    if let Some(buf) = self.assembly_map.get_mut(&nal_id) {
+                    if let Some((buf, _)) = self.assembly_map.get_mut(&nal_id) {
                         buf.extend_from_slice(frag_data);
                     } else {
                         // Orphan continuation fragment
@@ -148,7 +158,7 @@ impl VideoReceiver {
                     }
                 }
                 0x03 => {
-                    if let Some(mut buf) = self.assembly_map.remove(&nal_id) {
+                    if let Some((mut buf, _)) = self.assembly_map.remove(&nal_id) {
                         buf.extend_from_slice(frag_data);
                         if let Err(e) = self.tx.send(buf) {
                             warn!("Video frame channel closed: {}", e);
@@ -193,7 +203,6 @@ impl VideoReceiver {
 
         let mut blocks: [Option<RsBlock>; RING_SIZE] = std::array::from_fn(|_| None);
         let mut completed: [Option<CompletedBlock>; RING_SIZE] = std::array::from_fn(|_| None);
-        let mut processed_ring: [Option<u32>; RING_SIZE] = std::array::from_fn(|_| None);
         let mut next_block: u32 = 0;
         let mut next_block_init = false;
         let mut last_decode_time = Instant::now();
@@ -205,6 +214,8 @@ impl VideoReceiver {
         info!("VideoReceiver loop starting (strict in-order)");
 
         loop {
+            self.cleanup_fragments();
+
             let payload = match self.rx.try_recv() {
                 Ok(p) => p,
                 Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -217,7 +228,6 @@ impl VideoReceiver {
                             );
                         }
                         blocks[idx] = None;
-                        processed_ring[idx] = None;
                         next_block = next_block.wrapping_add(1);
                         fec_dropped += 1;
                     }
@@ -321,10 +331,16 @@ impl VideoReceiver {
                 }
             }
 
+            // Clear old completed block if seq mismatch (handles wraparound)
+            if let Some(ref comp) = completed[idx] {
+                if comp.block_seq != block_seq {
+                    completed[idx] = None;
+                }
+            }
+
             if let Some(ref existing) = blocks[idx] {
                 if existing.block_seq.wrapping_sub(block_seq) != 0 {
                     blocks[idx] = None;
-                    processed_ring[idx] = None;
                 }
             }
 
@@ -373,7 +389,6 @@ impl VideoReceiver {
                         data_shards,
                         shard_lens: block.shard_lens,
                     });
-                    processed_ring[idx] = Some(block_seq);
 
                     if block_seq.wrapping_sub(next_block) == 0 {
                         self.drain_completed(&mut completed, &mut next_block, &mut fec_recovered);
@@ -383,7 +398,6 @@ impl VideoReceiver {
                     }
                 } else {
                     fec_dropped += 1;
-                    processed_ring[idx] = Some(block_seq);
                 }
 #[cfg(test)]
 mod tests {

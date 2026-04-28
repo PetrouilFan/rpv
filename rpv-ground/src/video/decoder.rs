@@ -227,7 +227,28 @@ fn decode_loop_libavcodec(
         width, height
     );
     let codec_name = std::ffi::CString::new("h264").unwrap();
-    let codec = unsafe { ffi::avcodec_find_decoder_by_name(codec_name.as_ptr() as *const _) };
+    // Try hardware-accelerated decoders first
+    let hw_decoder_names = ["h264_videotoolbox", "h264", "h264_cuvid", "h264_qsv"];
+    let mut codec = std::ptr::null();
+    let mut selected_decoder = "h264";
+
+    for hw_name in &hw_decoder_names {
+        let cstr = std::ffi::CString::new(*hw_name).unwrap();
+        codec = unsafe { ffi::avcodec_find_decoder_by_name(cstr.as_ptr()) };
+        if !codec.is_null() {
+            selected_decoder = *hw_name;
+            info!("Using hardware decoder: {}", selected_decoder);
+            break;
+        }
+    }
+
+    if codec.is_null() {
+        // Fallback to software decoder
+        let codec_name = std::ffi::CString::new("h264").unwrap();
+        codec = unsafe { ffi::avcodec_find_decoder_by_name(codec_name.as_ptr() as *const _) };
+        selected_decoder = "h264 (software)";
+    }
+
     if codec.is_null() {
         error!("libavcodec: h264 decoder not found");
         return;
@@ -248,7 +269,7 @@ fn decode_loop_libavcodec(
 
     let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
     if ret < 0 {
-        error!("libavcodec: failed to open h264 decoder (err {})", ret);
+        error!("libavcodec: failed to open {} decoder (err {})", selected_decoder, ret);
         unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
         return;
     }
@@ -309,9 +330,12 @@ fn decode_loop_libavcodec(
         }
 
         unsafe {
-            ffi::av_packet_unref(pkt);
-            ffi::av_packet_from_data(pkt, nal_data.as_ptr() as *mut u8, nal_data.len() as i32);
-            std::mem::forget(nal_data);
+            // Properly manage packet data to avoid memory leaks
+            // av_packet_from_data takes ownership of the buffer
+            let nal_data_ptr = nal_data.as_ptr() as *mut u8;
+            let nal_data_len = nal_data.len() as i32;
+            std::mem::forget(nal_data); // Prevent Rust from deallocating
+            ffi::av_packet_from_data(pkt, nal_data_ptr, nal_data_len);
         }
 
         let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
@@ -383,6 +407,7 @@ fn decode_loop_libavcodec(
     }
 
     unsafe {
+        ffi::av_packet_unref(pkt);
         ffi::avcodec_free_context(&mut { codec_ctx });
         ffi::av_packet_free(&mut { pkt });
         ffi::av_frame_free(&mut { frame });
