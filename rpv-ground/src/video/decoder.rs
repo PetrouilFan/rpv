@@ -89,6 +89,10 @@ fn process_decoded_frame(
     let ls0 = unsafe { (*frame).linesize[0] };
     let ls1 = unsafe { (*frame).linesize[1] };
     let ls2 = unsafe { (*frame).linesize[2] };
+    if ls2 < 0 {
+        tracing::warn!("Negative linesize for V plane: {}", ls2);
+        return;
+    }
     if ls0 < 0 || ls1 < 0 || ls2 < 0 {
         return;
     }
@@ -99,7 +103,7 @@ fn process_decoded_frame(
     let data1 = unsafe { (*frame).data[1] };
     let data2 = unsafe { (*frame).data[2] };
 
-    if data0.is_null() || data1.is_null() {
+    if data0.is_null() || data1.is_null() || data2.is_null() {
         return;
     }
     if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2 {
@@ -179,7 +183,13 @@ fn process_decoded_frame(
             let dst_start = row * linesize1;
             u_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
-        let v_size = linesize2 * uv_h;
+        let v_size = match linesize2.checked_mul(uv_h) {
+            Some(val) => val,
+            None => {
+                tracing::warn!("Integer overflow in V plane size calculation: linesize2={}, uv_h={}", linesize2, uv_h);
+                return;
+            }
+        };
         v_buf.resize(v_size, 0);
         for row in 0..uv_h {
             let src = unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), linesize2) };

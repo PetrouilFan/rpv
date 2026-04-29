@@ -3,6 +3,8 @@ mod fc;
 mod rawsock;
 mod video_tx;
 
+use std::io::Write;
+use std::os::unix::fs::{PermissionsExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -93,6 +95,8 @@ fn main() {
     let is_udp = cfg.common.transport == "udp";
     let is_tcp = cfg.common.transport == "tcp";
 
+    let mut discovery_handle: Option<std::thread::JoinHandle<()>> = None;
+
     // Pre-declare peer_addr so it's in scope for UdpSocket::new below
     let peer_addr: std::sync::Arc<arc_swap::ArcSwap<Option<std::net::SocketAddr>>> =
         std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
@@ -118,11 +122,12 @@ fn main() {
 
         // If peer_addr not set (either not configured or parse failed), use discovery
         if peer_addr.load().is_none() {
-            let (_disc, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
+            let (handle, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
                 .unwrap_or_else(|e| {
                     tracing::error!("Failed to start discovery: {}", e);
                     std::process::exit(1);
                 });
+            discovery_handle = Some(handle);
 
             // Wait for ground station to discover us
             let mut waited = Duration::ZERO;
@@ -177,15 +182,16 @@ fn main() {
                     return;
                 }
             }
-        } else {
-            // Use discovery to find ground station
-            let (_disc, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
-                .unwrap_or_else(|e| {
-                    tracing::error!("Failed to start discovery: {}", e);
-                    std::process::exit(1);
-                });
+            } else {
+                // Use discovery to find ground station
+                let (handle, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Failed to start discovery: {}", e);
+                        std::process::exit(1);
+                    });
+                discovery_handle = Some(handle);
 
-            // Wait for ground station to discover us
+                // Wait for ground station to discover us
             let mut waited = Duration::ZERO;
             let wait_timeout = Duration::from_secs(30);
             while addr.load().is_none() && waited < wait_timeout {
@@ -402,6 +408,9 @@ fn main() {
     join_log("heartbeat_monitor", hm_handle);
     join_log("heartbeat_sender", hb_handle);
     join_log("mavlink_forwarder", mavlink_fwd_handle);
+    if let Some(handle) = discovery_handle {
+        join_log("discovery", handle);
+    }
 
     tracing::info!("rpv-cam stopped");
 }
@@ -497,8 +506,8 @@ fn rx_dispatcher(
                 if count > 16 {
                     continue;
                 }
-                let expected = 4 + count * 2;
-                if data.len() < expected {
+                if data.len() < 4 + count * 2 {
+                    tracing::warn!("RC packet too short: {} bytes for {} channels", data.len(), count);
                     continue;
                 }
                 let mut channels = Vec::with_capacity(count);
@@ -512,25 +521,51 @@ fn rx_dispatcher(
                     let _ = tx.try_send(channels);
                 } else {
                     let ch_str: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
-                    let tmp_path = format!("{}.tmp", rc_file_path);
-                    match std::fs::File::create(&tmp_path) {
-                        Ok(mut f) => {
-                            use std::io::Write;
-                            if let Err(e) = f.write_all(ch_str.join(",").as_bytes()) {
-                                tracing::warn!("RC file write error: {}", e);
-                            } else if let Err(e) = f.sync_all() {
-                                // NOTE: fsync ensures data hits disk, reducing torn file risk on crash/power loss
-                                tracing::warn!("RC file fsync error: {}", e);
-                            }
-                            // Atomic rename (note: directory sync would provide stronger guarantees)
-                            if let Err(e) = std::fs::rename(&tmp_path, rc_file_path) {
-                                tracing::warn!("RC file rename error: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("RC file create error: {}", e);
+                    let rc_file_path_str = rc_file_path;
+
+                    // Prevent TOCTOU symlink attack: ensure target is not a symlink before writing
+                    if let Ok(meta) = std::fs::symlink_metadata(rc_file_path_str) {
+                        if meta.file_type().is_symlink() {
+                            tracing::error!("RC file path is a symlink, refusing to write");
+                            return;
                         }
                     }
+
+                    let tmp_path = format!("{}.tmp", rc_file_path_str);
+                    let mut file = match std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(&tmp_path)
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::error!("Failed to create RC temp file: {}", e);
+                            return;
+                        }
+                    };
+
+                    if let Err(e) = file.write_all(ch_str.join(",").as_bytes()) {
+                        tracing::error!("Failed to write RC data: {}", e);
+                        return;
+                    }
+                    if let Err(e) = file.sync_all() {
+                        tracing::error!("Failed to sync RC data: {}", e);
+                        return;
+                    }
+                    // Close file before rename
+                    drop(file);
+
+                    // Atomic rename
+                    if let Err(e) = std::fs::rename(&tmp_path, rc_file_path_str) {
+                        tracing::error!("RC file rename error: {}", e);
+                        // Cleanup temp file
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return;
+                    }
+                    // Ensure final file has secure perms
+                    let _ = std::fs::set_permissions(rc_file_path_str, std::fs::Permissions::from_mode(0o600));
                     last_rc_time = Instant::now();
                     rc_failsafe_active.store(false, Ordering::SeqCst);
                 }

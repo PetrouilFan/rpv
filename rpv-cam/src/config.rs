@@ -147,6 +147,14 @@ impl Config {
                     errors.push(format!("video_device '{}' is not a character device", self.video_device));
                 }
             }
+            // Resolve symlinks and ensure final target is within /dev
+            if let Ok(canonical) = std::path::Path::new(&self.video_device).canonicalize() {
+                if !canonical.starts_with("/dev/") {
+                    errors.push(format!("video_device '{}' resolves outside /dev directory (possible symlink attack)", self.video_device));
+                }
+            } else {
+                errors.push(format!("video_device '{}' cannot be canonicalized (broken symlink or permission denied)", self.video_device));
+            }
         }
 
         // Validate fc_port exists and is a character device
@@ -157,6 +165,14 @@ impl Config {
             if !meta.file_type().is_char_device() {
                 errors.push(format!("fc_port '{}' is not a character device", self.fc_port));
             }
+        }
+        // Resolve symlinks and ensure final target is within /dev
+        if let Ok(canonical) = std::path::Path::new(&self.fc_port).canonicalize() {
+            if !canonical.starts_with("/dev/") {
+                errors.push(format!("fc_port '{}' resolves outside /dev directory (possible symlink attack)", self.fc_port));
+            }
+        } else {
+            errors.push(format!("fc_port '{}' cannot be canonicalized (broken symlink or permission denied)", self.fc_port));
         }
 
         // Validate fc_baud reasonable

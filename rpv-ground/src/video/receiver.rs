@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use rpv_proto::link;
-use std::collections::HashMap;
+use ahash::AHashMap;
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -12,7 +12,7 @@ const VIDEO_HDR_FIXED: usize = 8;
 const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
-const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
+const STALL_TIMEOUT: Duration = Duration::from_millis(500);
 const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RsBlock {
@@ -76,7 +76,7 @@ impl VideoReceiver {
         Self {
             tx,
             rx,
-            assembly_map: HashMap::new(),
+            assembly_map: AHashMap::new(),
             orphan_fragments: 0,
         }
     }

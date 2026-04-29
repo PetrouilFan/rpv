@@ -73,11 +73,10 @@ impl Default for CommonConfig {
 
 impl CommonConfig {
     pub fn config_dir() -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        // Resolve symlinks and .. to avoid directory traversal attacks
+        let home = std::env::var("HOME").expect("HOME environment variable not set");
         let home_canon = std::path::Path::new(&home)
             .canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(&home));
+            .expect("Failed to canonicalize HOME directory");
         std::path::PathBuf::from(format!("{}/.config/rpv", home_canon.display()))
     }
 

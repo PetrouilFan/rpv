@@ -922,6 +922,8 @@ fn main() -> Result<(), eframe::Error> {
     let is_udp = config.common.transport == "udp";
     let is_tcp = config.common.transport == "tcp";
 
+    let mut discovery_handle: Option<std::thread::JoinHandle<()>> = None;
+
     let socket: Arc<dyn SocketTrait> = if is_udp {
         // If peer_addr is pre-configured, set it directly; otherwise use discovery
         let preconfigured_addr: Option<std::net::SocketAddr> = if let Some(ref peer) = config.common.peer_addr {
@@ -939,12 +941,13 @@ fn main() -> Result<(), eframe::Error> {
             None
         };
 
-        let (_discovery, peer_addr) =
+        let (handle, peer_addr) =
             discovery::Discovery::spawn(0x02, config.common.drone_id, config.common.udp_port)
                 .unwrap_or_else(|e| {
                     tracing::error!("Failed to start discovery: {}", e);
                     std::process::exit(1);
                 });
+        discovery_handle = Some(handle);
 
         // If pre-configured, set the address directly; otherwise wait for discovery
         if let Some(addr) = preconfigured_addr {
@@ -1223,13 +1226,19 @@ fn main() -> Result<(), eframe::Error> {
     write_link_status("disconnected");
 
     join_log("rx_dispatcher", rx_handle);
-    join_log("video_receiver", vr_handle);
+    match vr_handle.join() {
+        Ok(()) => tracing::info!("video_receiver thread exited normally (video_frame_tx channel closed)"),
+        Err(e) => tracing::error!("video_receiver thread panicked: {:?}", e),
+    }
     join_log("telemetry", telem_handle);
     join_log("rc_joystick", rc_handle);
     join_log("heartbeat_sender", hb_handle);
     join_log("heartbeat_monitor", hm_handle);
     join_log("mavlink_downlink", mavlink_down_handle);
     join_log("mavlink_uplink", mavlink_up_handle);
+    if let Some(handle) = discovery_handle {
+        join_log("discovery", handle);
+    }
 
     result
 }

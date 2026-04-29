@@ -100,10 +100,10 @@ fn find_start_code(buf: &[u8], mut offset: usize) -> Option<usize> {
 
 /// Extract the next NAL unit from the buffer, including its start code.
 /// Returns (nal_data, consumed) where consumed is the number of bytes to drain from the buffer.
-fn extract_next_nal_cursor(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
+fn extract_next_nal_cursor(buf: &[u8]) -> Option<(&[u8], usize)> {
     let start = find_start_code(buf, 0)?;
     let end = find_start_code(buf, start + 3).unwrap_or(buf.len());
-    let nal = buf[start..end].to_vec();
+    let nal = &buf[start..end];
     let consumed = end - start;
     Some((nal, consumed))
 }
@@ -723,10 +723,10 @@ pub fn run(
 
             // Store SPS/PPS for future injection
             if nal_type == 7 {
-                stored_sps = Some(nal_data.clone());
+                stored_sps = Some(nal_data.to_vec());
             }
             if nal_type == 8 {
-                stored_pps = Some(nal_data.clone());
+                stored_pps = Some(nal_data.to_vec());
             }
 
             // If this is an IDR and we have both SPS and PPS, inject them by prepending to buffer
@@ -743,19 +743,17 @@ pub fn run(
                 }
             }
 
-            // Normal path: remove this NAL from buffer
-            nal_buf.drain(..consumed);
+            // Normal path: will remove this NAL from buffer after fragmentation
 
             tracing::debug!("Extracted NAL: len={}, first4={:02x?}", nal_data.len(), &nal_data[..4.min(nal_data.len())]);
 
-            let nal_with_sc = nal_data.clone();
 
             let nal_id = nal_seq;
             nal_seq = nal_seq.wrapping_add(1);
 
 
             let max_data = MAX_SHARD_DATA - 5; // 5-byte fragment header (frag_num + nal_id_le)
-            let mut offset_remaining = nal_with_sc.len();
+            let mut offset_remaining = nal_data.len();
             let mut offset = 0;
 
             loop {
@@ -773,7 +771,7 @@ pub fn run(
                     // Write fragment header into arena at current offset
                     arena.write_frag(slot, pending.offset, &[frag_num]);
                     arena.write_frag(slot, pending.offset + 1, &nal_id_val.to_le_bytes());
-                    arena.write_frag(slot, pending.offset + 5, &nal_with_sc[offset..offset + chunk_len]);
+                    arena.write_frag(slot, pending.offset + 5, &nal_data[offset..offset + chunk_len]);
 
                     let new_offset = pending.offset + 5 + chunk_len;
                     slot_filled[slot] = new_offset;
@@ -848,9 +846,9 @@ pub fn run(
                     arena.write_frag(slot, slot_filled[slot], &[frag_num]);
                     arena.write_frag(slot, slot_filled[slot] + 1, &nal_id.to_le_bytes());
 
-                    let pos_in_nal = nal_with_sc.len() - offset_remaining;
+                    let pos_in_nal = nal_data.len() - offset_remaining;
                     let chunk_len = offset_remaining.min(max_data);
-                    arena.write_frag(slot, slot_filled[slot] + 5, &nal_with_sc[pos_in_nal..pos_in_nal + chunk_len]);
+                    arena.write_frag(slot, slot_filled[slot] + 5, &nal_data[pos_in_nal..pos_in_nal + chunk_len]);
 
                     let new_offset = slot_filled[slot] + 5 + chunk_len;
                     slot_filled[slot] = new_offset;
@@ -906,6 +904,7 @@ pub fn run(
                     break;
                 }
             }
+            nal_buf.drain(..consumed);
         }
 
         // Rate limit slightly to avoid overwhelming the network

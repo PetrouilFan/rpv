@@ -287,8 +287,11 @@ impl SocketTrait for RawSocket {
 
 impl Drop for RawSocket {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = -1;
         }
     }
 }

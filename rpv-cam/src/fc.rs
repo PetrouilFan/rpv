@@ -70,7 +70,7 @@ pub fn start(
     rc_failsafe_active: Arc<AtomicBool>,
 ) -> Option<FcLink> {
     // Create persistent channels that survive reconnections
-    let (telem_tx, telem_rx) = unbounded::<FcTelemetry>();
+    let (telem_tx, telem_rx) = bounded::<FcTelemetry>(4);
     let (rc_tx, rc_rx) = bounded::<Vec<u16>>(2);
     let (raw_downlink_tx, raw_downlink_rx) = bounded::<Vec<u8>>(64);
     let (raw_uplink_tx, raw_uplink_rx) = bounded::<Vec<u8>>(64);
