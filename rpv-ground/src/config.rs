@@ -76,10 +76,16 @@ impl Config {
 
         // Validate GCS ports: must be in range 1024-65535 and not equal
         if self.gcs_uplink_port < 1024 || self.gcs_uplink_port > 65535 {
-            errors.push(format!("gcs_uplink_port {} invalid (should be 1024..65535)", self.gcs_uplink_port));
+            errors.push(format!(
+                "gcs_uplink_port {} invalid (should be 1024..65535)",
+                self.gcs_uplink_port
+            ));
         }
         if self.gcs_downlink_port < 1024 || self.gcs_downlink_port > 65535 {
-            errors.push(format!("gcs_downlink_port {} invalid (should be 1024..65535)", self.gcs_downlink_port));
+            errors.push(format!(
+                "gcs_downlink_port {} invalid (should be 1024..65535)",
+                self.gcs_downlink_port
+            ));
         }
         if self.gcs_uplink_port == self.gcs_downlink_port {
             errors.push("gcs_uplink_port and gcs_downlink_port must be different".to_string());

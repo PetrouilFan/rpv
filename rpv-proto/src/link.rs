@@ -77,7 +77,11 @@ mod tests {
 
     #[test]
     fn encode_into_produces_correct_bytes() {
-        let hdr = L2Header { seq: 123, payload_type: 1, drone_id: 42 };
+        let hdr = L2Header {
+            seq: 123,
+            payload_type: 1,
+            drone_id: 42,
+        };
         let mut buf = Vec::new();
         hdr.encode_into(&[], &mut buf);
         assert_eq!(buf[0], MAGIC[0]);
@@ -136,7 +140,11 @@ mod tests {
 
     #[test]
     fn round_trip_encode_decode() {
-        let original = L2Header { seq: 999, payload_type: PAYLOAD_VIDEO, drone_id: 100 };
+        let original = L2Header {
+            seq: 999,
+            payload_type: PAYLOAD_VIDEO,
+            drone_id: 100,
+        };
         let mut buf = Vec::new();
         let payload = b"test data";
         original.encode_into(payload, &mut buf);
@@ -149,7 +157,11 @@ mod tests {
 
     #[test]
     fn edge_case_max_seq() {
-        let hdr = L2Header { seq: u32::MAX, payload_type: 1, drone_id: 42 };
+        let hdr = L2Header {
+            seq: u32::MAX,
+            payload_type: 1,
+            drone_id: 42,
+        };
         let mut buf = Vec::new();
         hdr.encode_into(&[], &mut buf);
         let (decoded, _) = L2Header::decode(&buf).unwrap();
@@ -158,7 +170,11 @@ mod tests {
 
     #[test]
     fn edge_case_zero_drone_id() {
-        let hdr = L2Header { seq: 0, payload_type: 1, drone_id: 0 };
+        let hdr = L2Header {
+            seq: 0,
+            payload_type: 1,
+            drone_id: 0,
+        };
         let mut buf = Vec::new();
         hdr.encode_into(&[], &mut buf);
         let (decoded, _) = L2Header::decode(&buf).unwrap();
@@ -167,8 +183,18 @@ mod tests {
 
     #[test]
     fn various_payload_types() {
-        for &pt in &[PAYLOAD_VIDEO, PAYLOAD_TELEMETRY, PAYLOAD_RC, PAYLOAD_HEARTBEAT, PAYLOAD_MAVLINK] {
-            let hdr = L2Header { seq: 1, payload_type: pt, drone_id: 1 };
+        for &pt in &[
+            PAYLOAD_VIDEO,
+            PAYLOAD_TELEMETRY,
+            PAYLOAD_RC,
+            PAYLOAD_HEARTBEAT,
+            PAYLOAD_MAVLINK,
+        ] {
+            let hdr = L2Header {
+                seq: 1,
+                payload_type: pt,
+                drone_id: 1,
+            };
             let mut buf = Vec::new();
             hdr.encode_into(&[], &mut buf);
             let (decoded, _) = L2Header::decode(&buf).unwrap();

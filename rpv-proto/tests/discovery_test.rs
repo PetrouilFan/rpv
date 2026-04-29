@@ -54,7 +54,9 @@ struct TestPeer {
 impl TestPeer {
     fn new(role: u8, drone_id: u8, data_port: u16) -> (Self, SocketAddr) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind");
-        socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
 
         let local_addr = socket.local_addr().unwrap();
         let discovered_peer = Arc::new(AtomicU64::new(0));

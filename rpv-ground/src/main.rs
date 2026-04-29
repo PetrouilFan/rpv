@@ -19,10 +19,10 @@ use egui::Vec2;
 
 use rpv_proto::discovery;
 use rpv_proto::link;
+use rpv_proto::rawsock_common;
 use rpv_proto::socket_trait::SocketTrait;
 use rpv_proto::tcpsock::TcpSocket;
 use rpv_proto::udpsock::UdpSocket;
-use rpv_proto::rawsock_common;
 
 use crate::config::Config;
 use crate::link_state::{LinkStateHandle, LinkStatus};
@@ -383,7 +383,10 @@ impl egui_wgpu::CallbackTrait for YuvRenderCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         _callback_resources: &egui_wgpu::CallbackResources,
     ) {
-        let res = self.resources.lock().expect("GPU resources mutex poisoned; possible previous panic in paint callback");
+        let res = self
+            .resources
+            .lock()
+            .expect("GPU resources mutex poisoned; possible previous panic in paint callback");
         render_pass.set_pipeline(&res.pipeline);
         render_pass.set_bind_group(0, &res.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -496,7 +499,9 @@ impl RpvApp {
         let mut had_frame = false;
         if let (Some(frame), Some(ref gpu)) = (self.frame_buffer.front(), &self.yuv_gpu) {
             {
-                let res = gpu.lock().expect("GPU mutex poisoned; a panic occurred in GPU upload or paint callback");
+                let res = gpu
+                    .lock()
+                    .expect("GPU mutex poisoned; a panic occurred in GPU upload or paint callback");
                 if res.video_width != frame.width || res.video_height != frame.height {
                     tracing::warn!(
                         "Resolution change detected ({}x{} -> {}x{}), reinitializing GPU",
@@ -588,8 +593,10 @@ impl eframe::App for RpvApp {
         }
 
         let channels = **self.state.channels.load();
-        let rc_changed =
-            channels.iter().zip(self.last_rc_channels.iter()).any(|(a, b)| a != b);
+        let rc_changed = channels
+            .iter()
+            .zip(self.last_rc_channels.iter())
+            .any(|(a, b)| a != b);
         if rc_changed {
             self.last_rc_channels.copy_from_slice(&channels);
             self.needs_repaint = true;
@@ -916,7 +923,10 @@ fn main() -> Result<(), eframe::Error> {
         tracing::info!("Ctrl+C received, shutting down...");
         r.store(false, Ordering::SeqCst);
     }) {
-        tracing::error!("Failed to install Ctrl-C handler: {}. Clean shutdown may not work.", e);
+        tracing::error!(
+            "Failed to install Ctrl-C handler: {}. Clean shutdown may not work.",
+            e
+        );
     }
 
     let is_udp = config.common.transport == "udp";
@@ -926,20 +936,25 @@ fn main() -> Result<(), eframe::Error> {
 
     let socket: Arc<dyn SocketTrait> = if is_udp {
         // If peer_addr is pre-configured, set it directly; otherwise use discovery
-        let preconfigured_addr: Option<std::net::SocketAddr> = if let Some(ref peer) = config.common.peer_addr {
-            match peer.parse() {
-                Ok(addr) => {
-                    tracing::info!("Using configured camera address: {}", addr);
-                    Some(addr)
+        let preconfigured_addr: Option<std::net::SocketAddr> =
+            if let Some(ref peer) = config.common.peer_addr {
+                match peer.parse() {
+                    Ok(addr) => {
+                        tracing::info!("Using configured camera address: {}", addr);
+                        Some(addr)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Invalid peer_addr '{}': {}, falling back to discovery",
+                            peer,
+                            e
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Invalid peer_addr '{}': {}, falling back to discovery", peer, e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let (handle, peer_addr) =
             discovery::Discovery::spawn(0x02, config.common.drone_id, config.common.udp_port)
@@ -998,7 +1013,7 @@ fn main() -> Result<(), eframe::Error> {
         let tcp_port = config.common.tcp_port.unwrap_or(9003);
         let listen_addr = format!("0.0.0.0:{}", tcp_port);
         tracing::info!("Starting TCP server on {}", listen_addr);
-        
+
         match TcpSocket::new_server(&listen_addr, 1000) {
             Ok(s) => {
                 tracing::info!("TCP connection established with camera");
@@ -1227,7 +1242,9 @@ fn main() -> Result<(), eframe::Error> {
 
     join_log("rx_dispatcher", rx_handle);
     match vr_handle.join() {
-        Ok(()) => tracing::info!("video_receiver thread exited normally (video_frame_tx channel closed)"),
+        Ok(()) => {
+            tracing::info!("video_receiver thread exited normally (video_frame_tx channel closed)")
+        }
         Err(e) => tracing::error!("video_receiver thread panicked: {:?}", e),
     }
     join_log("video_decoder", decoder_handle);

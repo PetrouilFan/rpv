@@ -28,6 +28,7 @@ impl RawSocket {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface name"))?;
         let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
         if ifindex == 0 {
+            // SAFETY: fd is valid and owned by us, checked >= 0 before close
             unsafe {
                 libc::close(fd);
             }
@@ -37,6 +38,7 @@ impl RawSocket {
             ));
         }
 
+        // SAFETY: Zero-initializing sockaddr_ll is safe; we set all required fields before use
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
@@ -51,6 +53,7 @@ impl RawSocket {
             )
         };
         if ret < 0 {
+            // SAFETY: fd is valid and owned by us, checked >= 0 before close
             unsafe {
                 libc::close(fd);
             }
@@ -140,6 +143,7 @@ impl RawSocket {
 
         buf.extend_from_slice(payload);
 
+        // SAFETY: fd is valid (owned by this struct), buf.as_ptr() is valid for buf.len() bytes
         let ret = unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
         if ret < 0 {
             let e = io::Error::last_os_error();
@@ -205,7 +209,6 @@ impl Drop for RawSocket {
             unsafe {
                 libc::close(self.fd);
             }
-            self.fd = -1;
         }
     }
 }

@@ -1,5 +1,5 @@
-use tracing::{error, info, warn};
 use std::sync::Arc;
+use tracing::{error, info, warn};
 
 use ffmpeg_sys_next as ffi;
 
@@ -55,10 +55,7 @@ impl VideoDecoder {
         self.frame_rx.clone()
     }
 
-    pub fn spawn(
-        &self,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
-    ) -> std::thread::JoinHandle<()> {
+    pub fn spawn(&self, rx: crossbeam_channel::Receiver<Vec<u8>>) -> std::thread::JoinHandle<()> {
         let frame_tx = self.frame_tx.clone();
         let width = self.width;
         let height = self.height;
@@ -132,7 +129,11 @@ fn process_decoded_frame(
     let y_size = match linesize0.checked_mul(h) {
         Some(val) => val,
         None => {
-            tracing::warn!("Integer overflow in Y plane size: linesize0={}, h={}", linesize0, h);
+            tracing::warn!(
+                "Integer overflow in Y plane size: linesize0={}, h={}",
+                linesize0,
+                h
+            );
             return;
         }
     };
@@ -141,7 +142,11 @@ fn process_decoded_frame(
     let u_size = match linesize1.checked_mul(uv_h) {
         Some(val) => val,
         None => {
-            tracing::warn!("Integer overflow in U plane size: linesize1={}, uv_h={}", linesize1, uv_h);
+            tracing::warn!(
+                "Integer overflow in U plane size: linesize1={}, uv_h={}",
+                linesize1,
+                uv_h
+            );
             return;
         }
     };
@@ -149,7 +154,11 @@ fn process_decoded_frame(
         match linesize2.checked_mul(uv_h) {
             Some(val) => val,
             None => {
-                tracing::warn!("Integer overflow in V plane size (YUV420P): linesize2={}, uv_h={}", linesize2, uv_h);
+                tracing::warn!(
+                    "Integer overflow in V plane size (YUV420P): linesize2={}, uv_h={}",
+                    linesize2,
+                    uv_h
+                );
                 return;
             }
         }
@@ -175,7 +184,11 @@ fn process_decoded_frame(
         let uv_size = match linesize1.checked_mul(uv_h) {
             Some(val) => val,
             None => {
-                tracing::warn!("Integer overflow in UV plane size: linesize1={}, uv_h={}", linesize1, uv_h);
+                tracing::warn!(
+                    "Integer overflow in UV plane size: linesize1={}, uv_h={}",
+                    linesize1,
+                    uv_h
+                );
                 return;
             }
         };
@@ -221,7 +234,11 @@ fn process_decoded_frame(
         height: fh as u32,
         y_stride: linesize0 as u32,
         u_stride: linesize1 as u32,
-        v_stride: if pix_fmt == AV_PIX_FMT_YUV420P as i32 { linesize2 as u32 } else { linesize1 as u32 },
+        v_stride: if pix_fmt == AV_PIX_FMT_YUV420P as i32 {
+            linesize2 as u32
+        } else {
+            linesize1 as u32
+        },
         send_ts_us: None,
         recv_time: Some(std::time::Instant::now()),
     };
@@ -250,7 +267,13 @@ fn decode_loop_libavcodec(
     );
     let codec_name = std::ffi::CString::new("h264").unwrap();
     // Try hardware-accelerated decoders first
-    let hw_decoder_names = ["h264_vaapi", "h264_v4l2m2m", "h264_videotoolbox", "h264_cuvid", "h264_qsv"];
+    let hw_decoder_names = [
+        "h264_vaapi",
+        "h264_v4l2m2m",
+        "h264_videotoolbox",
+        "h264_cuvid",
+        "h264_qsv",
+    ];
     let mut codec = std::ptr::null();
     let mut selected_decoder = "h264";
 
@@ -291,7 +314,10 @@ fn decode_loop_libavcodec(
 
     let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
     if ret < 0 {
-        error!("libavcodec: failed to open {} decoder (err {})", selected_decoder, ret);
+        error!(
+            "libavcodec: failed to open {} decoder (err {})",
+            selected_decoder, ret
+        );
         unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
         return;
     }
@@ -368,20 +394,17 @@ fn decode_loop_libavcodec(
                     if r == AVERROR_EAGAIN || r == AVERROR_EOF || r < 0 {
                         break;
                     }
-                    process_decoded_frame(
-                        frame,
-                        &frame_tx,
-                        width,
-                        height,
-                        &mut frame_count,
-                    );
+                    process_decoded_frame(frame, &frame_tx, width, height, &mut frame_count);
                     unsafe {
                         ffi::av_frame_unref(frame);
                     }
                 }
                 let retry = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };
                 if retry < 0 {
-                    warn!("libavcodec: avcodec_send_packet retry failed with {}", retry);
+                    warn!(
+                        "libavcodec: avcodec_send_packet retry failed with {}",
+                        retry
+                    );
                     unsafe {
                         ffi::av_packet_unref(pkt);
                     }
@@ -405,13 +428,7 @@ fn decode_loop_libavcodec(
                 warn!("libavcodec: receive_frame error {}", recv_ret);
                 break;
             }
-            process_decoded_frame(
-                frame,
-                &frame_tx,
-                width,
-                height,
-                &mut frame_count,
-            );
+            process_decoded_frame(frame, &frame_tx, width, height, &mut frame_count);
             unsafe {
                 ffi::av_frame_unref(frame);
             }

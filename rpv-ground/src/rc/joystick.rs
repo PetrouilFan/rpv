@@ -44,11 +44,7 @@ pub struct RCTx {
 }
 
 impl RCTx {
-    pub fn new(
-        socket: Arc<dyn SocketTrait>,
-        drone_id: u8,
-        running: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(socket: Arc<dyn SocketTrait>, drone_id: u8, running: Arc<AtomicBool>) -> Self {
         let channels = Arc::new(ArcSwap::new(Arc::new([RC_CENTER; RC_CHANNELS])));
         let js_fd = Self::open_joystick();
 
@@ -210,13 +206,13 @@ impl RCTx {
         let normalized = deadboxed / effective_range;
 
         let result = match axis {
-            0 => center + normalized * rc_range,    // ch0 = Roll (Aileron)
+            0 => center + normalized * rc_range, // ch0 = Roll (Aileron)
             1 => {
                 let t = (deadboxed - (JOY_MIN + DEADBAND)) / effective_range;
                 rc_min + t.clamp(0.0, 1.0) * rc_range
             }
-            2 => center + normalized * rc_range,    // ch2 = Yaw
-            3 => center - normalized * rc_range,   // ch3 = Pitch (inverted)
+            2 => center + normalized * rc_range, // ch2 = Yaw
+            3 => center - normalized * rc_range, // ch3 = Pitch (inverted)
             _ => center + normalized * rc_range,
         };
 
@@ -225,14 +221,38 @@ impl RCTx {
 
     fn apply_button(btn: u8, value: i32, arr: &mut [u16; 16], updated: &mut bool) {
         match btn {
-            0 if value == 1 => { arr[4] = 2000; *updated = true; }
-            0 if value == 0 => { arr[4] = 1000; *updated = true; }
-            1 if value == 1 => { arr[5] = 2000; *updated = true; }
-            1 if value == 0 => { arr[5] = 1000; *updated = true; }
-            2 if value == 1 => { arr[6] = 2000; *updated = true; }
-            2 if value == 0 => { arr[6] = 1000; *updated = true; }
-            3 if value == 1 => { arr[7] = 2000; *updated = true; }
-            3 if value == 0 => { arr[7] = 1000; *updated = true; }
+            0 if value == 1 => {
+                arr[4] = 2000;
+                *updated = true;
+            }
+            0 if value == 0 => {
+                arr[4] = 1000;
+                *updated = true;
+            }
+            1 if value == 1 => {
+                arr[5] = 2000;
+                *updated = true;
+            }
+            1 if value == 0 => {
+                arr[5] = 1000;
+                *updated = true;
+            }
+            2 if value == 1 => {
+                arr[6] = 2000;
+                *updated = true;
+            }
+            2 if value == 0 => {
+                arr[6] = 1000;
+                *updated = true;
+            }
+            3 if value == 1 => {
+                arr[7] = 2000;
+                *updated = true;
+            }
+            3 if value == 0 => {
+                arr[7] = 1000;
+                *updated = true;
+            }
             _ => {}
         }
     }
@@ -242,7 +262,10 @@ impl RCTx {
 
         static SEND_COUNT: AtomicU64 = AtomicU64::new(0);
         if SEND_COUNT.fetch_add(1, Ordering::Relaxed) % 500 == 0 {
-            info!("RC: ch0={} ch1={} ch2={} ch3={} ch4={}", channels[0], channels[1], channels[2], channels[3], channels[4]);
+            info!(
+                "RC: ch0={} ch1={} ch2={} ch3={} ch4={}",
+                channels[0], channels[1], channels[2], channels[3], channels[4]
+            );
         }
 
         let mut payload = Vec::with_capacity(4 + RC_CHANNELS * 2);

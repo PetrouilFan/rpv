@@ -30,13 +30,13 @@ impl MockSerialPort {
         let buf2 = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let port1 = MockSerialPort {
-            read_buf: Arc::clone(&buf2), // port1 reads from buf2
+            read_buf: Arc::clone(&buf2),  // port1 reads from buf2
             write_buf: Arc::clone(&buf1), // port1 writes to buf1
             read_pos: 0,
         };
 
         let port2 = MockSerialPort {
-            read_buf: Arc::clone(&buf1), // port2 reads from buf1
+            read_buf: Arc::clone(&buf1),  // port2 reads from buf1
             write_buf: Arc::clone(&buf2), // port2 writes to buf2
             read_pos: 0,
         };
@@ -178,7 +178,9 @@ fn mavlink_roundtrip_heartbeat() {
     match &messages[0] {
         MavMessage::HEARTBEAT(h) => {
             assert_eq!(h.custom_mode, 5);
-            assert!(h.base_mode.contains(mavlink::common::MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED));
+            assert!(h
+                .base_mode
+                .contains(mavlink::common::MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED));
         }
         _ => panic!("Expected HEARTBEAT"),
     }
@@ -346,7 +348,7 @@ fn mavlink_rc_channels_override_roundtrip() {
 fn mavlink_gps_position_roundtrip() {
     let msg = MavMessage::GLOBAL_POSITION_INT(mavlink::common::GLOBAL_POSITION_INT_DATA {
         time_boot_ms: 0,
-        lat: 375000000,  // 37.5 degrees * 1e7
+        lat: 375000000,   // 37.5 degrees * 1e7
         lon: -1220000000, // -122.0 degrees * 1e7
         alt: 100000,      // 100 meters * 1000
         relative_alt: 50000,

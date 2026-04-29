@@ -34,6 +34,7 @@ impl RawSocket {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface name"))?;
         let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
         if ifindex == 0 {
+            // SAFETY: fd is valid and owned by us, checked >= 0 before close
             unsafe {
                 libc::close(fd);
             }
@@ -43,6 +44,7 @@ impl RawSocket {
             ));
         }
 
+        // SAFETY: Zero-initializing sockaddr_ll is safe; we set all required fields before use
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
@@ -57,6 +59,7 @@ impl RawSocket {
             )
         };
         if ret < 0 {
+            // SAFETY: fd is valid and owned by us, checked >= 0 before close
             unsafe {
                 libc::close(fd);
             }
@@ -67,6 +70,7 @@ impl RawSocket {
             tv_sec: 0,
             tv_usec: 100_000,
         };
+        // SAFETY: fd is valid, tv is valid, size is correct
         let rc = unsafe {
             libc::setsockopt(
                 fd,
@@ -137,7 +141,6 @@ impl RawSocket {
     /// and 802.11 header. Handles both QoS (26-byte) and non-QoS (24-byte)
     /// 802.11 headers by checking both offsets.
     fn try_attach_bpf_filter(&mut self) -> io::Result<()> {
-
         const BPF_LD_H_ABS: u16 = 0x0028;
         const BPF_LD_B_IND: u16 = 0x0040;
         const BPF_JEQ_K: u16 = 0x0015;

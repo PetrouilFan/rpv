@@ -57,16 +57,21 @@ impl Discovery {
         let running_clone = Arc::clone(&running);
 
         thread::spawn(move || {
-            discovery_loop(
-                sock,
-                beacon,
-                broadcast_target,
-                data_port,
-                peer_addr_clone,
-                last_seen_clone,
-                running_clone,
-                role,
-            );
+            let result = std::panic::catch_unwind(|| {
+                discovery_loop(
+                    sock,
+                    beacon,
+                    broadcast_target,
+                    data_port,
+                    peer_addr_clone,
+                    last_seen_clone,
+                    running_clone,
+                    role,
+                );
+            });
+            if let Err(err) = result {
+                tracing::error!("Discovery thread panicked: {:?}", err);
+            }
         });
 
         let disc = Self {
@@ -126,11 +131,14 @@ fn discovery_loop(
                     if peer_role != local_role {
                         // Use atomic counter for peer presence tracking
                         // This is immune to clock jumps (NTP, suspend/resume)
-                        static PEER_SEEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        static PEER_SEEN_COUNT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
                         PEER_SEEN_COUNT.fetch_add(1, Ordering::Relaxed);
                         last_seen.store(PEER_SEEN_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
 
-                        let peer_data_addr = match format!("{}:{}", src.ip(), peer_data_port).parse::<SocketAddr>() {
+                        let peer_data_addr = match format!("{}:{}", src.ip(), peer_data_port)
+                            .parse::<SocketAddr>()
+                        {
                             Ok(addr) => addr,
                             Err(e) => {
                                 tracing::warn!("Failed to parse peer address: {}", e);

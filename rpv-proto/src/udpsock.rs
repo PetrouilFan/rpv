@@ -22,7 +22,10 @@ impl UdpSocket {
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        tracing::info!("UDP socket ready (shared with discovery, port {})", udp_port);
+        tracing::info!(
+            "UDP socket ready (shared with discovery, port {})",
+            udp_port
+        );
         Ok(Self {
             socket,
             peer,
@@ -63,8 +66,12 @@ impl SocketTrait for UdpSocket {
         UdpSocket::recv(self, buf)
     }
     fn recreate(&self) -> std::io::Result<Box<dyn SocketTrait + Send + Sync>> {
-        UdpSocket::new(self.socket.clone(), self.peer.clone(), self.broadcast_addr.port())
-            .map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
+        UdpSocket::new(
+            self.socket.clone(),
+            self.peer.clone(),
+            self.broadcast_addr.port(),
+        )
+        .map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
     }
     fn reconnect(&self) -> std::io::Result<()> {
         // UDP is connectionless, nothing to reconnect

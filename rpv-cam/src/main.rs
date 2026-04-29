@@ -4,7 +4,7 @@ mod rawsock;
 mod video_tx;
 
 use std::io::Write;
-use std::os::unix::fs::{PermissionsExt, OpenOptionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -39,6 +39,7 @@ fn pin_thread_to_core(core_id: usize, fifo_priority: Option<i32>) {
             let param = libc::sched_param {
                 sched_priority: prio,
             };
+            // SAFETY: core_id is validated, thread is pinned, SCHED_FIFO priority is a valid non-negative int
             let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -89,7 +90,10 @@ fn main() {
         tracing::info!("Shutting down...");
         r.store(false, Ordering::SeqCst);
     }) {
-        tracing::error!("Failed to install Ctrl-C handler: {}. Clean shutdown may not work.", e);
+        tracing::error!(
+            "Failed to install Ctrl-C handler: {}. Clean shutdown may not work.",
+            e
+        );
     }
 
     let is_udp = cfg.common.transport == "udp";
@@ -114,7 +118,11 @@ fn main() {
                     peer_addr.store(std::sync::Arc::new(Some(addr)));
                 }
                 Err(e) => {
-                    tracing::warn!("Invalid peer_addr '{}': {}, falling back to discovery", peer, e);
+                    tracing::warn!(
+                        "Invalid peer_addr '{}': {}, falling back to discovery",
+                        peer,
+                        e
+                    );
                     // Fall through to discovery logic below
                 }
             }
@@ -122,11 +130,12 @@ fn main() {
 
         // If peer_addr not set (either not configured or parse failed), use discovery
         if peer_addr.load().is_none() {
-            let (handle, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
-                .unwrap_or_else(|e| {
-                    tracing::error!("Failed to start discovery: {}", e);
-                    std::process::exit(1);
-                });
+            let (handle, addr) =
+                discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Failed to start discovery: {}", e);
+                        std::process::exit(1);
+                    });
             discovery_handle = Some(handle);
 
             // Wait for ground station to discover us
@@ -136,7 +145,10 @@ fn main() {
                 thread::sleep(Duration::from_millis(200));
                 waited += Duration::from_millis(200);
                 if (waited.as_millis() as u64) % 2000 < 200 {
-                    tracing::info!("Waiting for ground station... ({}s elapsed)", waited.as_secs());
+                    tracing::info!(
+                        "Waiting for ground station... ({}s elapsed)",
+                        waited.as_secs()
+                    );
                 }
             }
 
@@ -170,7 +182,7 @@ fn main() {
     } else if is_tcp {
         // TCP mode: camera connects to ground station
         write_link_status("searching");
-        
+
         let ground_addr: std::net::SocketAddr = if let Some(ref peer) = cfg.common.peer_addr {
             match peer.parse::<std::net::SocketAddr>() {
                 Ok(addr) => {
@@ -182,23 +194,27 @@ fn main() {
                     return;
                 }
             }
-            } else {
-                // Use discovery to find ground station
-                let (handle, addr) = discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
+        } else {
+            // Use discovery to find ground station
+            let (handle, addr) =
+                discovery::Discovery::spawn(0x01, cfg.common.drone_id, cfg.common.udp_port)
                     .unwrap_or_else(|e| {
                         tracing::error!("Failed to start discovery: {}", e);
                         std::process::exit(1);
                     });
-                discovery_handle = Some(handle);
+            discovery_handle = Some(handle);
 
-                // Wait for ground station to discover us
+            // Wait for ground station to discover us
             let mut waited = Duration::ZERO;
             let wait_timeout = Duration::from_secs(30);
             while addr.load().is_none() && waited < wait_timeout {
                 thread::sleep(Duration::from_millis(200));
                 waited += Duration::from_millis(200);
                 if (waited.as_millis() as u64) % 2000 < 200 {
-                    tracing::info!("Waiting for ground station... ({}s elapsed)", waited.as_secs());
+                    tracing::info!(
+                        "Waiting for ground station... ({}s elapsed)",
+                        waited.as_secs()
+                    );
                 }
             }
 
@@ -208,12 +224,12 @@ fn main() {
             }
             addr.load().as_ref().clone().unwrap()
         };
-        
+
         // Connect to ground station via TCP
         let tcp_port = cfg.common.tcp_port.unwrap_or(9003);
         let target_addr = format!("{}:{}", ground_addr.ip(), tcp_port);
         tracing::info!("Connecting to ground station via TCP at {}", target_addr);
-        
+
         let mut retry_count: u32 = 0;
         loop {
             match TcpSocket::new_client(&target_addr, 1000) {
@@ -239,11 +255,18 @@ fn main() {
     } else {
         match RawSocket::new(&cfg.common.interface) {
             Ok(s) => {
-                tracing::info!("Raw socket bound to {} (monitor mode)", cfg.common.interface);
+                tracing::info!(
+                    "Raw socket bound to {} (monitor mode)",
+                    cfg.common.interface
+                );
                 Arc::new(s)
             }
             Err(e) => {
-                tracing::error!("Failed to open raw socket on {}: {}", cfg.common.interface, e);
+                tracing::error!(
+                    "Failed to open raw socket on {}: {}",
+                    cfg.common.interface,
+                    e
+                );
                 tracing::error!(
                     "Make sure the interface is in monitor mode: iw dev {} set type monitor",
                     cfg.common.interface
@@ -260,16 +283,21 @@ fn main() {
     let rc_failsafe_active = Arc::new(AtomicBool::new(false));
 
     // Start MAVLink FC link
-    let (fc_rc_tx, fc_telem_rx, fc_raw_downlink_rx, fc_raw_uplink_tx) =
-        match fc::start(running.clone(), &cfg.fc_port, cfg.fc_baud, cfg.common.drone_id, rc_failsafe_active.clone()) {
-            Some(link) => (
-                Some(link.rc_tx),
-                Some(link.telem_rx),
-                Some(link.raw_downlink_rx),
-                Some(link.raw_uplink_tx),
-            ),
-            None => (None, None, None, None),
-        };
+    let (fc_rc_tx, fc_telem_rx, fc_raw_downlink_rx, fc_raw_uplink_tx) = match fc::start(
+        running.clone(),
+        &cfg.fc_port,
+        cfg.fc_baud,
+        cfg.common.drone_id,
+        rc_failsafe_active.clone(),
+    ) {
+        Some(link) => (
+            Some(link.rc_tx),
+            Some(link.telem_rx),
+            Some(link.raw_downlink_rx),
+            Some(link.raw_uplink_tx),
+        ),
+        None => (None, None, None, None),
+    };
 
     // Start the raw socket RX dispatcher thread — #24: pin to core 0, SCHED_FIFO priority 50
     let rx_running = running.clone();
@@ -440,7 +468,10 @@ fn rx_dispatcher(
     }
 
     while running.load(Ordering::SeqCst) {
-        if rc_tx.is_none() && last_rc_time.elapsed() > failsafe_timeout && !rc_failsafe_active.load(Ordering::SeqCst) {
+        if rc_tx.is_none()
+            && last_rc_time.elapsed() > failsafe_timeout
+            && !rc_failsafe_active.load(Ordering::SeqCst)
+        {
             tracing::warn!(
                 "RC failsafe triggered: no data for {}s, clearing RC file",
                 failsafe_timeout.as_secs()
@@ -473,7 +504,10 @@ fn rx_dispatcher(
                 );
             } else if magic_rejects % 1000 == 0 {
                 // Periodically log the reject count to track noise levels
-                tracing::warn!("RX: {} magic rejects since last valid packet", magic_rejects);
+                tracing::warn!(
+                    "RX: {} magic rejects since last valid packet",
+                    magic_rejects
+                );
             }
             continue;
         }
@@ -507,7 +541,11 @@ fn rx_dispatcher(
                     continue;
                 }
                 if data.len() < 4 + count * 2 {
-                    tracing::warn!("RC packet too short: {} bytes for {} channels", data.len(), count);
+                    tracing::warn!(
+                        "RC packet too short: {} bytes for {} channels",
+                        data.len(),
+                        count
+                    );
                     continue;
                 }
                 let mut channels = Vec::with_capacity(count);
@@ -567,7 +605,10 @@ fn rx_dispatcher(
                         return;
                     }
                     // Ensure final file has secure perms
-                    let _ = std::fs::set_permissions(rc_file_path_str, std::fs::Permissions::from_mode(0o600));
+                    let _ = std::fs::set_permissions(
+                        rc_file_path_str,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
                     last_rc_time = Instant::now();
                     rc_failsafe_active.store(false, Ordering::SeqCst);
                 }

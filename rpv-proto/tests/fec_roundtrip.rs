@@ -234,10 +234,8 @@ fn fec_roundtrip_with_video_constants() {
     // Simulate missing one data shard
     let mut reconstruct_shards = shards.clone();
     // Use Option<Vec<u8>> for reconstruct
-    let mut shard_refs: Vec<Option<Vec<u8>>> = reconstruct_shards
-        .iter()
-        .map(|s| Some(s.clone()))
-        .collect();
+    let mut shard_refs: Vec<Option<Vec<u8>>> =
+        reconstruct_shards.iter().map(|s| Some(s.clone())).collect();
     rs.reconstruct(&mut shard_refs)
         .expect("Failed to reconstruct");
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use std::os::unix::fs::{PermissionsExt, FileTypeExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use rpv_proto::config::CommonConfig;
 
@@ -118,33 +118,51 @@ impl Config {
 
         // Bitrate: 100 kbps – 20 Mbps
         if self.bitrate < 100_000 || self.bitrate > 20_000_000 {
-            errors.push(format!("bitrate {} invalid (should be 100000..20000000 bits/sec)", self.bitrate));
+            errors.push(format!(
+                "bitrate {} invalid (should be 100000..20000000 bits/sec)",
+                self.bitrate
+            ));
         }
 
         // Framerate: 1 – 120 fps
         if self.framerate == 0 || self.framerate > 120 {
-            errors.push(format!("framerate {} invalid (should be 1..=120)", self.framerate));
+            errors.push(format!(
+                "framerate {} invalid (should be 1..=120)",
+                self.framerate
+            ));
         }
 
         // intra (keyframe interval): 1 – 300
         if self.intra == 0 || self.intra > 300 {
-            errors.push(format!("intra {} invalid (should be 1..=300 frames)", self.intra));
+            errors.push(format!(
+                "intra {} invalid (should be 1..=300 frames)",
+                self.intra
+            ));
         }
 
         // camera_type allowlist
         match self.camera_type.as_str() {
             "csi" | "rpicam" | "usb" => {}
-            _ => errors.push(format!("camera_type '{}' invalid (must be 'csi', 'rpicam', or 'usb')", self.camera_type)),
+            _ => errors.push(format!(
+                "camera_type '{}' invalid (must be 'csi', 'rpicam', or 'usb')",
+                self.camera_type
+            )),
         }
 
         // Validate video_device exists if camera_type is usb
         if self.camera_type == "usb" {
             let path = std::path::Path::new(&self.video_device);
             if !path.exists() {
-                errors.push(format!("video_device '{}' does not exist", self.video_device));
+                errors.push(format!(
+                    "video_device '{}' does not exist",
+                    self.video_device
+                ));
             } else if let Ok(meta) = std::fs::metadata(path) {
                 if !meta.file_type().is_char_device() {
-                    errors.push(format!("video_device '{}' is not a character device", self.video_device));
+                    errors.push(format!(
+                        "video_device '{}' is not a character device",
+                        self.video_device
+                    ));
                 }
             }
             // Resolve symlinks and ensure final target is within /dev
@@ -163,21 +181,33 @@ impl Config {
             errors.push(format!("fc_port '{}' does not exist", self.fc_port));
         } else if let Ok(meta) = std::fs::metadata(fc_path) {
             if !meta.file_type().is_char_device() {
-                errors.push(format!("fc_port '{}' is not a character device", self.fc_port));
+                errors.push(format!(
+                    "fc_port '{}' is not a character device",
+                    self.fc_port
+                ));
             }
         }
         // Resolve symlinks and ensure final target is within /dev
         if let Ok(canonical) = std::path::Path::new(&self.fc_port).canonicalize() {
             if !canonical.starts_with("/dev/") {
-                errors.push(format!("fc_port '{}' resolves outside /dev directory (possible symlink attack)", self.fc_port));
+                errors.push(format!(
+                    "fc_port '{}' resolves outside /dev directory (possible symlink attack)",
+                    self.fc_port
+                ));
             }
         } else {
-            errors.push(format!("fc_port '{}' cannot be canonicalized (broken symlink or permission denied)", self.fc_port));
+            errors.push(format!(
+                "fc_port '{}' cannot be canonicalized (broken symlink or permission denied)",
+                self.fc_port
+            ));
         }
 
         // Validate fc_baud reasonable
         if self.fc_baud < 9600 || self.fc_baud > 3_000_000 {
-            errors.push(format!("fc_baud {} invalid (typical 9600..3000000)", self.fc_baud));
+            errors.push(format!(
+                "fc_baud {} invalid (typical 9600..3000000)",
+                self.fc_baud
+            ));
         }
 
         errors

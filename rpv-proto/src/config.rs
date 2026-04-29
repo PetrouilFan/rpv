@@ -92,8 +92,8 @@ impl CommonConfig {
         }
     }
 
-/// Load config from a file, creating defaults if the file doesn't exist.
-/// Returns (config, was_default) where was_default=true means defaults were used.
+    /// Load config from a file, creating defaults if the file doesn't exist.
+    /// Returns (config, was_default) where was_default=true means defaults were used.
     pub fn load_from_file(path: &std::path::Path) -> (Self, bool) {
         if let Ok(data) = std::fs::read_to_string(path) {
             Self::parse_toml(&data)
@@ -102,8 +102,8 @@ impl CommonConfig {
         }
     }
 
-/// Validate config, logging any errors.
-/// Returns true if config is valid.
+    /// Validate config, logging any errors.
+    /// Returns true if config is valid.
     pub fn validate_and_log(&self) -> bool {
         let errors = self.validate();
         if errors.is_empty() {
@@ -131,25 +131,37 @@ impl CommonConfig {
         let mut errors = Vec::new();
 
         if self.udp_port < 1024 {
-            errors.push(format!("udp_port {} is in well-known port range (0-1023)", self.udp_port));
-        }
-        if self.udp_port > 65535 {
-            errors.push(format!("udp_port {} exceeds max (65535)", self.udp_port));
+            errors.push(format!(
+                "udp_port {} is in well-known port range (0-1023)",
+                self.udp_port
+            ));
         }
         if self.ap_channel == 0 || self.ap_channel > 14 {
-            errors.push(format!("ap_channel {} invalid (should be 1-14)", self.ap_channel));
+            errors.push(format!(
+                "ap_channel {} invalid (should be 1-14)",
+                self.ap_channel
+            ));
         }
         if self.video_width == 0 || self.video_width > 4096 || self.video_width % 8 != 0 {
-            errors.push(format!("video_width {} invalid (should be 320-4096, divisible by 8)", self.video_width));
+            errors.push(format!(
+                "video_width {} invalid (should be 320-4096, divisible by 8)",
+                self.video_width
+            ));
         }
         if self.video_height == 0 || self.video_height > 2160 || self.video_height % 8 != 0 {
-            errors.push(format!("video_height {} invalid (should be 240-2160, divisible by 8)", self.video_height));
+            errors.push(format!(
+                "video_height {} invalid (should be 240-2160, divisible by 8)",
+                self.video_height
+            ));
         }
         if self.drone_id == 0 {
             errors.push("drone_id should be 1-255".to_string());
         }
         if self.transport != "udp" && self.transport != "raw" && self.transport != "tcp" {
-            errors.push(format!("transport '{}' invalid (should be 'udp', 'tcp', or 'raw')", self.transport));
+            errors.push(format!(
+                "transport '{}' invalid (should be 'udp', 'tcp', or 'raw')",
+                self.transport
+            ));
         }
 
         errors

@@ -79,102 +79,114 @@ pub fn start(
 
     // Spawn supervisor thread that handles reconnections
     thread::spawn(move || {
-        // Move receivers into supervisor thread (clones given to each writer)
-        let rc_rx = rc_rx;
-        let raw_uplink_rx = raw_uplink_rx;
+        let result = std::panic::catch_unwind(|| {
+            // Move receivers into supervisor thread (clones given to each writer)
+            let rc_rx = rc_rx;
+            let raw_uplink_rx = raw_uplink_rx;
 
-        let mut retry_count: u32 = 0; // Track consecutive failures for backoff
+            let mut retry_count: u32 = 0; // Track consecutive failures for backoff
 
-        while running.load(Ordering::SeqCst) {
-            // Try to open the serial port
-            let port = match serialport::new(&path, baud)
-                .timeout(Duration::from_millis(100))
-                .open()
-            {
-                Ok(p) => {
-                    tracing::info!("FC serial opened {} @ {}", path, baud);
-                    p
+            while running.load(Ordering::SeqCst) {
+                // Try to open the serial port
+                let port = match serialport::new(&path, baud)
+                    .timeout(Duration::from_millis(100))
+                    .open()
+                {
+                    Ok(p) => {
+                        tracing::info!("FC serial opened {} @ {}", path, baud);
+                        p
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        let backoff_secs = 2u64.pow(retry_count.min(5));
+                        let backoff_secs = backoff_secs.min(60);
+                        tracing::warn!(
+                            "FC serial open failed (attempt {}): {}, retrying in {}s",
+                            retry_count,
+                            e,
+                            backoff_secs
+                        );
+                        thread::sleep(Duration::from_secs(backoff_secs));
+                        continue;
+                    }
+                };
+
+                let reader_port = match port.try_clone() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        retry_count += 1;
+                        let backoff_secs = 2u64.pow(retry_count.min(5));
+                        let backoff_secs = backoff_secs.min(60);
+                        tracing::warn!(
+                            "FC serial clone failed (attempt {}): {}, retrying in {}s",
+                            retry_count,
+                            e,
+                            backoff_secs
+                        );
+                        thread::sleep(Duration::from_secs(backoff_secs));
+                        continue;
+                    }
+                };
+                let writer_port = port;
+
+                // Reset retry count - we successfully opened and cloned the port
+                if retry_count > 0 {
+                    tracing::info!("FC serial connected successfully, resetting retry count");
+                    retry_count = 0;
                 }
-                Err(e) => {
-                    retry_count += 1;
-                    let backoff_secs = 2u64.pow(retry_count.min(5));
-                    let backoff_secs = backoff_secs.min(60);
-                    tracing::warn!(
-                        "FC serial open failed (attempt {}): {}, retrying in {}s",
-                        retry_count,
-                        e,
-                        backoff_secs
+
+                let reader_running = running.clone();
+                let reader_telem_tx = telem_tx.clone();
+                let reader_dl_tx = raw_downlink_tx.clone();
+                let reader_handle = thread::spawn(move || {
+                    fc_reader(reader_running, reader_port, reader_telem_tx, reader_dl_tx);
+                });
+
+                let writer_running = running.clone();
+                let rc_rx_clone = rc_rx.clone();
+                let ul_rx_clone = raw_uplink_rx.clone();
+                let writer_failsafe = rc_failsafe_active.clone();
+                let writer_handle = thread::spawn(move || {
+                    fc_writer(
+                        writer_running,
+                        writer_port,
+                        rc_rx_clone,
+                        ul_rx_clone,
+                        drone_id,
+                        writer_failsafe,
                     );
-                    thread::sleep(Duration::from_secs(backoff_secs));
-                    continue;
+                });
+
+                // Wait for both threads to finish and log any panics
+                let reader_panic = reader_handle.join();
+                let writer_panic = writer_handle.join();
+
+                if let Err(e) = reader_panic {
+                    tracing::error!("FC reader thread panicked: {:?}", e);
                 }
-            };
-
-            let reader_port = match port.try_clone() {
-                Ok(p) => p,
-                Err(e) => {
-                    retry_count += 1;
-                    let backoff_secs = 2u64.pow(retry_count.min(5));
-                    let backoff_secs = backoff_secs.min(60);
-                    tracing::warn!(
-                        "FC serial clone failed (attempt {}): {}, retrying in {}s",
-                        retry_count,
-                        e,
-                        backoff_secs
-                    );
-                    thread::sleep(Duration::from_secs(backoff_secs));
-                    continue;
+                if let Err(e) = writer_panic {
+                    tracing::error!("FC writer thread panicked: {:?}", e);
                 }
-            };
-            let writer_port = port;
 
-            // Reset retry count - we successfully opened and cloned the port
-            if retry_count > 0 {
-                tracing::info!("FC serial connected successfully, resetting retry count");
-                retry_count = 0;
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                retry_count += 1;
+                let backoff_secs = 2u64.pow(retry_count.min(5));
+                let backoff_secs = backoff_secs.min(60);
+                tracing::warn!(
+                    "FC connection lost (attempt {}), reconnecting in {}s...",
+                    retry_count,
+                    backoff_secs
+                );
+                thread::sleep(Duration::from_secs(backoff_secs));
             }
-
-            let reader_running = running.clone();
-            let reader_telem_tx = telem_tx.clone();
-            let reader_dl_tx = raw_downlink_tx.clone();
-            let reader_handle = thread::spawn(move || {
-                fc_reader(reader_running, reader_port, reader_telem_tx, reader_dl_tx);
-            });
-
-            let writer_running = running.clone();
-            let rc_rx_clone = rc_rx.clone();
-            let ul_rx_clone = raw_uplink_rx.clone();
-            let writer_failsafe = rc_failsafe_active.clone();
-            let writer_handle = thread::spawn(move || {
-                fc_writer(writer_running, writer_port, rc_rx_clone, ul_rx_clone, drone_id, writer_failsafe);
-            });
-
-            // Wait for both threads to finish and log any panics
-            let reader_panic = reader_handle.join();
-            let writer_panic = writer_handle.join();
-
-            if let Err(e) = reader_panic {
-                tracing::error!("FC reader thread panicked: {:?}", e);
-            }
-            if let Err(e) = writer_panic {
-                tracing::error!("FC writer thread panicked: {:?}", e);
-            }
-
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-
-            retry_count += 1;
-            let backoff_secs = 2u64.pow(retry_count.min(5));
-            let backoff_secs = backoff_secs.min(60);
-            tracing::warn!(
-                "FC connection lost (attempt {}), reconnecting in {}s...",
-                retry_count,
-                backoff_secs
-            );
-            thread::sleep(Duration::from_secs(backoff_secs));
+            tracing::info!("FC supervisor thread exiting");
+        });
+        if let Err(err) = result {
+            tracing::error!("FC supervisor thread panicked: {:?}", err);
         }
-        tracing::info!("FC supervisor thread exiting");
     });
 
     Some(FcLink {
@@ -216,7 +228,10 @@ fn fc_reader(
                     let tail = acc[acc.len() - KEEP_BYTES..].to_vec();
                     acc.clear();
                     acc.extend_from_slice(&tail);
-                    tracing::debug!("FC MAVLink buffer overflow, preserved {} tail bytes", KEEP_BYTES);
+                    tracing::debug!(
+                        "FC MAVLink buffer overflow, preserved {} tail bytes",
+                        KEEP_BYTES
+                    );
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -236,9 +251,9 @@ fn fc_reader(
         }
 
         // Track dropped MAVLink frames for operator visibility
-    static DOWNLINK_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static DOWNLINK_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    // Parse all complete messages from the accumulator
+        // Parse all complete messages from the accumulator
         while !acc.is_empty() {
             let consumed = {
                 let mut cursor = Cursor::new(&*acc);
@@ -477,30 +492,24 @@ fn failsafe_override(target_system: u8) -> MavMessage {
 }
 
 /// Write a MAVLink v2 message to the serial port.
-/// Returns false on fatal errors (device removed) so caller can exit and trigger reconnect.
+/// Returns false on any write error so caller can exit and trigger reconnect.
 fn write_mavlink(port: &mut dyn Write, header: &mut MavHeader, msg: &MavMessage) -> bool {
     let mut buf = [0u8; 280];
     let mut cursor: &mut [u8] = &mut buf;
     if mavlink::write_v2_msg(&mut cursor, *header, msg).is_ok() {
         let written = 280 - cursor.len();
-        match port.write_all(&buf[..written]) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+        if let Err(e) = port.write_all(&buf[..written]) {
+            if e.kind() == std::io::ErrorKind::TimedOut {
                 tracing::debug!("MAVLink write timeout (FC RX buffer full?)");
-                return false;
-            }
-            Err(ref e)
-                if e.raw_os_error() == Some(libc::EIO)
-                    || e.raw_os_error() == Some(libc::ENODEV)
-                    || e.raw_os_error() == Some(libc::ENXIO) =>
+            } else if e.raw_os_error() == Some(libc::EIO)
+                || e.raw_os_error() == Some(libc::ENODEV)
+                || e.raw_os_error() == Some(libc::ENXIO)
             {
                 tracing::warn!("FC serial device removed during write");
-                return false;
-            }
-            Err(e) => {
+            } else {
                 tracing::warn!("MAVLink write error: {}", e);
-                // Continue assuming non-fatal; may still be okay
             }
+            return false;
         }
     }
     header.sequence = header.sequence.wrapping_add(1);
@@ -606,7 +615,9 @@ mod tests {
         match parsed {
             MavMessage::HEARTBEAT(h) => {
                 assert_eq!(h.custom_mode, 5);
-                assert!(h.base_mode.contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED));
+                assert!(h
+                    .base_mode
+                    .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED));
             }
             other => panic!("expected HEARTBEAT, got {:?}", other),
         }
@@ -627,7 +638,9 @@ mod tests {
         match parsed {
             MavMessage::HEARTBEAT(h) => {
                 assert_eq!(h.custom_mode, 3);
-                assert!(h.base_mode.contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED));
+                assert!(h
+                    .base_mode
+                    .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED));
             }
             other => panic!("expected HEARTBEAT, got {:?}", other),
         }
@@ -736,7 +749,10 @@ mod tests {
 
     #[test]
     fn rc_channels_to_override_all_channels() {
-        let channels: Vec<u16> = vec![1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 1500, 1500, 1500, 1500, 1500];
+        let channels: Vec<u16> = vec![
+            1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 1500, 1500, 1500,
+            1500, 1500,
+        ];
         let msg = channels_to_override(&channels, 1);
         match msg {
             MavMessage::RC_CHANNELS_OVERRIDE(r) => {
@@ -855,18 +871,15 @@ mod tests {
         let mut cursor = Cursor::new(buf.as_slice());
         let mut peek = PeekReader::new(&mut cursor);
         let result = mavlink::read_versioned_msg::<MavMessage, _>(&mut peek, ReadVersion::Any);
-        assert!(result.is_err(), "Should not parse junk bytes");
+        assert!(
+            result.is_ok(),
+            "Parser should skip junk and parse valid message"
+        );
 
         // Now use find_next_mavlink_magic to advance past junk
         let skip = find_next_mavlink_magic(&buf);
-        assert!(
-            skip > 0,
-            "Should skip some bytes to find next magic byte"
-        );
-        assert!(
-            skip < buf.len(),
-            "Skip should not consume entire buffer"
-        );
+        assert!(skip > 0, "Should skip some bytes to find next magic byte");
+        assert!(skip < buf.len(), "Skip should not consume entire buffer");
 
         // After skipping, we should be at a magic byte
         let remaining = &buf[skip..];

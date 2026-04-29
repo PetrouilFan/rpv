@@ -164,12 +164,12 @@ pub fn parse_radiotap_rssi(frame: &[u8]) -> Option<i8> {
 
     // Natural alignment for each radiotap field per the spec
     const FIELD_ALIGN: [usize; 32] = [
-        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8,
-        2, 4, 2, 1,
+        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8, 2, 4,
+        2, 1,
     ];
     const FIELD_SIZE: [usize; 32] = [
-        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8,
-        2, 4, 2, 1,
+        8, 1, 1, 4, 2, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 8, 2, 4,
+        2, 1,
     ];
 
     let mut offset = pres_offset;
@@ -249,7 +249,7 @@ mod tests {
         let mut frame = vec![];
         frame.push(0x00); // version
         frame.push(0x00); // pad
-        // hdr_len will be set later
+                          // hdr_len will be set later
         frame.extend_from_slice(&0u16.to_le_bytes());
 
         // Present word
@@ -297,7 +297,7 @@ mod tests {
         let mut frame = vec![];
         frame.push(0x00); // version
         frame.push(0x00); // pad
-        // hdr_len will be set later
+                          // hdr_len will be set later
         frame.extend_from_slice(&0u16.to_le_bytes());
         // Present words (8 bytes total)
         frame.extend_from_slice(&present1.to_le_bytes());
@@ -369,10 +369,7 @@ mod tests {
 
         // Use recv_extract to parse
         let result = recv_extract(&frame, false);
-        assert!(
-            result.is_some(),
-            "Should extract payload after LLC/SNAP"
-        );
+        assert!(result.is_some(), "Should extract payload after LLC/SNAP");
         let (extracted_payload, _) = result.unwrap();
         assert_eq!(
             extracted_payload, payload,

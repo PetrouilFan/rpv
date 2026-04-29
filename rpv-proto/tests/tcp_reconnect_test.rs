@@ -5,6 +5,7 @@
 //! 2. Disconnections are detected
 //! 3. Reconnection logic works correctly
 
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,10 +23,20 @@ struct MockServer {
 
 impl MockServer {
     fn new(port: u16, accept_delay_ms: u64) -> Self {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).expect("Failed to bind");
-        listener
-            .set_nonblocking(true)
-            .expect("Failed to set non-blocking");
+        let std_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", port).parse().expect("parse addr");
+        let domain = if std_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, None).expect("socket");
+        socket.set_reuse_address(true).expect("set_reuse_address");
+        let sock_addr = socket2::SockAddr::from(std_addr);
+        socket.bind(&sock_addr).expect("bind");
+        socket.listen(128).expect("listen");
+        let listener: TcpListener = socket.into();
+        listener.set_nonblocking(true).expect("set_nonblocking");
 
         MockServer {
             listener,
@@ -155,6 +166,7 @@ fn tcp_reconnect_after_disconnect() {
 
     // First connection
     assert!(client.connect().is_ok());
+    thread::sleep(Duration::from_millis(50));
     let first_connect_count = server.connections_handled();
     assert!(first_connect_count >= 1);
 
@@ -200,7 +212,9 @@ fn tcp_send_receive_after_reconnect() {
     assert!(client.connect().is_ok());
 
     // Should receive new welcome message
-    let n = client.recv(&mut buf).expect("Failed to receive after reconnect");
+    let n = client
+        .recv(&mut buf)
+        .expect("Failed to receive after reconnect");
     assert_eq!(&buf[..n], b"HELLO");
 
     // Send data again
@@ -228,6 +242,7 @@ fn tcp_multiple_reconnects() {
 
     // Final reconnect
     assert!(client.connect().is_ok());
+    thread::sleep(Duration::from_millis(50));
     let final_count = server.connections_handled();
     assert!(final_count >= 6); // 5 reconnects + final connection
 
@@ -266,6 +281,7 @@ fn tcp_simulate_server_restart() {
     // Stop server
     server.stop();
     handle.join().unwrap();
+    drop(server);
 
     // Try to send (should fail)
     thread::sleep(Duration::from_millis(100));
@@ -279,15 +295,16 @@ fn tcp_simulate_server_restart() {
 
     // Reconnect to new server
     assert!(client.connect().is_ok());
-
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(50));
 
     let second_count = server2.connections_handled();
     assert!(second_count >= 1);
 
     // Should be able to communicate
     let mut buf = [0u8; 64];
-    let n = client.recv(&mut buf).expect("Failed to receive from restarted server");
+    let n = client
+        .recv(&mut buf)
+        .expect("Failed to receive from restarted server");
     assert_eq!(&buf[..n], b"HELLO");
 
     server2.stop();
@@ -373,7 +390,9 @@ fn tcp_framed_messaging() {
     let resp_len = u32::from_le_bytes(len_buf) as usize;
 
     let mut response = vec![0u8; resp_len];
-    let n = client.recv(&mut response).expect("Failed to receive response");
+    let n = client
+        .recv(&mut response)
+        .expect("Failed to receive response");
     assert_eq!(n, resp_len);
     assert!(String::from_utf8_lossy(&response).starts_with("ECHO:"));
 

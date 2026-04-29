@@ -13,3 +13,4 @@ libc = "0.2"
 
 [dev-dependencies]
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+socket2 = "0.5"

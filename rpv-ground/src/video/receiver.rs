@@ -1,8 +1,8 @@
-use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use ahash::AHashMap;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use rpv_proto::link;
-use ahash::AHashMap;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
@@ -83,7 +83,8 @@ impl VideoReceiver {
 
     fn cleanup_fragments(&mut self) {
         let now = Instant::now();
-        self.assembly_map.retain(|_, (_, time)| now.duration_since(*time) < FRAGMENT_TIMEOUT);
+        self.assembly_map
+            .retain(|_, (_, time)| now.duration_since(*time) < FRAGMENT_TIMEOUT);
     }
 
     #[inline]
@@ -116,12 +117,15 @@ impl VideoReceiver {
 
             if *fec_recovered < 3 {
                 let nalu_type = if frag_data.len() >= 5
-                    && frag_data[0] == 0x00 && frag_data[1] == 0x00
-                    && frag_data[2] == 0x00 && frag_data[3] == 0x01
+                    && frag_data[0] == 0x00
+                    && frag_data[1] == 0x00
+                    && frag_data[2] == 0x00
+                    && frag_data[3] == 0x01
                 {
                     Some(frag_data[4] & 0x1F)
                 } else if frag_data.len() >= 4
-                    && frag_data[0] == 0x00 && frag_data[1] == 0x00
+                    && frag_data[0] == 0x00
+                    && frag_data[1] == 0x00
                     && frag_data[2] == 0x01
                 {
                     Some(frag_data[3] & 0x1F)
@@ -130,7 +134,12 @@ impl VideoReceiver {
                 };
                 info!(
                     "NAL: seq={}, sidx={}, nal_id={}, frag_type=0x{:02x}, NAL_type={:?}, len={}",
-                    block.block_seq, sidx, nal_id, frag_type, nalu_type, frag_data.len()
+                    block.block_seq,
+                    sidx,
+                    nal_id,
+                    frag_type,
+                    nalu_type,
+                    frag_data.len()
                 );
             }
 
@@ -144,7 +153,8 @@ impl VideoReceiver {
                 }
                 0x01 => {
                     // Start of a multi-fragment NAL
-                    self.assembly_map.insert(nal_id, (frag_data.to_vec(), Instant::now()));
+                    self.assembly_map
+                        .insert(nal_id, (frag_data.to_vec(), Instant::now()));
                 }
                 0x02 => {
                     if let Some((buf, _)) = self.assembly_map.get_mut(&nal_id) {
@@ -153,7 +163,10 @@ impl VideoReceiver {
                         // Orphan continuation fragment
                         self.orphan_fragments += 1;
                         if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
-                            debug!("Orphan continuation fragment nal_id={}, total: {}", nal_id, self.orphan_fragments);
+                            debug!(
+                                "Orphan continuation fragment nal_id={}, total: {}",
+                                nal_id, self.orphan_fragments
+                            );
                         }
                     }
                 }
@@ -167,7 +180,10 @@ impl VideoReceiver {
                         // Orphan end fragment
                         self.orphan_fragments += 1;
                         if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
-                            debug!("Orphan end fragment nal_id={}, total: {}", nal_id, self.orphan_fragments);
+                            debug!(
+                                "Orphan end fragment nal_id={}, total: {}",
+                                nal_id, self.orphan_fragments
+                            );
                         }
                     }
                 }
@@ -309,7 +325,10 @@ impl VideoReceiver {
                 if head_of_line_stall_start.is_none() {
                     head_of_line_stall_start = Some(Instant::now());
                 } else if head_of_line_stall_start.unwrap().elapsed() > STALL_TIMEOUT {
-                    warn!("Head-of-line block {} stalled for {:?}, skipping to prevent freeze", next_block, STALL_TIMEOUT);
+                    warn!(
+                        "Head-of-line block {} stalled for {:?}, skipping to prevent freeze",
+                        next_block, STALL_TIMEOUT
+                    );
                     next_block = next_block.wrapping_add(1);
                     head_of_line_stall_start = None;
                     fec_dropped += 1;
@@ -399,141 +418,148 @@ impl VideoReceiver {
                 } else {
                     fec_dropped += 1;
                 }
-#[cfg(test)]
-mod tests {
+                #[cfg(test)]
+                mod tests {}
             }
         }
-    }
-    use super::*;
-    use crossbeam_channel;
+        use super::*;
+        use crossbeam_channel;
 
-    fn make_test_receiver() -> (VideoReceiver, crossbeam_channel::Receiver<Vec<u8>>) {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        (VideoReceiver::new(tx, rx.clone()), rx)
-    }
-
-    // ==================== Regression tests for AUDIT.md bugs ====================
-
-    /// Bug: AUDIT.md receiver.rs — Dedup check doesn't handle wrapping correctly
-    /// Fixed: The code now uses wrapping_sub with MSB check for proper wraparound handling
-    /// Test: Verify that is_future_block correctly handles wraparound at u32::MAX
-    #[test]
-    fn regression_dedup_handles_wrapping() {
-        // Test is_future_block function
-        // is_future_block checks: block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
-
-        // Normal case: block 100, next 99 -> future (MSB not set in diff)
-        assert!(VideoReceiver::is_future_block(100, 99));
-
-        // Wraparound case: block 0 (after wrap), next u32::MAX -> future
-        assert!(VideoReceiver::is_future_block(0, u32::MAX));
-
-        // Past case: block 99, next 100 -> NOT future (negative diff wraps to large positive)
-        assert!(!VideoReceiver::is_future_block(99, 100));
-
-        // Wraparound past: block u32::MAX, next 0 -> NOT future (should be treated as old)
-        assert!(!VideoReceiver::is_future_block(u32::MAX, 0));
-    }
-
-    /// Test: Verify RsBlock dedup logic works correctly
-    #[test]
-    fn regression_rsblock_dedup() {
-        let mut block = RsBlock {
-            block_seq: 42,
-            shards: vec![None; TOTAL_SHARDS],
-            shard_sizes: vec![0; TOTAL_SHARDS],
-            received: 0,
-            actual_data_shards: DATA_SHARDS,
-            shard_lens: [0; DATA_SHARDS],
-        };
-
-        // Add shard 0
-        block.shards[0] = Some(vec![0x01, 0x02, 0x03]);
-        block.shard_sizes[0] = 3;
-        block.received += 1;
-
-        // Try to add shard 0 again (duplicate)
-        // In the current code, this is checked by `if block.shards[shard_index].is_some()`
-        let shard_index = 0;
-        if block.shards[shard_index].is_some() {
-            // Duplicate detected - don't increment received count
-            // This is the correct behavior
-        } else {
-            block.received += 1;
+        fn make_test_receiver() -> (VideoReceiver, crossbeam_channel::Receiver<Vec<u8>>) {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            (VideoReceiver::new(tx, rx.clone()), rx)
         }
 
-        assert_eq!(
-            block.received, 1,
-            "Duplicate shard should not increment received count"
-        );
+        // ==================== Regression tests for AUDIT.md bugs ====================
 
-        // Add a different shard
-        block.shards[1] = Some(vec![0x04, 0x05]);
-        block.shard_sizes[1] = 2;
-        block.received += 1;
+        /// Bug: AUDIT.md receiver.rs — Dedup check doesn't handle wrapping correctly
+        /// Fixed: The code now uses wrapping_sub with MSB check for proper wraparound handling
+        /// Test: Verify that is_future_block correctly handles wraparound at u32::MAX
+        #[test]
+        fn regression_dedup_handles_wrapping() {
+            // Test is_future_block function
+            // is_future_block checks: block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
 
-        assert_eq!(block.received, 2, "New shard should increment received count");
+            // Normal case: block 100, next 99 -> future (MSB not set in diff)
+            assert!(VideoReceiver::is_future_block(100, 99));
+
+            // Wraparound case: block 0 (after wrap), next u32::MAX -> future
+            assert!(VideoReceiver::is_future_block(0, u32::MAX));
+
+            // Past case: block 99, next 100 -> NOT future (negative diff wraps to large positive)
+            assert!(!VideoReceiver::is_future_block(99, 100));
+
+            // Wraparound past: block u32::MAX, next 0 -> NOT future (should be treated as old)
+            assert!(!VideoReceiver::is_future_block(u32::MAX, 0));
+        }
+
+        /// Test: Verify RsBlock dedup logic works correctly
+        #[test]
+        fn regression_rsblock_dedup() {
+            let mut block = RsBlock {
+                block_seq: 42,
+                shards: vec![None; TOTAL_SHARDS],
+                shard_sizes: vec![0; TOTAL_SHARDS],
+                received: 0,
+                actual_data_shards: DATA_SHARDS,
+                shard_lens: [0; DATA_SHARDS],
+            };
+
+            // Add shard 0
+            block.shards[0] = Some(vec![0x01, 0x02, 0x03]);
+            block.shard_sizes[0] = 3;
+            block.received += 1;
+
+            // Try to add shard 0 again (duplicate)
+            // In the current code, this is checked by `if block.shards[shard_index].is_some()`
+            let shard_index = 0;
+            if block.shards[shard_index].is_some() {
+                // Duplicate detected - don't increment received count
+                // This is the correct behavior
+            } else {
+                block.received += 1;
+            }
+
+            assert_eq!(
+                block.received, 1,
+                "Duplicate shard should not increment received count"
+            );
+
+            // Add a different shard
+            block.shards[1] = Some(vec![0x04, 0x05]);
+            block.shard_sizes[1] = 2;
+            block.received += 1;
+
+            assert_eq!(
+                block.received, 2,
+                "New shard should increment received count"
+            );
+        }
+
+        /// Test: Verify ring buffer index calculation handles wraparound
+        #[test]
+        fn regression_ring_buffer_wraparound() {
+            let ring_size = RING_SIZE as u32;
+
+            // Test index calculation
+            let block_seq: u32 = 0;
+            let idx = (block_seq as usize) % RING_SIZE;
+            assert_eq!(idx, 0);
+
+            // Test near wraparound
+            let block_seq = u32::MAX;
+            let idx = (block_seq as usize) % RING_SIZE;
+            // Just verify it doesn't panic and gives a valid index
+            assert!(idx < RING_SIZE);
+        }
+
+        /// Test: Verify DATA_SHARDS and PARITY_SHARDS constants are correct
+        #[test]
+        fn regression_fec_constants() {
+            assert!(DATA_SHARDS > 0);
+            assert!(PARITY_SHARDS > 0);
+            assert_eq!(TOTAL_SHARDS, DATA_SHARDS + PARITY_SHARDS);
+        }
+
+        /// Test: Verify is_future_block logic matches the code in run()
+        #[test]
+        fn regression_future_block_matches_run_logic() {
+            // The run() function uses:
+            // let diff = block_seq.wrapping_sub(next_block);
+            // if diff != 0 && (diff & 0x80000000) != 0 { // Old block }
+
+            // Test that this logic is consistent with is_future_block
+
+            // Case 1: block is future (next=100, block=101)
+            let next_block: u32 = 100;
+            let block_seq: u32 = 101;
+            let diff = block_seq.wrapping_sub(next_block);
+            let is_old = diff != 0 && (diff & 0x80000000) != 0;
+            assert!(!is_old, "Block 101 should not be old when next is 100");
+            assert!(VideoReceiver::is_future_block(block_seq, next_block));
+
+            // Case 2: block is old (next=100, block=99)
+            let next_block: u32 = 100;
+            let block_seq: u32 = 99;
+            let diff = block_seq.wrapping_sub(next_block);
+            let is_old = diff != 0 && (diff & 0x80000000) != 0;
+            assert!(is_old, "Block 99 should be old when next is 100");
+            assert!(!VideoReceiver::is_future_block(block_seq, next_block));
+
+            // Case 3: wraparound - block 0 is FUTURE when next is u32::MAX
+            // (block 0 hasn't happened yet from next's perspective)
+            let next_block: u32 = u32::MAX;
+            let block_seq: u32 = 0;
+            let diff = block_seq.wrapping_sub(next_block);
+            let is_old = diff != 0 && (diff & 0x80000000) != 0;
+            assert!(
+                !is_old,
+                "Block 0 should NOT be old when next is u32::MAX (it's future)"
+            );
+            assert!(
+                VideoReceiver::is_future_block(block_seq, next_block),
+                "Block 0 should be future when next is u32::MAX"
+            );
+        }
     }
-
-    /// Test: Verify ring buffer index calculation handles wraparound
-    #[test]
-    fn regression_ring_buffer_wraparound() {
-        let ring_size = RING_SIZE as u32;
-
-        // Test index calculation
-        let block_seq: u32 = 0;
-        let idx = (block_seq as usize) % RING_SIZE;
-        assert_eq!(idx, 0);
-
-        // Test near wraparound
-        let block_seq = u32::MAX;
-        let idx = (block_seq as usize) % RING_SIZE;
-        // Just verify it doesn't panic and gives a valid index
-        assert!(idx < RING_SIZE);
-    }
-
-    /// Test: Verify DATA_SHARDS and PARITY_SHARDS constants are correct
-    #[test]
-    fn regression_fec_constants() {
-        assert!(DATA_SHARDS > 0);
-        assert!(PARITY_SHARDS > 0);
-        assert_eq!(TOTAL_SHARDS, DATA_SHARDS + PARITY_SHARDS);
-    }
-
-    /// Test: Verify is_future_block logic matches the code in run()
-    #[test]
-    fn regression_future_block_matches_run_logic() {
-        // The run() function uses:
-        // let diff = block_seq.wrapping_sub(next_block);
-        // if diff != 0 && (diff & 0x80000000) != 0 { // Old block }
-
-        // Test that this logic is consistent with is_future_block
-
-        // Case 1: block is future (next=100, block=101)
-        let next_block: u32 = 100;
-        let block_seq: u32 = 101;
-        let diff = block_seq.wrapping_sub(next_block);
-        let is_old = diff != 0 && (diff & 0x80000000) != 0;
-        assert!(!is_old, "Block 101 should not be old when next is 100");
-        assert!(VideoReceiver::is_future_block(block_seq, next_block));
-
-        // Case 2: block is old (next=100, block=99)
-        let next_block: u32 = 100;
-        let block_seq: u32 = 99;
-        let diff = block_seq.wrapping_sub(next_block);
-        let is_old = diff != 0 && (diff & 0x80000000) != 0;
-        assert!(is_old, "Block 99 should be old when next is 100");
-        assert!(!VideoReceiver::is_future_block(block_seq, next_block));
-
-        // Case 3: wraparound - block 0 is FUTURE when next is u32::MAX
-        // (block 0 hasn't happened yet from next's perspective)
-        let next_block: u32 = u32::MAX;
-        let block_seq: u32 = 0;
-        let diff = block_seq.wrapping_sub(next_block);
-        let is_old = diff != 0 && (diff & 0x80000000) != 0;
-        assert!(!is_old, "Block 0 should NOT be old when next is u32::MAX (it's future)");
-        assert!(VideoReceiver::is_future_block(block_seq, next_block),
-            "Block 0 should be future when next is u32::MAX");
-    }
-}
 }
