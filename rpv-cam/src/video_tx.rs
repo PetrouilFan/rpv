@@ -4,8 +4,6 @@ use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 // #30: Import video health flag from main
 use crate::VIDEO_HEALTHY;
@@ -85,12 +83,11 @@ const MAX_SHARD_DATA: usize = link::MAX_PAYLOAD - 8 - VIDEO_HDR_LEN - FRAG_HDR_L
 /// Returns the index of the start code if found, None otherwise.
 fn find_start_code(buf: &[u8], mut offset: usize) -> Option<usize> {
     while offset + 2 < buf.len() {
-        if buf[offset] == 0 && buf[offset + 1] == 0 {
-            if buf[offset + 2] == 1 {
-                return Some(offset);
-            } else if offset + 3 < buf.len() && buf[offset + 2] == 0 && buf[offset + 3] == 1 {
-                return Some(offset);
-            }
+        if buf[offset] == 0 && buf[offset + 1] == 0 &&
+           (buf[offset + 2] == 1 ||
+            (offset + 3 < buf.len() && buf[offset + 2] == 0 && buf[offset + 3] == 1))
+        {
+            return Some(offset);
         }
         offset += 1;
     }
@@ -205,6 +202,8 @@ impl ShardArena {
 }
 
 /// Transmit a complete FEC group: encode parity shards and send all TOTAL_SHARDS over the socket.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)]
 fn send_fec_group_arena(
     socket: &Arc<dyn SocketTrait>,
     rs: &ReedSolomon,
@@ -285,6 +284,7 @@ fn send_fec_group_arena(
 }
 
 /// Run the video capture and streaming loop.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     running: Arc<AtomicBool>,
     socket: Arc<dyn SocketTrait>,
@@ -320,13 +320,13 @@ pub fn run(
             .arg("--format")
             .arg("h264")
             .arg("--width")
-            .arg(&video_width.to_string())
+            .arg(video_width.to_string())
             .arg("--height")
-            .arg(&video_height.to_string())
+            .arg(video_height.to_string())
             .arg("--framerate")
-            .arg(&framerate.to_string())
+            .arg(framerate.to_string())
             .arg("--bitrate")
-            .arg(&bitrate.to_string())
+            .arg(bitrate.to_string())
             .arg("--inline")
             .arg("--g")
             .arg(intra.to_string())
@@ -351,13 +351,13 @@ pub fn run(
             .arg("-tune")
             .arg("zerolatency")
             .arg("-b:v")
-            .arg(&bitrate.to_string())
+            .arg(bitrate.to_string())
             .arg("-maxrate")
-            .arg(&bitrate.to_string())
+            .arg(bitrate.to_string())
             .arg("-bufsize")
-            .arg(&(bitrate / 2).to_string())
+            .arg((bitrate / 2).to_string())
             .arg("-g")
-            .arg(&intra.to_string())
+            .arg(intra.to_string())
             .arg("-bf")
             .arg("0")
             .arg("-sc_threshold")
@@ -403,13 +403,6 @@ pub fn run(
     let mut slot_frag_lens = [0usize; DATA_SHARDS];
     let mut fail_count: u32 = 0;
 
-    // Rate limiting: token bucket derived from configured bitrate
-    let bitrate_f64 = bitrate as f64;
-    let token_rate = bitrate_f64 / 8.0 / 1000.0; // bytes per millisecond
-    let mut tokens = token_rate * 100.0; // initial burst allowance (100 ms)
-    let max_tokens = token_rate * 100.0;
-    let mut last_rate_check = std::time::Instant::now();
-
     let mut camera_restart_count = 0;
     let mut last_restart_time = std::time::Instant::now();
 
@@ -426,168 +419,6 @@ pub fn run(
     let mut stored_sps: Option<Vec<u8>> = None;
     let mut stored_pps: Option<Vec<u8>> = None;
 
-    // Closure to fragment and send a single NAL unit, handling pending across groups.
-    let mut send_nal = |nal_data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
-        let max_data = MAX_SHARD_DATA - 5; // 5-byte fragment header (frag_num + nal_id_le)
-        let mut offset_remaining = nal_data.len();
-        let mut offset = 0;
-        let nal_id = nal_seq;
-        nal_seq = nal_seq.wrapping_add(1);
-
-        loop {
-            if let Some(ref mut pending) = pending_nal {
-                let slot = pending.slot;
-                let frag_start = slot_filled[slot];
-                let remaining = pending.remaining;
-                let frag_num = pending.frag_num;
-                let nal_id_val = pending.nal_id;
-
-                let space_in_slot = MAX_SHARD_DATA - pending.offset;
-                let chunk_len = remaining.min(max_data).min(space_in_slot);
-
-                arena.write_frag(slot, pending.offset, &[frag_num]);
-                arena.write_frag(slot, pending.offset + 1, &nal_id_val.to_le_bytes());
-                arena.write_frag(
-                    slot,
-                    pending.offset + 5,
-                    &nal_data[offset..offset + chunk_len],
-                );
-
-                let new_offset = pending.offset + 5 + chunk_len;
-                slot_filled[slot] = new_offset;
-                slot_frag_lens[slot] = new_offset - frag_start;
-
-                offset += chunk_len;
-                offset_remaining -= chunk_len;
-                pending.remaining -= chunk_len;
-                pending.offset = new_offset;
-
-                if pending.remaining == 0 {
-                    arena.pad_slot(slot, new_offset);
-                    if new_offset < MAX_SHARD_DATA {
-                        arena.write_frag(slot, new_offset, &[0u8]);
-                        slot_filled[slot] = new_offset + 1;
-                    }
-                    pending_nal = None;
-                }
-
-                if offset_remaining == 0 {
-                    break;
-                }
-                if slot_filled[slot] >= MAX_SHARD_DATA {
-                    arena.pad_slot(slot, slot_filled[slot]);
-                    send_fec_group_arena(
-                        &socket,
-                        &rs,
-                        &mut arena,
-                        &slot_filled,
-                        &slot_frag_lens,
-                        drone_id,
-                        fec_block_seq,
-                        &mut l2_pkt_seq,
-                        &mut fail_count,
-                        &mut l2_frame_buf,
-                        &mut send_buf,
-                        &mut video_payload_buf,
-                        &hp_rx,
-                        &mut fec_shards,
-                    )?;
-                    fec_block_seq = fec_block_seq.wrapping_add(1);
-
-                    slot_filled = [0usize; DATA_SHARDS];
-                    slot_frag_lens = [0usize; DATA_SHARDS];
-                }
-
-                continue;
-            }
-
-            // Fresh fragment
-            let mut slot = 0;
-            loop {
-                while slot < DATA_SHARDS && slot_filled[slot] >= MAX_SHARD_DATA {
-                    slot += 1;
-                }
-                if slot >= DATA_SHARDS {
-                    send_fec_group_arena(
-                        &socket,
-                        &rs,
-                        &mut arena,
-                        &slot_filled,
-                        &slot_frag_lens,
-                        drone_id,
-                        fec_block_seq,
-                        &mut l2_pkt_seq,
-                        &mut fail_count,
-                        &mut l2_frame_buf,
-                        &mut send_buf,
-                        &mut video_payload_buf,
-                        &hp_rx,
-                        &mut fec_shards,
-                    )?;
-                    fec_block_seq = fec_block_seq.wrapping_add(1);
-
-                    slot_filled = [0usize; DATA_SHARDS];
-                    slot_frag_lens = [0usize; DATA_SHARDS];
-                    continue;
-                }
-
-                let frag_start = slot_filled[slot];
-                let frag_num = if offset == 0 {
-                    1
-                } else if offset_remaining <= max_data {
-                    3
-                } else {
-                    2
-                };
-
-                arena.write_frag(slot, slot_filled[slot], &[frag_num]);
-                arena.write_frag(slot, slot_filled[slot] + 1, &nal_id.to_le_bytes());
-
-                let pos_in_nal = nal_data.len() - offset_remaining;
-                let chunk_len = offset_remaining.min(max_data);
-                arena.write_frag(
-                    slot,
-                    slot_filled[slot] + 5,
-                    &nal_data[pos_in_nal..pos_in_nal + chunk_len],
-                );
-
-                let new_offset = slot_filled[slot] + 5 + chunk_len;
-                slot_filled[slot] = new_offset;
-                slot_frag_lens[slot] = new_offset - frag_start;
-
-                offset += chunk_len;
-                offset_remaining -= chunk_len;
-
-                if offset_remaining > 0 {
-                    pending_nal = Some(PendingNal {
-                        remaining: offset_remaining,
-                        slot,
-                        offset: new_offset,
-                        frag_num: if frag_num == 1 { 2 } else { frag_num },
-                        nal_id,
-                    });
-                    arena.pad_slot(slot, new_offset);
-                    if new_offset < MAX_SHARD_DATA {
-                        arena.write_frag(slot, new_offset, &[0u8]);
-                        slot_filled[slot] = new_offset + 1;
-                    }
-                    break;
-                } else {
-                    arena.pad_slot(slot, new_offset);
-                    if new_offset < MAX_SHARD_DATA {
-                        arena.write_frag(slot, new_offset, &[0u8]);
-                        slot_filled[slot] = new_offset + 1;
-                    }
-                    break;
-                }
-            }
-
-            if offset_remaining == 0 {
-                break;
-            }
-        }
-        Ok(())
-    };
 
     while running.load(Ordering::SeqCst) {
         // Check if camera process is still alive
@@ -627,13 +458,13 @@ pub fn run(
                     .arg("--format")
                     .arg("h264")
                     .arg("--width")
-                    .arg(&video_width.to_string())
+                    .arg(video_width.to_string())
                     .arg("--height")
-                    .arg(&video_height.to_string())
+                    .arg(video_height.to_string())
                     .arg("--framerate")
-                    .arg(&framerate.to_string())
+                    .arg(framerate.to_string())
                     .arg("--bitrate")
-                    .arg(&bitrate.to_string())
+                    .arg(bitrate.to_string())
                     .arg("--inline")
                     .arg("--g")
                     .arg(intra.to_string())
@@ -662,9 +493,9 @@ pub fn run(
                     .arg("-tune")
                     .arg("zerolatency")
                     .arg("-b:v")
-                    .arg(&bitrate.to_string())
+                    .arg(bitrate.to_string())
                     .arg("-g")
-                    .arg(&intra.to_string())
+                    .arg(intra.to_string())
                     .arg("-f")
                     .arg("h264")
                     .arg("-")
@@ -687,9 +518,9 @@ pub fn run(
                             .arg("-tune")
                             .arg("zerolatency")
                             .arg("-b:v")
-                            .arg(&bitrate.to_string())
+                            .arg(bitrate.to_string())
                             .arg("-g")
-                            .arg(&intra.to_string())
+                            .arg(intra.to_string())
                             .arg("-pix_fmt")
                             .arg("yuv420p")
                             .arg("-f")
@@ -818,7 +649,7 @@ pub fn run(
                     let mut new_buf = Vec::new();
                     new_buf.extend_from_slice(sps);
                     new_buf.extend_from_slice(pps);
-                    new_buf.extend_from_slice(&nal_data);
+                    new_buf.extend_from_slice(nal_data);
                     new_buf.extend_from_slice(remaining);
                     nal_buf = new_buf;
                     continue;
@@ -838,7 +669,6 @@ pub fn run(
 
             let max_data = MAX_SHARD_DATA - 5; // 5-byte fragment header (frag_num + nal_id_le)
             let mut offset_remaining = nal_data.len();
-            let mut offset = 0;
 
             loop {
                 // If there's a pending NAL continuation from previous group, finish it first
@@ -855,17 +685,17 @@ pub fn run(
                     // Write fragment header into arena at current offset
                     arena.write_frag(slot, pending.offset, &[frag_num]);
                     arena.write_frag(slot, pending.offset + 1, &nal_id_val.to_le_bytes());
+                    let start = nal_data.len() - offset_remaining;
                     arena.write_frag(
                         slot,
                         pending.offset + 5,
-                        &nal_data[offset..offset + chunk_len],
+                        &nal_data[start..start + chunk_len],
                     );
 
                     let new_offset = pending.offset + 5 + chunk_len;
                     slot_filled[slot] = new_offset;
                     slot_frag_lens[slot] = new_offset - frag_start;
 
-                    offset += chunk_len;
                     offset_remaining -= chunk_len;
                     pending.remaining -= chunk_len;
                     pending.offset = new_offset;
@@ -945,13 +775,13 @@ pub fn run(
                     }
 
                     let frag_start = slot_filled[slot]; // capture before writing this fragment
-                    let frag_num = if offset == 0 {
-                        1
-                    } else if offset_remaining <= max_data {
-                        3
-                    } else {
-                        2
-                    };
+                    let frag_num = if offset_remaining == nal_data.len() {
+                         1
+                     } else if offset_remaining <= max_data {
+                         3
+                     } else {
+                         2
+                     };
 
                     // Write fragment header: [frag_num (1)][nal_id_le (4)]
                     arena.write_frag(slot, slot_filled[slot], &[frag_num]);
@@ -969,7 +799,6 @@ pub fn run(
                     slot_filled[slot] = new_offset;
                     slot_frag_lens[slot] = new_offset - frag_start;
 
-                    offset += chunk_len;
                     offset_remaining -= chunk_len;
 
                     if offset_remaining > 0 {

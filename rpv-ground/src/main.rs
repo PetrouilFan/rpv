@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use egui::Vec2;
 
 use rpv_proto::discovery;
@@ -487,14 +488,13 @@ impl RpvApp {
             recv_count += 1;
         }
 
-        if recv_count > 0 {
-            if self.yuv_gpu.is_none() {
+        if recv_count > 0
+            && self.yuv_gpu.is_none() {
                 tracing::warn!(
                     "process_frames: received {} frames but GPU resources NOT initialized",
                     recv_count
                 );
             }
-        }
 
         let mut had_frame = false;
         if let (Some(frame), Some(ref gpu)) = (self.frame_buffer.front(), &self.yuv_gpu) {
@@ -523,7 +523,7 @@ impl RpvApp {
             }
             if let Some(recv_time) = frame.recv_time {
                 let latency_ms = recv_time.elapsed().as_millis();
-                if self.state.frame_count % 60 == 0 {
+                if self.state.frame_count.is_multiple_of(60) {
                     tracing::info!(
                         "decode-to-display latency: {}ms, dropped {} stale frames",
                         latency_ms,
@@ -533,7 +533,7 @@ impl RpvApp {
             }
 
             let res = gpu.lock().expect("GPU mutex poisoned during frame upload");
-            res.upload(&frame);
+            res.upload(frame);
             drop(res);
 
             self.state.frame_count += 1;
@@ -692,7 +692,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         true
     } else {
         let t = ui.ctx().input(|i| i.time);
-        (t * 2.0) as u64 % 2 == 0
+        ((t * 2.0) as u64).is_multiple_of(2)
     };
     if dot_visible {
         p.circle_filled(egui::pos2(15.0, y + 7.0), 5.0, color);
@@ -1046,9 +1046,9 @@ fn main() -> Result<(), eframe::Error> {
 
     let link_state = LinkStateHandle::new();
 
-    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
-    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Vec<u8>>(16);
-    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let (video_payload_tx, video_payload_rx) = crossbeam_channel::bounded::<Bytes>(256);
+    let (video_frame_tx, video_frame_rx_decoder) = crossbeam_channel::bounded::<Bytes>(16);
+    let (telem_payload_tx, telem_payload_rx) = crossbeam_channel::bounded::<Bytes>(4);
 
     // QGC UDP bridge
     use std::net::UdpSocket as StdUdpSocket;
@@ -1061,7 +1061,7 @@ fn main() -> Result<(), eframe::Error> {
         .parse()
         .unwrap();
 
-    let (mavlink_down_tx, mavlink_down_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
+    let (mavlink_down_tx, mavlink_down_rx) = crossbeam_channel::bounded::<Bytes>(256);
 
     let decoder = VideoDecoder::new(config.common.video_width, config.common.video_height);
     let ui_frame_rx = decoder.get_rx();
@@ -1261,15 +1261,16 @@ fn main() -> Result<(), eframe::Error> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rx_dispatcher(
     running: Arc<AtomicBool>,
     socket: Arc<dyn SocketTrait>,
     drone_id: u8,
-    video_tx: crossbeam_channel::Sender<Vec<u8>>,
-    telem_tx: crossbeam_channel::Sender<Vec<u8>>,
+    video_tx: crossbeam_channel::Sender<Bytes>,
+    telem_tx: crossbeam_channel::Sender<Bytes>,
     last_heartbeat: Arc<AtomicU64>,
     _rssi: Arc<AtomicI8>,
-    mavlink_tx: crossbeam_channel::Sender<Vec<u8>>,
+    mavlink_tx: crossbeam_channel::Sender<Bytes>,
 ) {
     tracing::info!("RX dispatcher started");
     let mut buf = vec![0u8; 65536];
@@ -1325,7 +1326,7 @@ fn rx_dispatcher(
 
         if !link::L2Header::matches_magic(actual_payload) {
             reject_count += 1;
-            if reject_count <= 10 || reject_count % 500 == 0 {
+            if reject_count <= 10 || reject_count.is_multiple_of(500) {
                 tracing::warn!(
                     "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
                     reject_count,
@@ -1357,7 +1358,7 @@ fn rx_dispatcher(
         }
 
         total_frames += 1;
-        if total_frames % 500 == 0 {
+        if total_frames.is_multiple_of(500) {
             tracing::info!(
                 "RX stats: total={} video={} telem={} hb={} mavlink={} rejected={}",
                 total_frames,
@@ -1372,7 +1373,7 @@ fn rx_dispatcher(
         match header.payload_type {
             link::PAYLOAD_VIDEO => {
                 video_count += 1;
-                if video_tx.try_send(data.to_vec()).is_err() {
+                if video_tx.try_send(Bytes::copy_from_slice(data)).is_err() {
                     tracing::warn!("Video queue dropped (backpressure)");
                 }
                 let now_ms = std::time::SystemTime::now()
@@ -1383,7 +1384,7 @@ fn rx_dispatcher(
             }
             link::PAYLOAD_TELEMETRY => {
                 telemetry_count += 1;
-                if telem_tx.try_send(data.to_vec()).is_err() {
+                if telem_tx.try_send(Bytes::copy_from_slice(data)).is_err() {
                     tracing::warn!("Telemetry queue dropped");
                 }
                 let now_ms = std::time::SystemTime::now()
@@ -1402,7 +1403,7 @@ fn rx_dispatcher(
             }
             link::PAYLOAD_MAVLINK => {
                 mavlink_count += 1;
-                if mavlink_tx.try_send(data.to_vec()).is_err() {
+                if mavlink_tx.try_send(Bytes::copy_from_slice(data)).is_err() {
                     tracing::warn!("MAVLink downlink queue full — frame dropped");
                 }
             }

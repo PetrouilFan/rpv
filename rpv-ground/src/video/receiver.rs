@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use bytes::Bytes;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use rpv_proto::link;
 use std::time::{Duration, Instant};
@@ -31,8 +32,8 @@ struct CompletedBlock {
 }
 
 pub struct VideoReceiver {
-    tx: crossbeam_channel::Sender<Vec<u8>>,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    tx: crossbeam_channel::Sender<Bytes>,
+    rx: crossbeam_channel::Receiver<Bytes>,
     assembly_map: AHashMap<u32, (Vec<u8>, Instant)>,
     orphan_fragments: u64,
 }
@@ -60,8 +61,8 @@ fn reconstruct_rs_block(
 
     if rs.reconstruct(&mut shard_refs).is_ok() {
         let mut result = Vec::with_capacity(actual_data_shards);
-        for i in 0..actual_data_shards {
-            result.push(shard_refs[i].clone().unwrap_or_default());
+        for item in shard_refs.iter().take(actual_data_shards) {
+            result.push(item.clone().unwrap_or_default());
         }
         Some(result)
     } else {
@@ -70,8 +71,8 @@ fn reconstruct_rs_block(
 }
 impl VideoReceiver {
     pub fn new(
-        tx: crossbeam_channel::Sender<Vec<u8>>,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
+        tx: crossbeam_channel::Sender<Bytes>,
+        rx: crossbeam_channel::Receiver<Bytes>,
     ) -> Self {
         Self {
             tx,
@@ -137,17 +138,17 @@ impl VideoReceiver {
                     block.block_seq,
                     sidx,
                     nal_id,
-                    frag_type,
-                    nalu_type,
-                    frag_data.len()
-                );
+                frag_type,
+                nalu_type,
+                frag_data.len()
+            );
             }
 
             match frag_type {
                 0x00 => {
                     *fec_recovered += 1;
                     // Single-fragment NAL
-                    if let Err(e) = self.tx.send(frag_data.to_vec()) {
+                    if let Err(e) = self.tx.send(Bytes::copy_from_slice(frag_data)) {
                         warn!("Video frame channel closed: {}", e);
                     }
                 }
@@ -162,7 +163,7 @@ impl VideoReceiver {
                     } else {
                         // Orphan continuation fragment
                         self.orphan_fragments += 1;
-                        if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
+                        if self.orphan_fragments <= 10 || self.orphan_fragments.is_multiple_of(100) {
                             debug!(
                                 "Orphan continuation fragment nal_id={}, total: {}",
                                 nal_id, self.orphan_fragments
@@ -173,13 +174,13 @@ impl VideoReceiver {
                 0x03 => {
                     if let Some((mut buf, _)) = self.assembly_map.remove(&nal_id) {
                         buf.extend_from_slice(frag_data);
-                        if let Err(e) = self.tx.send(buf) {
+                        if let Err(e) = self.tx.send(Bytes::from(buf)) {
                             warn!("Video frame channel closed: {}", e);
                         }
                     } else {
                         // Orphan end fragment
                         self.orphan_fragments += 1;
-                        if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
+                        if self.orphan_fragments <= 10 || self.orphan_fragments.is_multiple_of(100) {
                             debug!(
                                 "Orphan end fragment nal_id={}, total: {}",
                                 nal_id, self.orphan_fragments
@@ -282,7 +283,7 @@ impl VideoReceiver {
             }
 
             payload_count += 1;
-            if payload_count % 1000 == 0 {
+            if payload_count.is_multiple_of(1000) {
                 info!(
                     "VideoReceiver: {} payloads, recovered={}, dropped={}, next={}",
                     payload_count, fec_recovered, fec_dropped, next_block
@@ -300,10 +301,9 @@ impl VideoReceiver {
             let actual_data_shards = (actual_payload[6] as usize).min(DATA_SHARDS);
 
             let mut parsed_shard_lens = [0usize; DATA_SHARDS];
-            for i in 0..DATA_SHARDS {
+            for (i, len) in parsed_shard_lens.iter_mut().take(DATA_SHARDS).enumerate() {
                 let off = VIDEO_HDR_FIXED + i * 2;
-                parsed_shard_lens[i] =
-                    u16::from_le_bytes([actual_payload[off], actual_payload[off + 1]]) as usize;
+                *len = u16::from_le_bytes([actual_payload[off], actual_payload[off + 1]]) as usize;
             }
 
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
@@ -421,13 +421,6 @@ impl VideoReceiver {
                 #[cfg(test)]
                 mod tests {}
             }
-        }
-        use super::*;
-        use crossbeam_channel;
-
-        fn make_test_receiver() -> (VideoReceiver, crossbeam_channel::Receiver<Vec<u8>>) {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            (VideoReceiver::new(tx, rx.clone()), rx)
         }
 
         // ==================== Regression tests for AUDIT.md bugs ====================

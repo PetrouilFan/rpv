@@ -134,7 +134,7 @@ impl RCTx {
     }
 
     fn poll_joystick(&mut self, fd: RawFd) {
-        let mut arr_copy = (**self.channels.load()).clone();
+        let mut arr_copy = **self.channels.load();
         let mut updated = false;
 
         loop {
@@ -168,13 +168,12 @@ impl RCTx {
             let num = event.number as usize;
 
             match event.etype & !JOY_EVENT_INIT {
-                x if x == JOY_EVENT_AXIS => {
-                    if num < RC_CHANNELS {
+                x if x == JOY_EVENT_AXIS
+                    && num < RC_CHANNELS => {
                         let rc = Self::joystick_to_rc(num, value);
                         arr_copy[num] = rc;
                         updated = true;
                     }
-                }
                 x if x == JOY_EVENT_BUTTON => {
                     Self::apply_button(num as u8, value, &mut arr_copy, &mut updated);
                 }
@@ -261,7 +260,7 @@ impl RCTx {
         let channels = self.channels.load();
 
         static SEND_COUNT: AtomicU64 = AtomicU64::new(0);
-        if SEND_COUNT.fetch_add(1, Ordering::Relaxed) % 500 == 0 {
+        if SEND_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(500) {
             info!(
                 "RC: ch0={} ch1={} ch2={} ch3={} ch4={}",
                 channels[0], channels[1], channels[2], channels[3], channels[4]

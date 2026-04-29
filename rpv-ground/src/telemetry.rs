@@ -1,4 +1,5 @@
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
@@ -46,11 +47,11 @@ impl Default for Telemetry {
 pub struct TelemetryReceiver {
     state: Arc<ArcSwap<Telemetry>>,
     link_state: LinkStateHandle,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    rx: crossbeam_channel::Receiver<Bytes>,
 }
 
 impl TelemetryReceiver {
-    pub fn new(link_state: LinkStateHandle, rx: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
+    pub fn new(link_state: LinkStateHandle, rx: crossbeam_channel::Receiver<Bytes>) -> Self {
         Self {
             state: Arc::new(ArcSwap::from_pointee(Telemetry::default())),
             link_state,

@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 
 const MAGIC: [u8; 2] = [0x52, 0x50];
-const ROLE_CAMERA: u8 = 0x01;
-const ROLE_GROUND: u8 = 0x02;
 const VERSION: u16 = 1;
 
 const BEACON_INTERVAL: Duration = Duration::from_millis(500);
@@ -26,8 +24,6 @@ const DISCOVERY_PORT: u16 = 9002;
 /// [6..8]  Data port (u16 LE)
 /// [8..14] Reserved
 pub struct Discovery {
-    peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
-    last_seen: Arc<AtomicU64>,
     /// Running flag for graceful shutdown - discovery thread checks this
     running: Arc<AtomicBool>,
 }
@@ -74,8 +70,6 @@ impl Discovery {
         });
 
         let disc = Self {
-            peer_addr: Arc::clone(&peer_addr),
-            last_seen: Arc::clone(&last_seen),
             running: Arc::clone(&running),
         };
         Ok((disc, peer_addr))
@@ -98,6 +92,7 @@ fn build_beacon(role: u8, drone_id: u8, data_port: u16) -> [u8; 14] {
     buf
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discovery_loop(
     socket: StdUdpSocket,
     beacon: [u8; 14],

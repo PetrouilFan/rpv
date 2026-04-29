@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use bytes::Bytes;
 use ffmpeg_sys_next as ffi;
 
 // NOTE: These FFmpeg constants are hardcoded because ffmpeg_sys_next doesn't re-export them.
@@ -55,7 +56,7 @@ impl VideoDecoder {
         self.frame_rx.clone()
     }
 
-    pub fn spawn(&self, rx: crossbeam_channel::Receiver<Vec<u8>>) -> std::thread::JoinHandle<()> {
+    pub fn spawn(&self, rx: crossbeam_channel::Receiver<Bytes>) -> std::thread::JoinHandle<()> {
         let frame_tx = self.frame_tx.clone();
         let width = self.width;
         let height = self.height;
@@ -150,7 +151,7 @@ fn process_decoded_frame(
             return;
         }
     };
-    let v_size = if pix_fmt == AV_PIX_FMT_YUV420P as i32 {
+    let v_size = if pix_fmt == AV_PIX_FMT_YUV420P {
         match linesize2.checked_mul(uv_h) {
             Some(val) => val,
             None => {
@@ -179,7 +180,7 @@ fn process_decoded_frame(
         y_buf[dst_start..dst_start + linesize0].copy_from_slice(src);
     }
 
-    if pix_fmt == AV_PIX_FMT_NV12 as i32 {
+    if pix_fmt == AV_PIX_FMT_NV12 {
         // NV12: copy interleaved UV with padding, then deinterleave
         let uv_size = match linesize1.checked_mul(uv_h) {
             Some(val) => val,
@@ -234,7 +235,7 @@ fn process_decoded_frame(
         height: fh as u32,
         y_stride: linesize0 as u32,
         u_stride: linesize1 as u32,
-        v_stride: if pix_fmt == AV_PIX_FMT_YUV420P as i32 {
+        v_stride: if pix_fmt == AV_PIX_FMT_YUV420P {
             linesize2 as u32
         } else {
             linesize1 as u32
@@ -248,7 +249,7 @@ fn process_decoded_frame(
     }
 
     *frame_count += 1;
-    if *frame_count % 30 == 0 {
+    if (*frame_count).is_multiple_of(30) {
         info!("Decoded {} frames (planar YUV, libavcodec)", *frame_count);
     }
 }
@@ -257,7 +258,7 @@ fn process_decoded_frame(
 
 fn decode_loop_libavcodec(
     frame_tx: crossbeam_channel::Sender<DecodedFrame>,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    rx: crossbeam_channel::Receiver<Bytes>,
     width: u32,
     height: u32,
 ) {
@@ -265,7 +266,6 @@ fn decode_loop_libavcodec(
         "libavcodec H.264 decoder initialized: {}x{} planar YUV",
         width, height
     );
-    let codec_name = std::ffi::CString::new("h264").unwrap();
     // Try hardware-accelerated decoders first
     let hw_decoder_names = [
         "h264_vaapi",
@@ -309,7 +309,7 @@ fn decode_loop_libavcodec(
         (*codec_ctx).thread_count = 1;
         (*codec_ctx).thread_type = 0;
         (*codec_ctx).err_recognition = 1;
-        (*codec_ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL as i32;
+        (*codec_ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL;
     }
 
     let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
@@ -333,9 +333,6 @@ fn decode_loop_libavcodec(
     let mut frame_count: u64 = 0;
     let mut nal_recv_count: u64 = 0;
 
-    let w = width as usize;
-    let h = height as usize;
-
     loop {
         let mut nal_data = match rx.recv() {
             Ok(d) => d,
@@ -347,21 +344,16 @@ fn decode_loop_libavcodec(
 
         let mut nal_start = 0usize;
         for i in 0..nal_data.len().saturating_sub(3) {
-            if nal_data[i] == 0x00 && nal_data[i + 1] == 0x00 {
-                if i + 2 < nal_data.len() && nal_data[i + 2] == 0x01 {
-                    nal_start = i;
-                    break;
-                } else if i + 3 < nal_data.len()
-                    && nal_data[i + 2] == 0x00
-                    && nal_data[i + 3] == 0x01
-                {
-                    nal_start = i;
-                    break;
-                }
+            if nal_data[i] == 0x00 && nal_data[i + 1] == 0x00 &&
+               ((i + 2 < nal_data.len() && nal_data[i + 2] == 0x01) ||
+                (i + 3 < nal_data.len() && nal_data[i + 2] == 0x00 && nal_data[i + 3] == 0x01))
+            {
+                nal_start = i;
+                break;
             }
         }
         if nal_start > 0 {
-            nal_data = nal_data[nal_start..].to_vec();
+            nal_data = nal_data.slice(nal_start..);
         }
 
         nal_recv_count += 1;

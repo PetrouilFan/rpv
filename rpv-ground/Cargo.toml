@@ -31,6 +31,7 @@ evdev = { version = "0.13", optional = true }
 arc-swap   = "1"
 ffmpeg-sys-next = "8.1"
 ahash = "0.8"
+bytes = "1"
 
 [features]
 default = ["raw-sock", "udp-transport"]

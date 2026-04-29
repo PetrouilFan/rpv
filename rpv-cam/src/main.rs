@@ -222,7 +222,7 @@ fn main() {
                 tracing::error!("No ground station discovered");
                 return;
             }
-            addr.load().as_ref().clone().unwrap()
+            (*addr.load().as_ref()).unwrap()
         };
 
         // Connect to ground station via TCP
@@ -460,12 +460,11 @@ fn rx_dispatcher(
     let mut magic_rejects: u64 = 0;
 
     // Clean up any stale RC file at startup to prevent old controls from persisting
-    if rc_tx.is_none() {
-        if std::path::Path::new(rc_file_path).exists() {
+    if rc_tx.is_none()
+        && std::path::Path::new(rc_file_path).exists() {
             tracing::info!("Cleaning stale RC file at startup");
             let _ = std::fs::remove_file(rc_file_path);
         }
-    }
 
     while running.load(Ordering::SeqCst) {
         if rc_tx.is_none()
@@ -502,7 +501,7 @@ fn rx_dispatcher(
                     "RX: magic mismatch, payload first 8 bytes: {:02x?}",
                     &payload[..8.min(payload.len())]
                 );
-            } else if magic_rejects % 1000 == 0 {
+            } else if magic_rejects.is_multiple_of(1000) {
                 // Periodically log the reject count to track noise levels
                 tracing::warn!(
                     "RX: {} magic rejects since last valid packet",

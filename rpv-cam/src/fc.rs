@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, unbounded};
+use crossbeam_channel::{bounded};
 use mavlink::common::{MavMessage, MavModeFlag};
 use mavlink::peek_reader::PeekReader;
 use mavlink::{MavHeader, ReadVersion};
@@ -260,7 +260,6 @@ fn fc_reader(
                 let mut peek = PeekReader::new(&mut cursor);
                 match mavlink::read_versioned_msg::<MavMessage, _>(&mut peek, ReadVersion::Any) {
                     Ok((_header, msg)) => {
-                        drop(peek);
                         let consumed = cursor.position() as usize;
 
                         // Log drops when channel is full
