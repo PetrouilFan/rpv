@@ -12,22 +12,23 @@ pkg-config = "0.3"
 
 [dependencies]
 rpv-proto = { path = "../rpv-proto" }
-egpu          = "0.29"
-eframe        = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
-egui-wgpu     = "0.29"
-wgpu          = "22"
 
-serde         = { version = "1", features = ["derive"] }
-serde_json    = "1"
-tracing       = "0.1"
+eframe      = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
+egui        = "0.29"
+egui-wgpu   = "0.29"
+wgpu        = "22"
+
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-toml          = "0.8"
-ctrlc         = "3"
+toml        = "0.8"
+ctrlc       = "3"
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
-libc          = "0.2"
+libc        = "0.2"
 crossbeam-channel = "0.5"
 evdev = { version = "0.13", optional = true }
-arc-swap = "1"
+arc-swap   = "1"
 ffmpeg-sys-next = "8.1"
 ahash = "0.8"
 

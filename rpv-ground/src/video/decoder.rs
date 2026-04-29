@@ -1,4 +1,5 @@
 use tracing::{error, info, warn};
+use std::sync::Arc;
 
 use ffmpeg_sys_next as ffi;
 
@@ -20,9 +21,9 @@ const AVERROR_EAGAIN: i32 = -11;
 
 #[derive(Clone)]
 pub struct DecodedFrame {
-    pub y_data: Vec<u8>,
-    pub u_data: Vec<u8>,
-    pub v_data: Vec<u8>,
+    pub y_data: Arc<[u8]>,
+    pub u_data: Arc<[u8]>,
+    pub v_data: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
     pub y_stride: u32,
@@ -41,7 +42,7 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(width: u32, height: u32) -> Self {
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(2);
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(8);
         Self {
             frame_tx,
             frame_rx,
@@ -54,7 +55,10 @@ impl VideoDecoder {
         self.frame_rx.clone()
     }
 
-    pub fn spawn(&self, rx: crossbeam_channel::Receiver<Vec<u8>>) {
+    pub fn spawn(
+        &self,
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
         let frame_tx = self.frame_tx.clone();
         let width = self.width;
         let height = self.height;
@@ -66,7 +70,7 @@ impl VideoDecoder {
                 libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
             }
             decode_loop_libavcodec(frame_tx, rx, width, height);
-        });
+        })
     }
 }
 
@@ -78,9 +82,6 @@ fn process_decoded_frame(
     width: u32,
     height: u32,
     frame_count: &mut u64,
-    y_buf: &mut Vec<u8>,
-    u_buf: &mut Vec<u8>,
-    v_buf: &mut Vec<u8>,
 ) {
     let fw = unsafe { (*frame).width } as usize;
     let fh = unsafe { (*frame).height } as usize;
@@ -123,27 +124,45 @@ fn process_decoded_frame(
         );
     }
 
-    // Detailed diagnostics for first few frames
-    if *frame_count < 5 && !y_buf.is_empty() {
-        let y1 = y_buf[0];
-        let y2 = y_buf[1];
-        let y3 = y_buf[2];
-        let y4 = if fw < y_buf.len() { y_buf[fw] } else { 0 };
-        info!("FRAME {}: Y=[{},{},{},{}], U=[{},{},{},{}], V=[{},{},{},{}]",
-            *frame_count, y1, y2, y3, y4,
-            u_buf.get(0).copied().unwrap_or(128), u_buf.get(1).copied().unwrap_or(128),
-            u_buf.get(2).copied().unwrap_or(128), u_buf.get(3).copied().unwrap_or(128),
-            v_buf.get(0).copied().unwrap_or(128), v_buf.get(1).copied().unwrap_or(128),
-            v_buf.get(2).copied().unwrap_or(128), v_buf.get(3).copied().unwrap_or(128));
-    }
-
     // Use actual decoded frame dimensions, not config dimensions
     let w = fw;
     let h = fh;
 
-    // Resize buffers to include padding
-    let y_size = linesize0 * h;
-    y_buf.resize(y_size, 0);
+    // Compute buffer sizes with overflow protection
+    let y_size = match linesize0.checked_mul(h) {
+        Some(val) => val,
+        None => {
+            tracing::warn!("Integer overflow in Y plane size: linesize0={}, h={}", linesize0, h);
+            return;
+        }
+    };
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u_size = match linesize1.checked_mul(uv_h) {
+        Some(val) => val,
+        None => {
+            tracing::warn!("Integer overflow in U plane size: linesize1={}, uv_h={}", linesize1, uv_h);
+            return;
+        }
+    };
+    let v_size = if pix_fmt == AV_PIX_FMT_YUV420P as i32 {
+        match linesize2.checked_mul(uv_h) {
+            Some(val) => val,
+            None => {
+                tracing::warn!("Integer overflow in V plane size (YUV420P): linesize2={}, uv_h={}", linesize2, uv_h);
+                return;
+            }
+        }
+    } else {
+        // NV12 uses same size for U and V (interleaved)
+        u_size
+    };
+
+    // Allocate buffers
+    let mut y_buf = vec![0u8; y_size];
+    let mut u_buf = vec![0u8; u_size];
+    let mut v_buf = vec![0u8; v_size];
+
     // Copy Y plane with padding
     for row in 0..h {
         let src = unsafe { std::slice::from_raw_parts(data0.add(row * linesize0), linesize0) };
@@ -151,12 +170,15 @@ fn process_decoded_frame(
         y_buf[dst_start..dst_start + linesize0].copy_from_slice(src);
     }
 
-    let uv_w = w / 2;
-    let uv_h = h / 2;
-
     if pix_fmt == AV_PIX_FMT_NV12 as i32 {
         // NV12: copy interleaved UV with padding, then deinterleave
-        let uv_size = linesize1 * uv_h;
+        let uv_size = match linesize1.checked_mul(uv_h) {
+            Some(val) => val,
+            None => {
+                tracing::warn!("Integer overflow in UV plane size: linesize1={}, uv_h={}", linesize1, uv_h);
+                return;
+            }
+        };
         let mut uv_buf = vec![0u8; uv_size];
         for row in 0..uv_h {
             let src = unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), linesize1) };
@@ -164,9 +186,7 @@ fn process_decoded_frame(
             uv_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
         // Deinterleave into padded U and V
-        let u_size = linesize1 * uv_h;
-        u_buf.resize(u_size, 0);
-        v_buf.resize(u_size, 0);
+        // Buffers already allocated with correct sizes
         for row in 0..uv_h {
             let src = &uv_buf[row * linesize1..(row + 1) * linesize1];
             for col in 0..uv_w {
@@ -176,21 +196,11 @@ fn process_decoded_frame(
         }
     } else {
         // YUV420P or fallback: copy U and V with padding
-        let u_size = linesize1 * uv_h;
-        u_buf.resize(u_size, 0);
         for row in 0..uv_h {
             let src = unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), linesize1) };
             let dst_start = row * linesize1;
             u_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
-        let v_size = match linesize2.checked_mul(uv_h) {
-            Some(val) => val,
-            None => {
-                tracing::warn!("Integer overflow in V plane size calculation: linesize2={}, uv_h={}", linesize2, uv_h);
-                return;
-            }
-        };
-        v_buf.resize(v_size, 0);
         for row in 0..uv_h {
             let src = unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), linesize2) };
             let dst_start = row * linesize2;
@@ -198,15 +208,15 @@ fn process_decoded_frame(
         }
     }
 
-    // Clone the data
-    let y_data = y_buf.clone();
-    let u_data = u_buf.clone();
-    let v_data = v_buf.clone();
+    // Convert buffers into Arc<[u8]> for zero-copy transfer
+    let y_arc = std::sync::Arc::from(y_buf.into_boxed_slice());
+    let u_arc = std::sync::Arc::from(u_buf.into_boxed_slice());
+    let v_arc = std::sync::Arc::from(v_buf.into_boxed_slice());
 
     let decoded = DecodedFrame {
-        y_data,
-        u_data,
-        v_data,
+        y_data: y_arc,
+        u_data: u_arc,
+        v_data: v_arc,
         width: fw as u32,
         height: fh as u32,
         y_stride: linesize0 as u32,
@@ -216,7 +226,9 @@ fn process_decoded_frame(
         recv_time: Some(std::time::Instant::now()),
     };
 
-    let _ = frame_tx.try_send(decoded);
+    if let Err(e) = frame_tx.try_send(decoded) {
+        tracing::warn!("Decoded frame queue full, dropping frame: {}", e);
+    }
 
     *frame_count += 1;
     if *frame_count % 30 == 0 {
@@ -297,9 +309,6 @@ fn decode_loop_libavcodec(
 
     let w = width as usize;
     let h = height as usize;
-    let mut y_buf = vec![0u8; w * h];
-    let mut u_buf = vec![0u8; (w / 2) * (h / 2)];
-    let mut v_buf = vec![0u8; (w / 2) * (h / 2)];
 
     loop {
         let mut nal_data = match rx.recv() {
@@ -365,9 +374,6 @@ fn decode_loop_libavcodec(
                         width,
                         height,
                         &mut frame_count,
-                        &mut y_buf,
-                        &mut u_buf,
-                        &mut v_buf,
                     );
                     unsafe {
                         ffi::av_frame_unref(frame);
@@ -405,9 +411,6 @@ fn decode_loop_libavcodec(
                 width,
                 height,
                 &mut frame_count,
-                &mut y_buf,
-                &mut u_buf,
-                &mut v_buf,
             );
             unsafe {
                 ffi::av_frame_unref(frame);

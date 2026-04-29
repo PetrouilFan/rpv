@@ -922,7 +922,7 @@ fn main() -> Result<(), eframe::Error> {
     let is_udp = config.common.transport == "udp";
     let is_tcp = config.common.transport == "tcp";
 
-    let mut discovery_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut discovery_handle: Option<discovery::Discovery> = None;
 
     let socket: Arc<dyn SocketTrait> = if is_udp {
         // If peer_addr is pre-configured, set it directly; otherwise use discovery
@@ -1050,7 +1050,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let decoder = VideoDecoder::new(config.common.video_width, config.common.video_height);
     let ui_frame_rx = decoder.get_rx();
-    decoder.spawn(video_frame_rx_decoder);
+    let decoder_handle = decoder.spawn(video_frame_rx_decoder);
 
     let telemetry = TelemetryReceiver::new(link_state.clone(), telem_payload_rx);
     let telemetry_state = telemetry.get_state();
@@ -1230,14 +1230,15 @@ fn main() -> Result<(), eframe::Error> {
         Ok(()) => tracing::info!("video_receiver thread exited normally (video_frame_tx channel closed)"),
         Err(e) => tracing::error!("video_receiver thread panicked: {:?}", e),
     }
+    join_log("video_decoder", decoder_handle);
     join_log("telemetry", telem_handle);
     join_log("rc_joystick", rc_handle);
     join_log("heartbeat_sender", hb_handle);
     join_log("heartbeat_monitor", hm_handle);
     join_log("mavlink_downlink", mavlink_down_handle);
     join_log("mavlink_uplink", mavlink_up_handle);
-    if let Some(handle) = discovery_handle {
-        join_log("discovery", handle);
+    if let Some(disc) = discovery_handle {
+        disc.stop();
     }
 
     result

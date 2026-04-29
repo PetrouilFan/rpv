@@ -12,7 +12,7 @@ const VIDEO_HDR_FIXED: usize = 8;
 const VIDEO_HDR_LEN: usize = VIDEO_HDR_FIXED + DATA_SHARDS * 2;
 const DATA_START: usize = VIDEO_HDR_LEN;
 
-const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+const STALL_TIMEOUT: Duration = Duration::from_millis(200);
 const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RsBlock {
@@ -33,7 +33,7 @@ struct CompletedBlock {
 pub struct VideoReceiver {
     tx: crossbeam_channel::Sender<Vec<u8>>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
-    assembly_map: HashMap<u32, (Vec<u8>, Instant)>,
+    assembly_map: AHashMap<u32, (Vec<u8>, Instant)>,
     orphan_fragments: u64,
 }
 

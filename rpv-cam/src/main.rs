@@ -95,7 +95,7 @@ fn main() {
     let is_udp = cfg.common.transport == "udp";
     let is_tcp = cfg.common.transport == "tcp";
 
-    let mut discovery_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut discovery_handle: Option<discovery::Discovery> = None;
 
     // Pre-declare peer_addr so it's in scope for UdpSocket::new below
     let peer_addr: std::sync::Arc<arc_swap::ArcSwap<Option<std::net::SocketAddr>>> =
@@ -408,8 +408,8 @@ fn main() {
     join_log("heartbeat_monitor", hm_handle);
     join_log("heartbeat_sender", hb_handle);
     join_log("mavlink_forwarder", mavlink_fwd_handle);
-    if let Some(handle) = discovery_handle {
-        join_log("discovery", handle);
+    if let Some(disc) = discovery_handle {
+        disc.stop();
     }
 
     tracing::info!("rpv-cam stopped");
@@ -518,7 +518,9 @@ fn rx_dispatcher(
                 }
 
                 if let Some(ref tx) = rc_tx {
-                    let _ = tx.try_send(channels);
+                    if let Err(e) = tx.try_send(channels) {
+                        tracing::warn!("RC channel send failed (queue full): {}", e);
+                    }
                 } else {
                     let ch_str: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
                     let rc_file_path_str = rc_file_path;
