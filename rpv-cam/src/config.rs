@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, FileTypeExt};
 
 use rpv_proto::config::CommonConfig;
 

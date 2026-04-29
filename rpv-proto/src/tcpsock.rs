@@ -19,10 +19,8 @@ use crate::link; // for MAX_PAYLOAD and HEADER_LEN
 /// The socket uses separate read and write handles to avoid head-of-line blocking
 /// and lock contention between concurrent readers and writers.
 pub struct TcpSocket {
-    /// Write half of the TCP connection (owned, with mutex for interior mutability)
-    write_stream: Arc<ArcSwap<Option<Mutex<TcpStream>>>>,
-    /// Read half of the TCP connection (owned, with mutex)
-    read_stream: Arc<ArcSwap<Option<Mutex<TcpStream>>>>,
+    /// TCP connection stream (interior mutability for reconnect)
+    stream: Arc<Mutex<Option<TcpStream>>>,
     /// Read buffer for incomplete frames (interior mutability via Mutex)
     read_buf: Mutex<Vec<u8>>,
     /// Listener for server mode (kept to re-accept connections after disconnect)
@@ -63,8 +61,7 @@ impl TcpSocket {
         })?;
 
         Ok(Self {
-            write_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
-            read_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(read_stream))))),
+            stream: Arc::new(Mutex::new(Some(stream))),
             read_buf: Mutex::new(Vec::new()),
             listener: None,
             target_addr: Some(addr),
@@ -176,8 +173,7 @@ impl TcpSocket {
         tracing::info!("TCP server accepted connection from {}", peer_addr);
 
         Ok(Self {
-            write_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(stream))))),
-            read_stream: Arc::new(ArcSwap::new(Arc::new(Some(Mutex::new(read_stream))))),
+            stream: Arc::new(Mutex::new(Some(stream))),
             read_buf: Mutex::new(Vec::new()),
             listener: Some(listener),
             target_addr: None,
@@ -187,7 +183,7 @@ impl TcpSocket {
     
     /// Check if the socket is connected.
     pub fn is_connected(&self) -> bool {
-        self.write_stream.load().is_some()
+        self.stream.lock().map(|opt| opt.is_some()).unwrap_or(false)
     }
 }
 
@@ -196,15 +192,10 @@ impl SocketTrait for TcpSocket {
     ///
     /// The wire format is: [4-byte length (LE)][payload bytes]
     fn send_with_buf(&self, payload: &[u8], _buf: &mut Vec<u8>) -> io::Result<usize> {
-        let stream_opt = self.write_stream.load();
-        if let Some(ref stream_mutex) = **stream_opt {
-            let mut stream = match stream_mutex.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::warn!("TCP stream mutex poisoned, recovering");
-                    poisoned.into_inner()
-                }
-            };
+        let mut stream_opt = self.stream.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "TCP stream mutex poisoned")
+        })?;
+        if let Some(ref mut stream) = *stream_opt {
             // Write length prefix + payload
             let len_bytes = (payload.len() as u32).to_le_bytes();
             stream.write_all(&len_bytes)
@@ -235,15 +226,10 @@ impl SocketTrait for TcpSocket {
     /// - Ok(n) with the number of bytes copied to buf
     /// - Err(e) on error
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let stream_opt = self.read_stream.load();
-        if let Some(ref stream_mutex) = **stream_opt {
-            let mut stream = match stream_mutex.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::warn!("TCP stream mutex poisoned, recovering");
-                    poisoned.into_inner()
-                }
-            };
+        let mut stream_opt = self.stream.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "TCP stream mutex poisoned")
+        })?;
+        if let Some(ref mut stream) = *stream_opt {
             let mut read_buf = match self.read_buf.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -339,15 +325,9 @@ impl SocketTrait for TcpSocket {
             new_stream.set_read_timeout(Some(timeout))?;
             new_stream.set_write_timeout(Some(timeout))?;
 
-            // Split into read and write halves
-            let write_arc = Arc::new(Mutex::new(new_stream.try_clone().map_err(|e| {
-                tracing::error!("Failed to clone TCP stream for write half: {}", e);
-                e
-            })?));
-            let read_arc = Arc::new(Mutex::new(new_stream));
-
-            self.write_stream.store(Arc::new(Some(write_arc)));
-            self.read_stream.store(Arc::new(Some(read_arc)));
+            *self.stream.lock().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "TCP stream mutex poisoned during reconnect")
+            })? = Some(new_stream);
 
             tracing::info!("TCP server reconnected: new connection from {}", peer_addr);
             return Ok(());
@@ -363,14 +343,9 @@ impl SocketTrait for TcpSocket {
             new_stream.set_read_timeout(Some(timeout))?;
             new_stream.set_write_timeout(Some(timeout))?;
 
-            let write_arc = Arc::new(Mutex::new(new_stream.try_clone().map_err(|e| {
-                tracing::error!("Failed to clone TCP stream for write half: {}", e);
-                e
-            })?));
-            let read_arc = Arc::new(Mutex::new(new_stream));
-
-            self.write_stream.store(Arc::new(Some(write_arc)));
-            self.read_stream.store(Arc::new(Some(read_arc)));
+            *self.stream.lock().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "TCP stream mutex poisoned during reconnect")
+            })? = Some(new_stream);
 
             tracing::info!("TCP client reconnected to {}", addr);
             return Ok(());

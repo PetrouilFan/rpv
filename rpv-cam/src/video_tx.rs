@@ -1,8 +1,7 @@
-use bytes::{Buf, BytesMut};
-use std::env;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
+use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
+use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -107,7 +106,43 @@ fn extract_next_nal_cursor(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     let nal = buf[start..end].to_vec();
     let consumed = end - start;
     Some((nal, consumed))
-}\n\n/// Validate rpicam-vid extra options using an allowlist to prevent command injection.\n/// Accepts a space-separated string of \"--flag value\" pairs or standalone flags.\n/// Returns Result<Vec<String>, Box<dyn std::error::Error>> of validated arguments, or error if any flag is not allowed.\nfn validate_rpicam_options(opts: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {\n    const ALLOWED_FLAGS: &[&str] = &[\n        \"--sharpness\", \"--contrast\", \"--brightness\", \"--saturation\",\n        \"--ISO\", \"--ev\", \"--exposure\", \"--awb-gains\", \"--awb\",\n        \"--denoise\", \"--image-effect\", \"--color-effect\",\n        \"--metering\", \"--rotation\", \"--hflip\", \"--vflip\",\n        \"--roi\", \"--autofocus\", \"--lens-position\",\n    ];\n\n    let tokens: Vec<&str> = opts.split_whitespace().collect();\n    let mut args = Vec::new();\n    let mut i = 0;\n    while i < tokens.len() {\n        let token = tokens[i];\n        if !token.starts_with(\"--\") {\n            return Err(format!(\"Invalid rpicam-vid argument '{}': must start with --\", token).into());\n        }\n        if !ALLOWED_FLAGS.contains(&token) {\n            return Err(format!(\"rpicam-vid flag '{}' is not allowed\", token).into());\n        }\n        args.push(token.to_string());\n        i += 1;\n        if i < tokens.len() && !tokens[i].starts_with(\"--\") {\n            args.push(tokens[i].to_string());\n            i += 1;\n        }\n    }\n    Ok(args)\n}\n\n/// Pre-allocated shard arena for zero-alloc FEC encoding.\n/// Each slot is MAX_SHARD_DATA bytes, zero-filled remainder in-place.
+}
+
+/// Validate rpicam-vid extra options using an allowlist to prevent command injection.
+/// Accepts a space-separated string of "--flag value" pairs or standalone flags.
+/// Returns Result<Vec<String>, Box<dyn std::error::Error>> of validated arguments, or error if any flag is not allowed.
+fn validate_rpicam_options(opts: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    const ALLOWED_FLAGS: &[&str] = &[
+        "--sharpness", "--contrast", "--brightness", "--saturation",
+        "--ISO", "--ev", "--exposure", "--awb-gains", "--awb",
+        "--denoise", "--image-effect", "--color-effect",
+        "--metering", "--rotation", "--hflip", "--vflip",
+        "--roi", "--autofocus", "--lens-position",
+    ];
+
+    let tokens: Vec<&str> = opts.split_whitespace().collect();
+    let mut args = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if !token.starts_with("--") {
+            return Err(format!("Invalid rpicam-vid argument '{}': must start with --", token).into());
+        }
+        if !ALLOWED_FLAGS.contains(&token) {
+            return Err(format!("rpicam-vid flag '{}' is not allowed", token).into());
+        }
+        args.push(token.to_string());
+        i += 1;
+        if i < tokens.len() && !tokens[i].starts_with("--") {
+            args.push(tokens[i].to_string());
+            i += 1;
+        }
+    }
+    Ok(args)
+}
+
+/// Pre-allocated shard arena for zero-alloc FEC encoding.
+/// Each slot is MAX_SHARD_DATA bytes, zero-filled remainder in-place.
 struct ShardArena {
     slots: Vec<[u8; MAX_SHARD_DATA]>,
 }
@@ -312,9 +347,15 @@ pub fn run(
      };
     let mut stdout = child.stdout.take().unwrap();
     // Set non-blocking mode so we can respond to shutdown promptly
-    stdout
-        .set_nonblocking(true)
-        .expect("Failed to set stdout non-blocking");
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let ret = unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
 
     let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS)
         .expect("Failed to create ReedSolomon");
@@ -365,7 +406,7 @@ pub fn run(
         let mut offset_remaining = nal_data.len();
         let mut offset = 0;
         let nal_id = nal_seq;
-        nal_seq = nal_seq.wrapping_add(1();
+        nal_seq = nal_seq.wrapping_add(1);
 
         loop {
             if let Some(ref mut pending) = pending_nal {
@@ -406,12 +447,12 @@ pub fn run(
                 if slot_filled[slot] >= MAX_SHARD_DATA {
                     arena.pad_slot(slot, slot_filled[slot]);
                     send_fec_group_arena(
-                        socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                        &socket, &rs, &mut arena, &slot_filled, &slot_frag_lens,
                         drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
                         &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
                         &hp_rx, &mut fec_shards,
                     )?;
-                    fec_block_seq = fec_block_seq.wrapping_add(1();
+                    fec_block_seq = fec_block_seq.wrapping_add(1);
 
                     slot_filled = [0usize; DATA_SHARDS];
                     slot_frag_lens = [0usize; DATA_SHARDS];
@@ -429,12 +470,12 @@ pub fn run(
                 }
                 if slot >= DATA_SHARDS {
                     send_fec_group_arena(
-                        socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                        &socket, &rs, &mut arena, &slot_filled, &slot_frag_lens,
                         drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
                         &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
                         &hp_rx, &mut fec_shards,
                     )?;
-                    fec_block_seq = fec_block_seq.wrapping_add(1();
+                    fec_block_seq = fec_block_seq.wrapping_add(1);
 
                     slot_filled = [0usize; DATA_SHARDS];
                     slot_frag_lens = [0usize; DATA_SHARDS];
@@ -517,7 +558,7 @@ pub fn run(
             VIDEO_HEALTHY.store(false, Ordering::Relaxed);
 
             // Respawn camera process
-            child = if is_csi {
+            let new_child = if is_csi {
                 Command::new("rpicam-vid")
                     .arg("--output")
                     .arg("-")
@@ -566,7 +607,7 @@ pub fn run(
                     .spawn();
 
                 match hw_result {
-                    Ok(child) => child,
+                    Ok(child) => Some(child),
                     Err(e) => {
                         tracing::warn!("Hardware encoder h264_v4l2m2m unavailable ({:?}), falling back to software libx264", e);
                         Command::new("ffmpeg")
@@ -600,7 +641,7 @@ pub fn run(
                 }
             };
 
-            match child {
+            match new_child {
                 Some(c) => {
                     child = c;
                     stdout = match child.stdout.take() {
@@ -761,7 +802,7 @@ pub fn run(
                     if slot_filled[slot] >= MAX_SHARD_DATA {
                         arena.pad_slot(slot, slot_filled[slot]);
                         send_fec_group_arena(
-                            socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                            &socket, &rs, &mut arena, &slot_filled, &slot_frag_lens,
                             drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
                             &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
                             &hp_rx, &mut fec_shards,
@@ -788,7 +829,7 @@ pub fn run(
                     if slot >= DATA_SHARDS {
                         // All slots full; send group and start new one
                         send_fec_group_arena(
-                            socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                            &socket, &rs, &mut arena, &slot_filled, &slot_frag_lens,
                             drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
                             &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
                             &hp_rx, &mut fec_shards,
@@ -852,7 +893,7 @@ pub fn run(
                 } else {
                     if slot_filled.iter().any(|&f| f > 0) {
                         send_fec_group_arena(
-                            socket, &rs, arena, &slot_filled, &slot_frag_lens,
+                            &socket, &rs, &mut arena, &slot_filled, &slot_frag_lens,
                             drone_id, fec_block_seq, &mut l2_pkt_seq, &mut fail_count,
                             &mut l2_frame_buf, &mut send_buf, &mut video_payload_buf,
                             &hp_rx, &mut fec_shards,
@@ -865,6 +906,7 @@ pub fn run(
                     break;
                 }
             }
+        }
 
         // Rate limit slightly to avoid overwhelming the network
         std::thread::sleep(std::time::Duration::from_micros(100));
