@@ -1,6 +1,5 @@
 /// Shared raw socket functions for stripping radiotap + 802.11 headers
 /// and parsing RSSI from monitor-mode WiFi frames.
-
 /// Fixed 802.11 QoS Data header size (26 bytes with QoS Control field).
 const IEEE80211_HDR_LEN: usize = 26;
 /// 9-byte radiotap: Rate (bit 2) only.

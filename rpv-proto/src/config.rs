@@ -142,13 +142,13 @@ impl CommonConfig {
                 self.ap_channel
             ));
         }
-        if self.video_width == 0 || self.video_width > 4096 || self.video_width % 8 != 0 {
+        if self.video_width == 0 || self.video_width > 4096 || !self.video_width.is_multiple_of(8) {
             errors.push(format!(
                 "video_width {} invalid (should be 320-4096, divisible by 8)",
                 self.video_width
             ));
         }
-        if self.video_height == 0 || self.video_height > 2160 || self.video_height % 8 != 0 {
+        if self.video_height == 0 || self.video_height > 2160 || !self.video_height.is_multiple_of(8) {
             errors.push(format!(
                 "video_height {} invalid (should be 240-2160, divisible by 8)",
                 self.video_height

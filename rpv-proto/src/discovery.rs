@@ -25,7 +25,6 @@ const DISCOVERY_PORT: u16 = 9002;
 /// [4..6]  Version (u16 LE)
 /// [6..8]  Data port (u16 LE)
 /// [8..14] Reserved
-
 pub struct Discovery {
     peer_addr: Arc<ArcSwap<Option<SocketAddr>>>,
     last_seen: Arc<AtomicU64>,

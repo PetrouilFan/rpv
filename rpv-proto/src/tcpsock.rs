@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 
 use crate::link;
 use crate::socket_trait::SocketTrait; // for MAX_PAYLOAD and HEADER_LEN
@@ -48,7 +47,7 @@ impl TcpSocket {
         stream.set_write_timeout(Some(timeout))?;
 
         // Split into read and write halves to avoid lock contention
-        let read_stream = stream.try_clone().map_err(|e| {
+        let _read_stream = stream.try_clone().map_err(|e| {
             tracing::error!("Failed to clone TCP stream for read half: {}", e);
             e
         })?;
@@ -173,7 +172,7 @@ impl TcpSocket {
         stream.set_write_timeout(Some(timeout))?;
 
         // Split into read and write halves to avoid lock contention
-        let read_stream = stream.try_clone().map_err(|e| {
+        let _read_stream = stream.try_clone().map_err(|e| {
             tracing::error!("Failed to clone accepted TCP stream for read half: {}", e);
             e
         })?;
@@ -203,7 +202,7 @@ impl SocketTrait for TcpSocket {
         let mut stream_opt = self
             .stream
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "TCP stream mutex poisoned"))?;
+            .map_err(|_| io::Error::other("TCP stream mutex poisoned"))?;
         if let Some(ref mut stream) = *stream_opt {
             // Write length prefix + payload
             let len_bytes = (payload.len() as u32).to_le_bytes();
@@ -239,7 +238,7 @@ impl SocketTrait for TcpSocket {
         let mut stream_opt = self
             .stream
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "TCP stream mutex poisoned"))?;
+            .map_err(|_| io::Error::other("TCP stream mutex poisoned"))?;
         if let Some(ref mut stream) = *stream_opt {
             let mut read_buf = match self.read_buf.lock() {
                 Ok(guard) => guard,
@@ -340,8 +339,7 @@ impl SocketTrait for TcpSocket {
             TcpSocket::new_client(&addr.to_string(), self.timeout_ms)
                 .map(|s| Box::new(s) as Box<dyn SocketTrait + Send + Sync>)
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "No listener or target address for TCP recreate",
             ))
         }
@@ -359,8 +357,7 @@ impl SocketTrait for TcpSocket {
             new_stream.set_write_timeout(Some(timeout))?;
 
             *self.stream.lock().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     "TCP stream mutex poisoned during reconnect",
                 )
             })? = Some(new_stream);
@@ -380,8 +377,7 @@ impl SocketTrait for TcpSocket {
             new_stream.set_write_timeout(Some(timeout))?;
 
             *self.stream.lock().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     "TCP stream mutex poisoned during reconnect",
                 )
             })? = Some(new_stream);
