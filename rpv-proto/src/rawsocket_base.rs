@@ -135,7 +135,7 @@ impl RawSocketBase {
 
         let seq = self
             .seq_control
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed) & 0x0FFF;
         let seq_bytes = seq.to_le_bytes();
         buf[rawsock_common::RADIOTAP_LEN + 22] = seq_bytes[0];
         buf[rawsock_common::RADIOTAP_LEN + 23] = seq_bytes[1];
@@ -146,7 +146,7 @@ impl RawSocketBase {
         if ret < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(0);
+                return Err(io::Error::new(std::io::ErrorKind::WouldBlock, "TX ring full"));
             }
             if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::ENODEV) {
                 return Err(e);

@@ -202,6 +202,11 @@ impl Config {
             ));
         }
 
+        // Validate that the current user can read/write the fc_port
+        if let Err(e) = std::fs::OpenOptions::new().read(true).write(true).open(&self.fc_port) {
+            errors.push(format!("fc_port '{}' cannot be opened for read/write: {}", self.fc_port, e));
+        }
+
         // Validate fc_baud reasonable
         if self.fc_baud < 9600 || self.fc_baud > 3_000_000 {
             errors.push(format!(
@@ -215,10 +220,19 @@ impl Config {
 
     pub fn save(&self) {
         let config_path = CommonConfig::config_dir().join("cam.toml");
-        if let Ok(data) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(&config_path, data);
-            // Set restrictive permissions (owner read/write only)
-            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+        match toml::to_string_pretty(self) {
+            Ok(data) => {
+                if let Err(e) = std::fs::write(&config_path, data) {
+                    tracing::error!("Failed to write config file: {}", e);
+                }
+                if let Err(e) = std::fs::set_permissions(
+                    &config_path,
+                    std::fs::Permissions::from_mode(0o600)
+                ) {
+                    tracing::error!("Failed to set config file permissions: {}", e);
+                }
+            }
+            Err(e) => tracing::error!("Failed to serialize config to TOML: {}", e),
         }
     }
 }

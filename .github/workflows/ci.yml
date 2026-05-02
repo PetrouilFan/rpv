@@ -37,15 +37,14 @@ jobs:
         with:
           shared-key: "${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
 
-      - name: Check workspace
-        run: cargo check --workspace
+       - name: Check workspace
+         run: cargo check --workspace
 
        - name: Build release
          run: cargo build --workspace --release --no-default-features --features "raw-sock,udp-transport" --bins -j1
 
        - name: Run tests
          run: cargo test --workspace --all-features
-         continue-on-error: true
 
        - name: Run clippy
          run: cargo clippy --workspace --all-targets -- -D warnings
@@ -58,14 +57,3 @@ jobs:
 
        - name: Run security audit
          run: cargo audit
-
-      - name: Check formatting
-        run: cargo fmt --workspace -- --check
-
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Security audit
-        run: |
-          cargo install cargo-audit
-          cargo audit

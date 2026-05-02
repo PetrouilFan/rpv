@@ -7,8 +7,10 @@ mkdir -p "$APP_DIR"
 echo "=== Installing rpv-ground service ==="
 
 cp rpv-ground/target/aarch64-unknown-linux-gnu/release/rpv-ground "$APP_DIR/" 2>/dev/null || \
-cp rpv-ground/target/release/rpv-ground "$APP_DIR/" 2>/dev/null || \
-echo "Warning: Binary not found, run 'cargo build --release' first"
+cp rpv-ground/target/release/rpv-ground "$APP_DIR/" 2>/dev/null || {
+    echo "ERROR: Binary not found, run 'cargo build --release' first" >&2
+    exit 1
+}
 
 cp rpv-ground/xorg.conf "$APP_DIR/"
 cp rpv-ground/start.sh "$APP_DIR/"

@@ -111,7 +111,9 @@ fn discovery_loop(
     // Check running flag to allow graceful shutdown
     while running.load(Ordering::Relaxed) {
         if last_beacon.elapsed() >= BEACON_INTERVAL {
-            let _ = socket.send_to(&beacon, broadcast_target);
+            if let Err(e) = socket.send_to(&beacon, broadcast_target) {
+                tracing::warn!("Discovery beacon send failed: {}", e);
+            }
             last_beacon = Instant::now();
         }
 

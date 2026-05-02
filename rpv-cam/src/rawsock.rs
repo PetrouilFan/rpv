@@ -7,7 +7,7 @@ pub struct RawSocket(RawSocketBase);
 
 impl RawSocket {
     pub fn new(iface: &str) -> io::Result<Self> {
-        RawSocketBase::new(iface, libc::ARPHRD_IEEE80211 as i32).map(Self)
+        RawSocketBase::new(iface, libc::ARPHRD_IEEE80211_RADIOTAP as i32).map(Self)
     }
 
     pub fn send_with_buf(&self, payload: &[u8], buf: &mut Vec<u8>) -> io::Result<usize> {

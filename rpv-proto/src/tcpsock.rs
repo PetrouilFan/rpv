@@ -37,6 +37,11 @@ impl TcpSocket {
     /// * `remote_addr` - The remote address to connect to (e.g., "192.168.1.100:9003")
     /// * `timeout_ms` - Connection and read/write timeout in milliseconds
     pub fn new_client(remote_addr: &str, timeout_ms: u64) -> io::Result<Self> {
+        // Parse address first to validate and for reconnection
+        let addr: SocketAddr = remote_addr
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
         let stream = TcpStream::connect(remote_addr).map_err(|e| {
             tracing::error!("TCP connect to {} failed: {}", remote_addr, e);
             e
@@ -46,17 +51,13 @@ impl TcpSocket {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
-        // Split into read and write halves to avoid lock contention
+        // Split into read and write halves to avoid lock contention (for future use)
         let _read_stream = stream.try_clone().map_err(|e| {
             tracing::error!("Failed to clone TCP stream for read half: {}", e);
             e
         })?;
 
         tracing::info!("TCP client connected to {}", remote_addr);
-
-        let addr: SocketAddr = remote_addr
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
         Ok(Self {
             stream: Arc::new(Mutex::new(Some(stream))),
@@ -156,6 +157,24 @@ impl TcpSocket {
             return Err(io::Error::last_os_error());
         }
 
+        // Set SO_REUSEPORT for rapid restarts (Linux)
+        let optval: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            tracing::warn!(
+                "Failed to set SO_REUSEPORT (kernel may not support it): {}",
+                io::Error::last_os_error()
+            );
+        }
+
         // SAFETY: fd is valid and newly created, from_raw_fd takes ownership safely
         let listener = unsafe { TcpListener::from_raw_fd(fd) };
 
@@ -199,28 +218,40 @@ impl SocketTrait for TcpSocket {
     ///
     /// The wire format is: [4-byte length (LE)][payload bytes]
     fn send_with_buf(&self, payload: &[u8], _buf: &mut Vec<u8>) -> io::Result<usize> {
-        let mut stream_opt = self
-            .stream
-            .lock()
-            .map_err(|_| io::Error::other("TCP stream mutex poisoned"))?;
-        if let Some(ref mut stream) = *stream_opt {
-            // Write length prefix + payload
-            let len_bytes = (payload.len() as u32).to_le_bytes();
-            stream.write_all(&len_bytes).map_err(|e| {
-                tracing::warn!("TCP send length prefix failed: {}", e);
-                e
-            })?;
-            stream.write_all(payload).map_err(|e| {
-                tracing::warn!("TCP send payload failed: {}", e);
-                e
-            })?;
-            Ok(payload.len())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "TCP socket not connected",
-            ))
-        }
+        // Clone the stream while holding the lock briefly, then write without holding it.
+        // This reduces contention and prevents the receiver thread from being blocked
+        // by a slow TCP write.
+        let stream = {
+            let guard = self
+                .stream
+                .lock()
+                .map_err(|_| io::Error::other("TCP stream mutex poisoned"))?;
+            match guard.as_ref() {
+                Some(s) => {
+                    s.try_clone().map_err(|e| {
+                        tracing::warn!("Failed to clone TCP stream for send: {}", e);
+                        io::Error::new(io::ErrorKind::Other, e)
+                    })?
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "TCP socket not connected",
+                    ));
+                }
+            }
+        };
+
+        let len_bytes = (payload.len() as u32).to_le_bytes();
+        stream.write_all(&len_bytes).map_err(|e| {
+            tracing::warn!("TCP send length prefix failed: {}", e);
+            e
+        })?;
+        stream.write_all(payload).map_err(|e| {
+            tracing::warn!("TCP send payload failed: {}", e);
+            e
+        })?;
+        Ok(payload.len())
     }
 
     /// Receive a framed message from the TCP stream.

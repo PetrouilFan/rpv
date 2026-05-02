@@ -65,7 +65,11 @@ impl VideoDecoder {
                 let mut set: libc::cpu_set_t = std::mem::zeroed();
                 libc::CPU_ZERO(&mut set);
                 libc::CPU_SET(2, &mut set);
-                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                if ret < 0 {
+                    tracing::warn!("Failed to set thread affinity: {}", std::io::Error::last_os_error());
+                }
+            }
             }
             decode_loop_libavcodec(frame_tx, rx, width, height);
         })
@@ -88,11 +92,9 @@ fn process_decoded_frame(
     let ls0 = unsafe { (*frame).linesize[0] };
     let ls1 = unsafe { (*frame).linesize[1] };
     let ls2 = unsafe { (*frame).linesize[2] };
-    if ls2 < 0 {
-        tracing::warn!("Negative linesize for V plane: {}", ls2);
-        return;
-    }
     if ls0 < 0 || ls1 < 0 || ls2 < 0 {
+        tracing::warn!("Negative linesize detected: [{}, {}, {}], frame may be bottom-up; dropping",
+            ls0, ls1, ls2);
         return;
     }
     let linesize0 = ls0 as usize;
@@ -102,7 +104,7 @@ fn process_decoded_frame(
     let data1 = unsafe { (*frame).data[1] };
     let data2 = unsafe { (*frame).data[2] };
 
-    if data0.is_null() || data1.is_null() || data2.is_null() {
+    if data0.is_null() || data1.is_null() {
         return;
     }
     if fw == 0 || fh == 0 || fw > width as usize * 2 || fh > height as usize * 2 {
@@ -168,10 +170,8 @@ fn process_decoded_frame(
         u_size
     };
 
-    // Allocate buffers
+    // Allocate buffer for Y plane (always first)
     let mut y_buf = vec![0u8; y_size];
-    let mut u_buf = vec![0u8; u_size];
-    let mut v_buf = vec![0u8; v_size];
 
     // Copy Y plane with padding
     for row in 0..h {
@@ -180,8 +180,14 @@ fn process_decoded_frame(
         y_buf[dst_start..dst_start + linesize0].copy_from_slice(src);
     }
 
+    // UV dimensions
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+
+    // Deinterleave color planes depending on pixel format
+    let (u_arc, v_arc, u_stride_val, v_stride_val);
     if pix_fmt == AV_PIX_FMT_NV12 {
-        // NV12: copy interleaved UV with padding, then deinterleave
+        // NV12: interleaved UV — copy then split into packed U and V planes
         let uv_size = match linesize1.checked_mul(uv_h) {
             Some(val) => val,
             None => {
@@ -199,17 +205,27 @@ fn process_decoded_frame(
             let dst_start = row * linesize1;
             uv_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
-        // Deinterleave into padded U and V
-        // Buffers already allocated with correct sizes
+        // Deinterleave into packed U and V (tightly packed, row stride = uv_w)
+        let u_packed = vec![0u8; uv_w * uv_h];
+        let v_packed = vec![0u8; uv_w * uv_h];
         for row in 0..uv_h {
-            let src = &uv_buf[row * linesize1..(row + 1) * linesize1];
+            let src_row = &uv_buf[row * linesize1..(row + 1) * linesize1];
             for col in 0..uv_w {
-                u_buf[row * linesize1 + col] = src[col * 2];
-                v_buf[row * linesize1 + col] = src[col * 2 + 1];
+                u_packed[row * uv_w + col] = src_row[col * 2];
+                v_packed[row * uv_w + col] = src_row[col * 2 + 1];
             }
         }
+        u_arc = std::sync::Arc::from(u_packed.into_boxed_slice());
+        v_arc = std::sync::Arc::from(v_packed.into_boxed_slice());
+        u_stride_val = uv_w as u32;
+        v_stride_val = uv_w as u32;
     } else {
-        // YUV420P or fallback: copy U and V with padding
+        // YUV420P: copy U and V planes separately with padding
+        // data2 must be valid for YUV420P
+        if data2.is_null() {
+            tracing::warn!("YUV420P frame missing V plane");
+            return;
+        }
         for row in 0..uv_h {
             let src = unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), linesize1) };
             let dst_start = row * linesize1;
@@ -220,13 +236,18 @@ fn process_decoded_frame(
             let dst_start = row * linesize2;
             v_buf[dst_start..dst_start + linesize2].copy_from_slice(src);
         }
+        for row in 0..uv_h {
+            let src = unsafe { std::slice::from_raw_parts(data2.add(row * linesize2), linesize2) };
+            let dst_start = row * linesize2;
+            v_buf[dst_start..dst_start + linesize2].copy_from_slice(src);
+        }
+        u_arc = std::sync::Arc::from(u_buf.into_boxed_slice());
+        v_arc = std::sync::Arc::from(v_buf.into_boxed_slice());
+        u_stride_val = linesize1 as u32;
+        v_stride_val = linesize2 as u32;
     }
 
-    // Convert buffers into Arc<[u8]> for zero-copy transfer
     let y_arc = std::sync::Arc::from(y_buf.into_boxed_slice());
-    let u_arc = std::sync::Arc::from(u_buf.into_boxed_slice());
-    let v_arc = std::sync::Arc::from(v_buf.into_boxed_slice());
-
     let decoded = DecodedFrame {
         y_data: y_arc,
         u_data: u_arc,
@@ -234,12 +255,8 @@ fn process_decoded_frame(
         width: fw as u32,
         height: fh as u32,
         y_stride: linesize0 as u32,
-        u_stride: linesize1 as u32,
-        v_stride: if pix_fmt == AV_PIX_FMT_YUV420P {
-            linesize2 as u32
-        } else {
-            linesize1 as u32
-        },
+        u_stride: u_stride_val,
+        v_stride: v_stride_val,
         send_ts_us: None,
         recv_time: Some(std::time::Instant::now()),
     };
@@ -249,7 +266,7 @@ fn process_decoded_frame(
     }
 
     *frame_count += 1;
-    if (*frame_count).is_multiple_of(30) {
+    if *frame_count % 30 == 0 {
         info!("Decoded {} frames (planar YUV, libavcodec)", *frame_count);
     }
 }
@@ -266,59 +283,50 @@ fn decode_loop_libavcodec(
         "libavcodec H.264 decoder initialized: {}x{} planar YUV",
         width, height
     );
-    // Try hardware-accelerated decoders first
-    let hw_decoder_names = [
+    // Try hardware-accelerated decoders first, fallback to software on failure
+    let decoder_names = [
         "h264_vaapi",
         "h264_v4l2m2m",
         "h264_videotoolbox",
         "h264_cuvid",
         "h264_qsv",
+        "h264", // software fallback
     ];
     let mut codec = std::ptr::null();
-    let mut selected_decoder = "h264";
+    let mut selected_decoder = "";
+    let mut codec_ctx = std::ptr::null_mut();
 
-    for hw_name in &hw_decoder_names {
-        let cstr = std::ffi::CString::new(*hw_name).unwrap();
+    for name in &decoder_names {
+        let cstr = std::ffi::CString::new(*name).unwrap();
         codec = unsafe { ffi::avcodec_find_decoder_by_name(cstr.as_ptr()) };
-        if !codec.is_null() {
-            selected_decoder = *hw_name;
-            info!("Using hardware decoder: {}", selected_decoder);
-            break;
+        if codec.is_null() {
+            continue;
         }
+        selected_decoder = *name;
+        codec_ctx = unsafe { ffi::avcodec_alloc_context3(codec) };
+        if codec_ctx.is_null() {
+            error!("avcodec_alloc_context3 failed for {}", selected_decoder);
+            continue;
+        }
+        unsafe {
+            (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*codec_ctx).thread_count = 1;
+            (*codec_ctx).thread_type = 0;
+            (*codec_ctx).err_recognition = 1;
+            (*codec_ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL;
+        }
+        let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
+        if ret < 0 {
+            error!("Failed to open {} decoder (err {}), trying next...", selected_decoder, ret);
+            unsafe { ffi::avcodec_free_context(&mut codec_ctx) };
+            continue;
+        }
+        info!("Using decoder: {}", selected_decoder);
+        break;
     }
 
-    if codec.is_null() {
-        // Fallback to software decoder
-        let codec_name = std::ffi::CString::new("h264").unwrap();
-        codec = unsafe { ffi::avcodec_find_decoder_by_name(codec_name.as_ptr() as *const _) };
-        selected_decoder = "h264 (software)";
-    }
-
-    if codec.is_null() {
-        error!("libavcodec: h264 decoder not found");
-        return;
-    }
-
-    let codec_ctx = unsafe { ffi::avcodec_alloc_context3(codec) };
-    if codec_ctx.is_null() {
-        error!("libavcodec: failed to alloc context");
-        return;
-    }
-    unsafe {
-        (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-        (*codec_ctx).thread_count = 1;
-        (*codec_ctx).thread_type = 0;
-        (*codec_ctx).err_recognition = 1;
-        (*codec_ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL;
-    }
-
-    let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, std::ptr::null_mut()) };
-    if ret < 0 {
-        error!(
-            "libavcodec: failed to open {} decoder (err {})",
-            selected_decoder, ret
-        );
-        unsafe { ffi::avcodec_free_context(&mut { codec_ctx }) };
+    if codec.is_null() || codec_ctx.is_null() {
+        error!("libavcodec: no suitable H.264 decoder found");
         return;
     }
 
@@ -367,7 +375,6 @@ fn decode_loop_libavcodec(
         }
 
         unsafe {
-            // Allocate buffer with FFmpeg's allocator to avoid mismatched free
             let buf_len = nal_data.len();
             let buffer = ffi::av_malloc(buf_len) as *mut u8;
             if buffer.is_null() {
@@ -375,7 +382,12 @@ fn decode_loop_libavcodec(
                 continue;
             }
             std::ptr::copy_nonoverlapping(nal_data.as_ptr(), buffer, buf_len);
-            ffi::av_packet_from_data(pkt, buffer, buf_len as i32);
+            let ret = ffi::av_packet_from_data(pkt, buffer, buf_len as i32);
+            if ret < 0 {
+                error!("av_packet_from_data failed: {}", ret);
+                ffi::av_free(buffer);
+                continue;
+            }
         }
 
         let send_ret = unsafe { ffi::avcodec_send_packet(codec_ctx, pkt) };

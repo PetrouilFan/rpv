@@ -141,9 +141,11 @@ if [ -n "$CURRENT_IP" ]; then
 else
     log_warn "No IP address assigned"
     log_info "Attempting to set static IP..."
-    sudo ip addr add ${EXPECTED_SUBNET}.2/24 dev "$WIFI_IFACE" 2>/dev/null && \
-        log_ok "Static IP set: ${EXPECTED_SUBNET}.2" || \
+    if sudo ip addr add ${EXPECTED_SUBNET}.2/24 dev "$WIFI_IFACE" 2>/dev/null; then
+        log_ok "Static IP set: ${EXPECTED_SUBNET}.2"
+    else
         log_error "Failed to set static IP"
+    fi
 fi
 
 # ---- 5. Test connectivity to Pi ----

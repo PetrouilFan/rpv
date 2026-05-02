@@ -67,7 +67,8 @@ impl LinkStateMachine {
     }
 
     /// Heartbeat restored -> Connected (or NoCamera if camera unavailable).
-    /// #5: Checks camera_ok flag on every transition so NoCamera isn't lost.
+    /// Checks camera_ok flag on every transition so NoCamera isn't lost.
+    /// Also handles transitioning from NoCamera to Connected if camera has become available.
     pub fn heartbeat_restored(&self) {
         let cur = self.state.load(Ordering::SeqCst);
         if cur == SEARCHING || cur == SIGNAL_LOST {
@@ -78,6 +79,10 @@ impl LinkStateMachine {
                 self.state.store(NO_CAMERA, Ordering::SeqCst);
                 tracing::info!("Link: heartbeat restored but camera unavailable -> NoCamera");
             }
+        } else if cur == NO_CAMERA && self.camera_ok.load(Ordering::SeqCst) {
+            // Camera became available while we were in NoCamera — heartbeat is active, so go straight to Connected
+            self.state.store(CONNECTED, Ordering::SeqCst);
+            tracing::info!("Link: camera available + heartbeat -> Connected");
         }
     }
 
@@ -102,7 +107,7 @@ impl LinkStateMachine {
     }
 
     /// Camera not available -> NoCamera.
-    /// #5: Sets camera_ok flag so heartbeat_restored can check it.
+    /// Sets camera_ok flag so heartbeat_restored can check it.
     pub fn camera_unavailable(&self) {
         self.camera_ok.store(false, Ordering::SeqCst);
         let cur = self.state.load(Ordering::SeqCst);
@@ -112,14 +117,16 @@ impl LinkStateMachine {
         }
     }
 
-    /// Camera available again -> Searching (let heartbeat/telemetry confirm Connected).
-    /// #5: Clears camera_ok flag.
+    /// Camera available again.
+    /// If currently in NoCamera, we know heartbeat is still active (since we only stay in NoCamera
+    /// while heartbeats continue), so transition directly to Connected.
+    /// Otherwise (e.g., Searching) — wait for heartbeat to confirm.
     pub fn camera_available(&self) {
         self.camera_ok.store(true, Ordering::SeqCst);
         let cur = self.state.load(Ordering::SeqCst);
         if cur == NO_CAMERA {
-            self.state.store(SEARCHING, Ordering::SeqCst);
-            tracing::info!("Link: camera available -> Searching");
+            self.state.store(CONNECTED, Ordering::SeqCst);
+            tracing::info!("Link: camera available -> Connected");
         }
     }
 }
@@ -192,7 +199,7 @@ mod tests {
         assert_eq!(state.get(), LinkStatus::NoCamera);
 
         state.camera_available();
-        state.heartbeat_restored();
+        // After camera_available while in NoCamera, we transition directly to Connected
         assert_eq!(state.get(), LinkStatus::Connected);
     }
 

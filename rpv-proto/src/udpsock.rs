@@ -38,20 +38,24 @@ impl UdpSocket {
         if let Some(addr) = current.as_ref() {
             self.socket.send_to(payload, *addr)
         } else {
-            self.socket.send_to(payload, self.broadcast_addr)
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no peer address known (discovery not completed)",
+            ))
         }
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self.socket.recv_from(buf) {
-            Ok((n, addr)) => {
-                tracing::trace!("UDP recv: {} bytes from {}", n, addr);
+            Ok((n, _addr)) => {
+                tracing::trace!("UDP recv: {} bytes", n);
                 Ok(n)
             }
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                Ok(0)
+                // Propagate WouldBlock so callers can distinguish "no data now" from zero-length datagram
+                Err(e)
             }
             Err(e) => Err(e),
         }

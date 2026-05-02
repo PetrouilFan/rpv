@@ -523,7 +523,7 @@ impl RpvApp {
             }
             if let Some(recv_time) = frame.recv_time {
                 let latency_ms = recv_time.elapsed().as_millis();
-                if self.state.frame_count.is_multiple_of(60) {
+                if self.state.frame_count % 60 == 0 {
                     tracing::info!(
                         "decode-to-display latency: {}ms, dropped {} stale frames",
                         latency_ms,
@@ -692,7 +692,7 @@ fn draw_osd(ui: &mut egui::Ui, state: &AppState) {
         true
     } else {
         let t = ui.ctx().input(|i| i.time);
-        ((t * 2.0) as u64).is_multiple_of(2)
+                ((t * 2.0) as u64) % 2 == 0
     };
     if dot_visible {
         p.circle_filled(egui::pos2(15.0, y + 7.0), 5.0, color);
@@ -1284,8 +1284,18 @@ fn rx_dispatcher(
 
     while running.load(Ordering::SeqCst) {
         let len = match socket.recv(&mut buf) {
-            Ok(0) => continue,
+            Ok(0) => {
+                // Connection closed (TCP) or zero-length packet (UDP) – treat as no data
+                continue;
+            }
             Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No data available now (non-blocking socket)
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("RX recv error: {}", e);
                 tracing::info!("Attempting to reconnect TCP socket...");
@@ -1326,7 +1336,7 @@ fn rx_dispatcher(
 
         if !link::L2Header::matches_magic(actual_payload) {
             reject_count += 1;
-            if reject_count <= 10 || reject_count.is_multiple_of(500) {
+            if reject_count <= 10 || reject_count % 500 == 0 {
                 tracing::warn!(
                     "RX: magic mismatch #{}, payload first 16 bytes: {:02x?}",
                     reject_count,
@@ -1358,7 +1368,7 @@ fn rx_dispatcher(
         }
 
         total_frames += 1;
-        if total_frames.is_multiple_of(500) {
+        if total_frames % 500 == 0 {
             tracing::info!(
                 "RX stats: total={} video={} telem={} hb={} mavlink={} rejected={}",
                 total_frames,

@@ -163,10 +163,11 @@ impl VideoReceiver {
                     } else {
                         // Orphan continuation fragment
                         self.orphan_fragments += 1;
-                        if self.orphan_fragments <= 10 || self.orphan_fragments.is_multiple_of(100) {
+                        if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
                             debug!(
                                 "Orphan continuation fragment nal_id={}, total: {}",
-                                nal_id, self.orphan_fragments
+                                nal_id,
+                                self.orphan_fragments
                             );
                         }
                     }
@@ -180,12 +181,14 @@ impl VideoReceiver {
                     } else {
                         // Orphan end fragment
                         self.orphan_fragments += 1;
-                        if self.orphan_fragments <= 10 || self.orphan_fragments.is_multiple_of(100) {
+                        if self.orphan_fragments <= 10 || self.orphan_fragments % 100 == 0 {
                             debug!(
                                 "Orphan end fragment nal_id={}, total: {}",
-                                nal_id, self.orphan_fragments
+                                nal_id,
+                                self.orphan_fragments
                             );
                         }
+                    }
                     }
                 }
                 _ => {
@@ -283,7 +286,7 @@ impl VideoReceiver {
             }
 
             payload_count += 1;
-            if payload_count.is_multiple_of(1000) {
+            if payload_count % 1000 == 0 {
                 info!(
                     "VideoReceiver: {} payloads, recovered={}, dropped={}, next={}",
                     payload_count, fec_recovered, fec_dropped, next_block
@@ -304,6 +307,16 @@ impl VideoReceiver {
             for (i, len) in parsed_shard_lens.iter_mut().take(DATA_SHARDS).enumerate() {
                 let off = VIDEO_HDR_FIXED + i * 2;
                 *len = u16::from_le_bytes([actual_payload[off], actual_payload[off + 1]]) as usize;
+            }
+
+            // Validate shard lengths to prevent excessive allocations / OOB
+            if parsed_shard_lens.iter().any(|&len| len > MAX_SHARD_DATA) {
+                tracing::warn!(
+                    "Block {}: shard length exceeds max {}, dropping",
+                    block_seq,
+                    MAX_SHARD_DATA
+                );
+                continue;
             }
 
             if total_shards != TOTAL_SHARDS || shard_index >= TOTAL_SHARDS {
@@ -343,8 +356,7 @@ impl VideoReceiver {
             let idx = (block_seq as usize) % RING_SIZE;
 
             if next_block_init {
-                let diff = block_seq.wrapping_sub(next_block);
-                if diff != 0 && (diff & 0x80000000) != 0 {
+                if !Self::is_future_block(block_seq, next_block) && block_seq != next_block {
                     // Old block (pre-wrap or already processed), discard
                     continue;
                 }

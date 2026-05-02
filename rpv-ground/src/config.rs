@@ -91,15 +91,46 @@ impl Config {
             errors.push("gcs_uplink_port and gcs_downlink_port must be different".to_string());
         }
 
+        // Check for port conflicts with data ports
+        if self.gcs_uplink_port == self.common.udp_port {
+            errors.push(format!(
+                "gcs_uplink_port {} conflicts with udp_port {}",
+                self.gcs_uplink_port, self.common.udp_port
+            ));
+        }
+        if let Some(tcp_port) = self.common.tcp_port {
+            if self.gcs_uplink_port == tcp_port {
+                errors.push(format!(
+                    "gcs_uplink_port {} conflicts with tcp_port {}",
+                    self.gcs_uplink_port, tcp_port
+                ));
+            }
+            if self.gcs_downlink_port == tcp_port {
+                errors.push(format!(
+                    "gcs_downlink_port {} conflicts with tcp_port {}",
+                    self.gcs_downlink_port, tcp_port
+                ));
+            }
+        }
+
         errors
     }
 
     pub fn save(&self) {
         let config_path = CommonConfig::config_dir().join("ground.toml");
-        if let Ok(data) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(&config_path, data);
-            // Set restrictive permissions (0600)
-            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+        match toml::to_string_pretty(self) {
+            Ok(data) => {
+                if let Err(e) = std::fs::write(&config_path, data) {
+                    tracing::error!("Failed to write config file: {}", e);
+                }
+                if let Err(e) = std::fs::set_permissions(
+                    &config_path,
+                    std::fs::Permissions::from_mode(0o600)
+                ) {
+                    tracing::error!("Failed to set config file permissions: {}", e);
+                }
+            }
+            Err(e) => tracing::error!("Failed to serialize config to TOML: {}", e),
         }
     }
 }

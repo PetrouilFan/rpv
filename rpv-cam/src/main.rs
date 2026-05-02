@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use rpv_proto::discovery;
 use rpv_proto::link;
+use rpv_proto::rawsock_common;
 use rpv_proto::socket_trait::SocketTrait;
 use rpv_proto::tcpsock::TcpSocket;
 use rpv_proto::udpsock::UdpSocket;
@@ -231,7 +232,30 @@ fn main() {
         tracing::info!("Connecting to ground station via TCP at {}", target_addr);
 
         let mut retry_count: u32 = 0;
-        loop {
+        while running.load(Ordering::SeqCst) {
+            match TcpSocket::new_client(&target_addr, 1000) {
+                Ok(s) => {
+                    tracing::info!("TCP connection established");
+                    write_link_status("connected");
+                    break Arc::new(s);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    let backoff_secs = 2u64.pow(retry_count.min(5));
+                    let backoff_secs = backoff_secs.min(60);
+                    tracing::error!(
+                        "TCP connect failed (attempt {}): {}, retrying in {}s...",
+                        retry_count,
+                        e,
+                        backoff_secs
+                    );
+                    std::thread::sleep(Duration::from_secs(backoff_secs));
+                    if !running.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+            }
+        }
             match TcpSocket::new_client(&target_addr, 1000) {
                 Ok(s) => {
                     tracing::info!("TCP connection established");
@@ -482,26 +506,31 @@ fn rx_dispatcher(
         let len = match socket.recv(&mut buf) {
             Ok(0) => continue,
             Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("RX recv error: {}", e);
                 continue;
             }
         };
 
-        let payload = if len >= 8 {
-            &buf[..len]
-        } else {
-            continue;
+        let (actual_payload, _) = match rpv_proto::rawsock_common::recv_extract(&buf[..len], false) {
+            Some((p, _r)) => p,
+            None => continue,
         };
 
-        if !link::L2Header::matches_magic(payload) {
+        if !link::L2Header::matches_magic(actual_payload) {
             magic_rejects += 1;
             if magic_rejects <= 5 {
                 tracing::debug!(
                     "RX: magic mismatch, payload first 8 bytes: {:02x?}",
                     &payload[..8.min(payload.len())]
                 );
-            } else if magic_rejects.is_multiple_of(1000) {
+            } else if magic_rejects % 1000 == 0 {
                 // Periodically log the reject count to track noise levels
                 tracing::warn!(
                     "RX: {} magic rejects since last valid packet",
@@ -515,7 +544,7 @@ fn rx_dispatcher(
             tracing::debug!("RX: valid packet after {} magic rejects", magic_rejects);
             magic_rejects = 0;
         }
-        let (header, data) = match link::L2Header::decode(payload) {
+        let (header, data) = match link::L2Header::decode(actual_payload) {
             Some(h) => h,
             None => continue,
         };

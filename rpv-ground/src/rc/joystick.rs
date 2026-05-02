@@ -260,7 +260,7 @@ impl RCTx {
         let channels = self.channels.load();
 
         static SEND_COUNT: AtomicU64 = AtomicU64::new(0);
-        if SEND_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(500) {
+        if SEND_COUNT.fetch_add(1, Ordering::Relaxed) % 500 == 0 {
             info!(
                 "RC: ch0={} ch1={} ch2={} ch3={} ch4={}",
                 channels[0], channels[1], channels[2], channels[3], channels[4]

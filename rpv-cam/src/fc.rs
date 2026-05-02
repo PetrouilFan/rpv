@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded};
-use mavlink::common::{MavMessage, MavModeFlag};
+use mavlink::common::{MavMessage, MavModeFlag, MavType};
 use mavlink::peek_reader::PeekReader;
 use mavlink::{MavHeader, ReadVersion};
 
@@ -302,7 +302,7 @@ fn fc_reader(
                                 fc.armed = h
                                     .base_mode
                                     .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED);
-                                fc.mode = ardupilot_mode_name(h.custom_mode).to_string();
+                                fc.mode = ardupilot_mode_name(h.custom_mode, h.mavtype).to_string();
                             }
                             _ => {}
                         }
@@ -313,19 +313,26 @@ fn fc_reader(
             };
             if consumed == 0 {
                 let skip = find_next_mavlink_magic(&acc);
-                let safe_skip = skip.min(acc.len());
-                if safe_skip == 0 || safe_skip > acc.len() {
-                    acc.clear();
+                if skip >= acc.len() {
+                    // No magic found; preserve tail for partial message detection
+                    const KEEP_BYTES: usize = 16;
+                    if acc.len() > KEEP_BYTES {
+                        let tail = acc[acc.len() - KEEP_BYTES..].to_vec();
+                        acc.clear();
+                        acc.extend_from_slice(&tail);
+                    } else {
+                        acc.clear();
+                    }
                     continue;
                 }
-                acc.advance(safe_skip);
+                acc.advance(skip);
                 continue;
             }
             acc.advance(consumed);
         }
 
         if last_telem_send.elapsed() >= Duration::from_millis(100) {
-            let _ = telem_tx.send(fc.clone());
+            let _ = telem_tx.try_send(fc.clone());
             last_telem_send = Instant::now();
         }
     }
@@ -466,29 +473,26 @@ fn channels_to_override(channels: &[u16], target_system: u8) -> MavMessage {
         chan7_raw: ch(6),
         chan8_raw: ch(7),
         target_system,
-        target_component: 0,
+        target_component: 1,
     })
 }
 
-/// Creates an RC_CHANNELS_OVERRIDE message for failsafe state.
-/// Default: throttle=1000 (low), all other channels at 1500 (mid), aux channels disabled.
-/// NOTE: These values may not be appropriate for all vehicle types.
-/// Channel 3 (throttle) at 1000 is typical for "low throttle" failsafe.
-/// Channels 5-8 set to 0 (disabled) since RC_CHANNELS_OVERRIDE treats 0 as "ignore".
-fn failsafe_override(target_system: u8) -> MavMessage {
-    MavMessage::RC_CHANNELS_OVERRIDE(mavlink::common::RC_CHANNELS_OVERRIDE_DATA {
-        chan1_raw: 1500,
-        chan2_raw: 1500,
-        chan3_raw: 1000,
-        chan4_raw: 1500,
-        chan5_raw: 0,
-        chan6_raw: 0,
-        chan7_raw: 0,
-        chan8_raw: 0,
-        target_system,
-        target_component: 0,
-    })
-}
+    /// NOTE: These failsafe values (throttle=1000, aux=1000) are safe for most setups.
+    /// Adjust if your vehicle requires different failsafe positions.
+    fn failsafe_override(target_system: u8) -> MavMessage {
+        MavMessage::RC_CHANNELS_OVERRIDE(mavlink::common::RC_CHANNELS_OVERRIDE_DATA {
+            chan1_raw: 1500,
+            chan2_raw: 1500,
+            chan3_raw: 1000,
+            chan4_raw: 1500,
+            chan5_raw: 1000,
+            chan6_raw: 1000,
+            chan7_raw: 1000,
+            chan8_raw: 1000,
+            target_system,
+            target_component: 1,
+        })
+    }
 
 /// Write a MAVLink v2 message to the serial port.
 /// Returns false on any write error so caller can exit and trigger reconnect.
@@ -537,35 +541,40 @@ fn find_next_mavlink_magic(buf: &[u8]) -> usize {
     buf.len()
 }
 
-fn ardupilot_mode_name(custom_mode: u32) -> &'static str {
-    match custom_mode {
-        0 => "STABILIZE",
-        1 => "ACRO",
-        2 => "ALT_HOLD",
-        3 => "AUTO",
-        4 => "GUIDED",
-        5 => "LOITER",
-        6 => "RTL",
-        7 => "CIRCLE",
-        9 => "LAND",
-        11 => "DRIFT",
-        13 => "SPORT",
-        14 => "FLIP",
-        15 => "AUTOTUNE",
-        16 => "POSHOLD",
-        17 => "BRAKE",
-        18 => "THROW",
-        19 => "AVOID_ADSB",
-        20 => "GUIDED_NOGPS",
-        21 => "SMART_RTL",
-        22 => "FLOWHOLD",
-        23 => "FOLLOW",
-        24 => "ZIGZAG",
-        25 => "SYSTEMID",
-        26 => "AUTOROTATE",
-        27 => "AUTO_RTL",
+fn ardupilot_mode_name(custom_mode: u32, mavtype: u8) -> &'static str {
+    // Current mapping for ArduCopter (quadrotor). Other vehicle types return UNKNOWN.
+    match mavtype {
+        x if x == MavType::MAV_TYPE_QUADROTOR as u8 => match custom_mode {
+            0 => "STABILIZE",
+            1 => "ACRO",
+            2 => "ALT_HOLD",
+            3 => "AUTO",
+            4 => "GUIDED",
+            5 => "LOITER",
+            6 => "RTL",
+            7 => "CIRCLE",
+            9 => "LAND",
+            11 => "DRIFT",
+            13 => "SPORT",
+            14 => "FLIP",
+            15 => "AUTOTUNE",
+            16 => "POSHOLD",
+            17 => "BRAKE",
+            18 => "THROW",
+            19 => "AVOID_ADSB",
+            20 => "GUIDED_NOGPS",
+            21 => "SMART_RTL",
+            22 => "FLOWHOLD",
+            23 => "FOLLOW",
+            24 => "ZIGZAG",
+            25 => "SYSTEMID",
+            26 => "AUTOROTATE",
+            27 => "AUTO_RTL",
+            _ => "UNKNOWN",
+        },
         _ => "UNKNOWN",
     }
+}
 }
 
 #[cfg(test)]
