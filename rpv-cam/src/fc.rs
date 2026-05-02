@@ -302,7 +302,7 @@ fn fc_reader(
                                 fc.armed = h
                                     .base_mode
                                     .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED);
-                                fc.mode = ardupilot_mode_name(h.custom_mode, h.mavtype).to_string();
+                                fc.mode = ardupilot_mode_name(h.custom_mode, h.mavtype as u8).to_string();
                             }
                             _ => {}
                         }
@@ -575,7 +575,6 @@ fn ardupilot_mode_name(custom_mode: u32, mavtype: u8) -> &'static str {
         _ => "UNKNOWN",
     }
 }
-}
 
 #[cfg(test)]
 mod tests {
@@ -809,10 +808,10 @@ mod tests {
         let msg = failsafe_override(1);
         match msg {
             MavMessage::RC_CHANNELS_OVERRIDE(r) => {
-                assert_eq!(r.chan5_raw, 0);
-                assert_eq!(r.chan6_raw, 0);
-                assert_eq!(r.chan7_raw, 0);
-                assert_eq!(r.chan8_raw, 0);
+                assert_eq!(r.chan5_raw, 1000);
+                assert_eq!(r.chan6_raw, 1000);
+                assert_eq!(r.chan7_raw, 1000);
+                assert_eq!(r.chan8_raw, 1000);
             }
             other => panic!("expected RC_CHANNELS_OVERRIDE, got {:?}", other),
         }

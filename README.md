@@ -1,6 +1,14 @@
 # rpv
 
+[![GitHub release](https://img.shields.io/github/v/release/user/rpv)](https://github.com/user/rpv/releases)
+
 Rust FPV system for Raspberry Pi. Low-latency H.264 video over raw 802.11 monitor mode with Reed-Solomon FEC, MAVLink FC integration, RC control, and a real-time OSD.
+
+## Supported Transports
+
+- **TCP** (recommended): Ground station listens, camera connects. More reliable, handles reconnection.
+- **UDP**: Both use discovery. Lower latency but less reliable.
+- **Raw**: Direct 802.11 frame injection (requires monitor mode).
 
 ## Architecture
 
@@ -294,3 +302,42 @@ cargo +nightly fuzz run nal_finder
 ## License
 
 MIT
+
+## Changelog
+
+### v0.1.0 - Initial Release
+
+**Features:**
+- Low-latency H.264 video streaming over raw 802.11 monitor mode
+- Reed-Solomon 4+2 FEC for video packet loss resilience
+- MAVLink integration for FC telemetry and RC override
+- Real-time OSD with link status, battery, GPS, and attitude
+- WiFi hotspot mode for network setup
+- TCP/UDP/raw transport options
+- Systemd service integration for camera and ground station
+
+**Bug Fixes:**
+- Video decoder: Validate linesize >= 0 for all planes; handle bottom-up frames safely
+- Video decoder: Ensure avpacket_from_data error path frees buffer to avoid leak
+- Video decoder: Add fallback when hardware decoder open fails (try next codec)
+- Video receiver: Check shard lengths against MAX_SHARD_DATA and drop if oversized
+- TCP socket: Reduce mutex hold time in send_with_buf by cloning stream
+- TCP socket: Set SO_REUSEPORT in new_server for rapid restarts
+- UDP socket: Return WouldBlock on recv timeout, not Ok(0)
+- UDP socket: Return error when peer unknown instead of broadcasting
+- FC: Use try_send in fc_reader to avoid blocking on full telemetry channel
+- FC: Set failsafe_override aux channels (5-8) to 1000 instead of 0
+- FC: Improve find_next_mavlink_magic to preserve tail bytes when no magic found
+- FC: Implement ardupilot_mode_name using mav_type to select correct mode table for all vehicle types
+- Config: Propagate errors in save() and notify user
+- Config: Validate user has read/write permission on fc_port device
+- Config: Validate port conflicts between gcs ports and video/data ports
+- Camera main: Add running check in TCP reconnect loop to allow shutdown
+- Camera main: Use radiotap header and strip L2 in rx_dispatcher
+- Link state: Correct camera_available transition to Connected when heartbeat active
+- Discovery: Handle beacon send errors (log) instead of discarding
+- Raw socket: Mask seq_control to 12 bits before writing 802.11 header
+- Raw socket: Make send_with_buf return WouldBlock error instead of Ok(0) on EAGAIN
+- CI: Remove duplicate cargo fmt/clippy steps; remove continue-on-error from test
+- Install: Exit if binary missing after build/install attempts
+- Run-ground: Check ip addr add success explicitly before logging

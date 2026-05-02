@@ -232,30 +232,10 @@ fn main() {
         tracing::info!("Connecting to ground station via TCP at {}", target_addr);
 
         let mut retry_count: u32 = 0;
-        while running.load(Ordering::SeqCst) {
-            match TcpSocket::new_client(&target_addr, 1000) {
-                Ok(s) => {
-                    tracing::info!("TCP connection established");
-                    write_link_status("connected");
-                    break Arc::new(s);
-                }
-                Err(e) => {
-                    retry_count += 1;
-                    let backoff_secs = 2u64.pow(retry_count.min(5));
-                    let backoff_secs = backoff_secs.min(60);
-                    tracing::error!(
-                        "TCP connect failed (attempt {}): {}, retrying in {}s...",
-                        retry_count,
-                        e,
-                        backoff_secs
-                    );
-                    std::thread::sleep(Duration::from_secs(backoff_secs));
-                    if !running.load(Ordering::SeqCst) {
-                        return;
-                    }
-                }
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                std::process::exit(1);
             }
-        }
             match TcpSocket::new_client(&target_addr, 1000) {
                 Ok(s) => {
                     tracing::info!("TCP connection established");
@@ -518,7 +498,7 @@ fn rx_dispatcher(
             }
         };
 
-        let (actual_payload, _) = match rpv_proto::rawsock_common::recv_extract(&buf[..len], false) {
+        let actual_payload = match rpv_proto::rawsock_common::recv_extract(&buf[..len], false) {
             Some((p, _r)) => p,
             None => continue,
         };
@@ -528,7 +508,7 @@ fn rx_dispatcher(
             if magic_rejects <= 5 {
                 tracing::debug!(
                     "RX: magic mismatch, payload first 8 bytes: {:02x?}",
-                    &payload[..8.min(payload.len())]
+                    &actual_payload[..8.min(actual_payload.len())]
                 );
             } else if magic_rejects % 1000 == 0 {
                 // Periodically log the reject count to track noise levels

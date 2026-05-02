@@ -221,7 +221,7 @@ impl SocketTrait for TcpSocket {
         // Clone the stream while holding the lock briefly, then write without holding it.
         // This reduces contention and prevents the receiver thread from being blocked
         // by a slow TCP write.
-        let stream = {
+        let mut stream = {
             let guard = self
                 .stream
                 .lock()

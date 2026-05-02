@@ -36,6 +36,7 @@ CAM_PACKAGES=(
     "iproute2"
     "rfkill"
     "proot"  # for hostapd without root (optional)
+    "firmware-ath9k-htc"  # for AR9271 WiFi adapter support
 )
 
 # Parse command-line arguments

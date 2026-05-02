@@ -28,11 +28,8 @@ The external WiFi adapter (wlan1) creates a hotspot that the ground station conn
 ## Prerequisites
 
 ### On the Pi (10.0.0.59):
-- Raspberry Pi 5
-- CSI camera (imx296 sensor)
-- External WiFi adapter (TP-Link Archer T2U PLUS - RTL8821AU)
-- Raspbian/Debian 13
-- SSH access from ground station
+
+The IP address `10.0.0.59` in this guide is an example from a specific setup. Your Pi's IP on the home network may differ. Use `ip addr show eth0` or check your router to find the Pi's actual IP. Alternatively, use mDNS: `ssh petrouil@raspberrypi.local`.
 
 ### On the Ground Station (this PC):
 - Linux (Arch)

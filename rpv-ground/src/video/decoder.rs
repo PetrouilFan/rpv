@@ -70,7 +70,6 @@ impl VideoDecoder {
                     tracing::warn!("Failed to set thread affinity: {}", std::io::Error::last_os_error());
                 }
             }
-            }
             decode_loop_libavcodec(frame_tx, rx, width, height);
         })
     }
@@ -206,8 +205,8 @@ fn process_decoded_frame(
             uv_buf[dst_start..dst_start + linesize1].copy_from_slice(src);
         }
         // Deinterleave into packed U and V (tightly packed, row stride = uv_w)
-        let u_packed = vec![0u8; uv_w * uv_h];
-        let v_packed = vec![0u8; uv_w * uv_h];
+        let mut u_packed = vec![0u8; uv_w * uv_h];
+        let mut v_packed = vec![0u8; uv_w * uv_h];
         for row in 0..uv_h {
             let src_row = &uv_buf[row * linesize1..(row + 1) * linesize1];
             for col in 0..uv_w {
@@ -226,6 +225,8 @@ fn process_decoded_frame(
             tracing::warn!("YUV420P frame missing V plane");
             return;
         }
+        let mut u_buf = vec![0u8; (uv_h * linesize1) as usize];
+        let mut v_buf = vec![0u8; (uv_h * linesize2) as usize];
         for row in 0..uv_h {
             let src = unsafe { std::slice::from_raw_parts(data1.add(row * linesize1), linesize1) };
             let dst_start = row * linesize1;
@@ -385,7 +386,7 @@ fn decode_loop_libavcodec(
             let ret = ffi::av_packet_from_data(pkt, buffer, buf_len as i32);
             if ret < 0 {
                 error!("av_packet_from_data failed: {}", ret);
-                ffi::av_free(buffer);
+                ffi::av_free(buffer as *mut libc::c_void);
                 continue;
             }
         }

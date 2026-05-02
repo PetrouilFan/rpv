@@ -15,6 +15,8 @@ const DATA_START: usize = VIDEO_HDR_LEN;
 
 const STALL_TIMEOUT: Duration = Duration::from_millis(200);
 const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAG_HDR_LEN: usize = 5;
+const MAX_SHARD_DATA: usize = rpv_proto::link::MAX_PAYLOAD - 8 - VIDEO_HDR_LEN - FRAG_HDR_LEN;
 
 struct RsBlock {
     block_seq: u32,
@@ -188,9 +190,8 @@ impl VideoReceiver {
                                 self.orphan_fragments
                             );
                         }
+                        }
                     }
-                    }
-                }
                 _ => {
                     warn!("Unknown frag_type: {}", frag_type);
                 }
@@ -356,7 +357,7 @@ impl VideoReceiver {
             let idx = (block_seq as usize) % RING_SIZE;
 
             if next_block_init {
-                if !Self::is_future_block(block_seq, next_block) && block_seq != next_block {
+                if !VideoReceiver::is_future_block(block_seq, next_block) && block_seq != next_block {
                     // Old block (pre-wrap or already processed), discard
                     continue;
                 }
@@ -424,84 +425,18 @@ impl VideoReceiver {
                     if block_seq.wrapping_sub(next_block) == 0 {
                         self.drain_completed(&mut completed, &mut next_block, &mut fec_recovered);
                         last_decode_time = Instant::now();
-                    } else if Self::is_future_block(block_seq, next_block) {
+                    } else if VideoReceiver::is_future_block(block_seq, next_block) {
                         // block is in the future, just store it
                     }
                 } else {
                     fec_dropped += 1;
                 }
-                #[cfg(test)]
-                mod tests {}
             }
         }
+    }
+}
 
-        // ==================== Regression tests for AUDIT.md bugs ====================
-
-        /// Bug: AUDIT.md receiver.rs — Dedup check doesn't handle wrapping correctly
-        /// Fixed: The code now uses wrapping_sub with MSB check for proper wraparound handling
-        /// Test: Verify that is_future_block correctly handles wraparound at u32::MAX
-        #[test]
-        fn regression_dedup_handles_wrapping() {
-            // Test is_future_block function
-            // is_future_block checks: block_seq != next_block && (block_seq.wrapping_sub(next_block) & 0x80000000) == 0
-
-            // Normal case: block 100, next 99 -> future (MSB not set in diff)
-            assert!(VideoReceiver::is_future_block(100, 99));
-
-            // Wraparound case: block 0 (after wrap), next u32::MAX -> future
-            assert!(VideoReceiver::is_future_block(0, u32::MAX));
-
-            // Past case: block 99, next 100 -> NOT future (negative diff wraps to large positive)
-            assert!(!VideoReceiver::is_future_block(99, 100));
-
-            // Wraparound past: block u32::MAX, next 0 -> NOT future (should be treated as old)
-            assert!(!VideoReceiver::is_future_block(u32::MAX, 0));
-        }
-
-        /// Test: Verify RsBlock dedup logic works correctly
-        #[test]
-        fn regression_rsblock_dedup() {
-            let mut block = RsBlock {
-                block_seq: 42,
-                shards: vec![None; TOTAL_SHARDS],
-                shard_sizes: vec![0; TOTAL_SHARDS],
-                received: 0,
-                actual_data_shards: DATA_SHARDS,
-                shard_lens: [0; DATA_SHARDS],
-            };
-
-            // Add shard 0
-            block.shards[0] = Some(vec![0x01, 0x02, 0x03]);
-            block.shard_sizes[0] = 3;
-            block.received += 1;
-
-            // Try to add shard 0 again (duplicate)
-            // In the current code, this is checked by `if block.shards[shard_index].is_some()`
-            let shard_index = 0;
-            if block.shards[shard_index].is_some() {
-                // Duplicate detected - don't increment received count
-                // This is the correct behavior
-            } else {
-                block.received += 1;
-            }
-
-            assert_eq!(
-                block.received, 1,
-                "Duplicate shard should not increment received count"
-            );
-
-            // Add a different shard
-            block.shards[1] = Some(vec![0x04, 0x05]);
-            block.shard_sizes[1] = 2;
-            block.received += 1;
-
-            assert_eq!(
-                block.received, 2,
-                "New shard should increment received count"
-            );
-        }
-
-        /// Test: Verify ring buffer index calculation handles wraparound
+    /// Test: Verify ring buffer index calculation handles wraparound
         #[test]
         fn regression_ring_buffer_wraparound() {
             let ring_size = RING_SIZE as u32;
@@ -566,5 +501,3 @@ impl VideoReceiver {
                 "Block 0 should be future when next is u32::MAX"
             );
         }
-    }
-}
